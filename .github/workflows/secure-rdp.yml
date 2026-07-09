@@ -23,7 +23,7 @@ jobs:
           $wd = "${{ github.workspace }}"
           Set-Location -LiteralPath $wd
           Write-Host "=== Starting pip install in background ==="
-          $pipProc = Start-Process -FilePath pip -ArgumentList "install -r requirements.txt" -NoNewWindow -PassThru -RedirectStandardOutput "pip_stdout.log" -RedirectStandardError "pip_stderr.log"
+          $pipProc = Start-Process -FilePath python -ArgumentList "-m pip install -r requirements.txt" -NoNewWindow -PassThru -RedirectStandardOutput "pip_stdout.log" -RedirectStandardError "pip_stderr.log"
           "PIP_PID=$($pipProc.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "pip started (PID: $($pipProc.Id))."
 
@@ -77,16 +77,19 @@ jobs:
               Get-Content "pip_stderr.log" -ErrorAction SilentlyContinue
               exit 1
             }
-            Remove-Variable pipProc
           } else {
             Write-Host "pip already finished."
-            $pipLog = Get-Content "pip_stdout.log" -ErrorAction SilentlyContinue
-            if ($pipLog -match "error|failed") {
-              Write-Host "::error::pip may have failed. Check logs."
-              Get-Content "pip_stderr.log" -ErrorAction SilentlyContinue
-            }
           }
           Write-Host "pip install completed."
+
+          Write-Host "=== Verifying Python modules ==="
+          python -c "import discord; print(f'discord.py {discord.__version__}')" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::discord module not found after pip install"
+            Get-Content "pip_stdout.log" -ErrorAction SilentlyContinue | Select-Object -Last 30
+            Get-Content "pip_stderr.log" -ErrorAction SilentlyContinue | Select-Object -Last 10
+            exit 1
+          }
 
           Write-Host "=== Loading session metadata ==="
           $cacheFile = "C:\rdp-session\session.json"
