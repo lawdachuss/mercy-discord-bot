@@ -211,7 +211,7 @@ jobs:
           Start-Sleep -Seconds 5
 
           & $tailscale up `
-            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
+            --authkey="${{ secrets.TAILSCALE_KEY }}" `
             --hostname="$hostname" `
             --accept-routes `
             --reset
