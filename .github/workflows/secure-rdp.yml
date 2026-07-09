@@ -179,6 +179,10 @@ jobs:
           $endTime = (Get-Date).AddMinutes(345)
           while ((Get-Date) -lt $endTime) {
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            $log = Get-Content "bot_stdout.log" -ErrorAction SilentlyContinue
+            $err = Get-Content "bot_stderr.log" -ErrorAction SilentlyContinue
+            if ($log) { Write-Host "=== STDOUT (last 5 lines) ==="; $log | Select-Object -Last 5 }
+            if ($err) { Write-Host "=== STDERR (last 3 lines) ==="; $err | Select-Object -Last 3 }
             Write-Host "[$ts] Runner active... (bot running in background)"
             Start-Sleep -Seconds 60
           }
