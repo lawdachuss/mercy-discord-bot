@@ -659,6 +659,7 @@ class ResetConfirmationView(discord.ui.View):
         # Delete configuration
         try:
             await self.cog.collection.delete_one({"guild_id": interaction.guild.id})
+            self.cog._config_cache.pop(interaction.guild.id, None)
             
             embed = discord.Embed(
                 title="✅ System Reset Complete",
@@ -1050,6 +1051,7 @@ class StatusRoleCog(commands.Cog):
         self._ready = False
         self._cache: Dict[Tuple[int, int], str] = {}  # (guild_id, user_id) -> status_hash for debouncing
         self._cache_timestamps: Dict[Tuple[int, int], float] = {}  # (guild_id, user_id) -> timestamp
+        self._config_cache: Dict[int, tuple[float, Any]] = {}  # guild_id -> (timestamp, GuildConfig) for 30s TTL
         self.messages = self._load_messages()
         
         # Color management for random colors without repetition
@@ -1209,7 +1211,7 @@ class StatusRoleCog(commands.Cog):
             self._ready = False
 
     async def save_config(self, config: GuildConfig) -> bool:
-        """Save guild configuration to MongoDB."""
+        """Save guild configuration to MongoDB and update cache."""
         if not self._ready or self.collection is None:
             return False
         
@@ -1220,20 +1222,30 @@ class StatusRoleCog(commands.Cog):
                 document,
                 upsert=True
             )
+            if result.acknowledged:
+                self._config_cache[config.guild_id] = (time.time(), config)
             return result.acknowledged
         except Exception as e:
             logger.error(f"Error saving config: {e}")
             return False
 
     async def get_config(self, guild_id: int) -> Optional[GuildConfig]:
-        """Get guild configuration from MongoDB."""
+        """Get guild configuration from MongoDB with 30s TTL cache."""
         if not self._ready or self.collection is None:
             return None
+        
+        now = time.time()
+        cached = self._config_cache.get(guild_id)
+        if cached and now - cached[0] < 30:
+            return cached[1]
         
         try:
             document = await self.collection.find_one({"guild_id": guild_id})
             if document:
-                return GuildConfig.from_dict(document)
+                config = GuildConfig.from_dict(document)
+                self._config_cache[guild_id] = (now, config)
+                return config
+            self._config_cache[guild_id] = (now, None)
             return None
         except Exception as e:
             logger.error(f"Error getting config: {e}")
@@ -1260,6 +1272,14 @@ class StatusRoleCog(commands.Cog):
             
             if expired_keys:
                 logger.info(f"Cleaned up {len(expired_keys)} expired cache entries")
+            
+            # Clean up config cache for guilds the bot no longer has
+            guild_ids = {g.id for g in self.bot.guilds}
+            stale_configs = [gid for gid in self._config_cache if gid not in guild_ids]
+            for gid in stale_configs:
+                self._config_cache.pop(gid, None)
+            if stale_configs:
+                logger.info(f"Cleaned up {len(stale_configs)} stale config cache entries")
             
             # Reset color usage periodically to ensure variety
             if len(self._used_colors) > 30:
