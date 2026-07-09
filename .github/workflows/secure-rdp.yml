@@ -80,6 +80,14 @@ jobs:
           Remove-Item $tsInstaller -Force -ErrorAction SilentlyContinue
           Write-Host "Tailscale installed."
 
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-
+
       - name: Setup Python and install dependencies
         shell: powershell
         run: |
