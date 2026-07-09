@@ -141,6 +141,9 @@ class DiscordBot(commands.Bot):
                 logging.warning(f"Failed to initialize shared MongoDB connection: {e}")
                 self.mongo_client = None
         
+        # DB latency cache for .ping command
+        self._db_latency_cache: tuple[float, str] = (0.0, "N/A")
+        
         # Global cooldown mapping
         self._cd_mapping = commands.CooldownMapping.from_cooldown(1, 0.2, commands.BucketType.user)
         
@@ -155,34 +158,28 @@ class DiscordBot(commands.Bot):
         # Prefix commands
         @self.command()
         async def ping(ctx):
-            # Bot latency
             bot_latency = self.latency * 1000
             bot_latency_str = f"{bot_latency:.0f}ms"
-            
-            # Database latency
-            db_latency_str = "N/A"
-            if self.mongo_client:
-                try:
-                    start = time.time()
-                    await asyncio.wait_for(
-                        self.mongo_client.admin.command('ping'),
-                        timeout=5.0
-                    )
-                    db_latency = (time.time() - start) * 1000
-                    db_latency_str = f"{db_latency:.0f}ms"
-                except Exception:
-                    db_latency_str = "Offline"
-            
-            # Stability rating based on latency
-            if bot_latency < 100:
-                stability_str = "Excellent"
-            elif bot_latency < 200:
-                stability_str = "Good"
-            elif bot_latency < 400:
-                stability_str = "Fair"
-            else:
-                stability_str = "Poor"
-            
+
+            db_latency_str = ctx.bot._db_latency_cache[1]
+            cached_time = ctx.bot._db_latency_cache[0]
+            if time.time() - cached_time > 10 or db_latency_str == "N/A":
+                if ctx.bot.mongo_client:
+                    try:
+                        start = time.time()
+                        await asyncio.wait_for(
+                            ctx.bot.mongo_client.admin.command('ping'),
+                            timeout=5.0
+                        )
+                        db_latency = (time.time() - start) * 1000
+                        db_latency_str = f"{db_latency:.0f}ms"
+                        ctx.bot._db_latency_cache = (time.time(), db_latency_str)
+                    except Exception:
+                        db_latency_str = "Offline"
+                        ctx.bot._db_latency_cache = (time.time(), db_latency_str)
+
+            stability_str = "Excellent" if bot_latency < 100 else "Good" if bot_latency < 200 else "Fair" if bot_latency < 400 else "Poor"
+
             await ctx.send(f'<a:heartspark_ogs:1427918324066422834> Latency: **{bot_latency_str}** | Database: **{db_latency_str}** | Stability: **{stability_str}**')
         
         @self.command()
