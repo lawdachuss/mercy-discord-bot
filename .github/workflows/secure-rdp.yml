@@ -132,38 +132,13 @@ jobs:
 
           $job = Start-Job -Name "mercybot" -ScriptBlock {
             param($wd, $token, $webhook, $mongo, $owners)
-            $env:PYTHONIOENCODING = 'utf-8'
             $env:DISCORD_TOKEN = $token
             $env:WEBHOOK_URL = $webhook
             $env:MONGO_URL = $mongo
             $env:OWNER_IDS = $owners
             $env:AUTO_SYNC_COMMANDS = "true"
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = "python"
-            $psi.Arguments = "-u main.py"
-            $psi.WorkingDirectory = $wd
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow = $true
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $envTable = $psi.EnvironmentVariables
-            $envTable["PYTHONIOENCODING"] = "utf-8"
-            $envTable["DISCORD_TOKEN"] = $token
-            $envTable["WEBHOOK_URL"] = $webhook
-            $envTable["MONGO_URL"] = $mongo
-            $envTable["OWNER_IDS"] = $owners
-            $envTable["AUTO_SYNC_COMMANDS"] = "true"
-            $p = [System.Diagnostics.Process]::Start($psi)
-            $outLines = New-Object System.Collections.ArrayList
-            $errLines = New-Object System.Collections.ArrayList
-            $p.OutputDataReceived.Add({ param($s, $e); if ($e.Data) { [void]$outLines.Add($e.Data) } })
-            $p.ErrorDataReceived.Add({ param($s, $e); if ($e.Data) { [void]$errLines.Add($e.Data) } })
-            $p.BeginOutputReadLine()
-            $p.BeginErrorReadLine()
-            $p.WaitForExit()
-            [System.IO.File]::WriteAllLines("$wd\bot_stdout.log", $outLines)
-            [System.IO.File]::WriteAllLines("$wd\bot_stderr.log", $errLines)
-            exit $p.ExitCode
+            python "$wd\start_bot.py" "$wd"
+            exit $LASTEXITCODE
           } -ArgumentList $wd, $env:DISCORD_TOKEN, $env:WEBHOOK_URL, $env:MONGO_URL, $env:OWNER_IDS
 
           Start-Sleep -Seconds 12
