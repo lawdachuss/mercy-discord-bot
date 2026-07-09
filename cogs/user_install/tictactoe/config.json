@@ -1,0 +1,29 @@
+{
+  "emojis": {
+    "x": {
+      "name": "ttt_x",
+      "id": 0,
+      "comment": "Set id to your custom emoji ID, or leave as 0 to use text X"
+    },
+    "o": {
+      "name": "ttt_o",
+      "id": 0,
+      "comment": "Set id to your custom emoji ID, or leave as 0 to use text O"
+    },
+    "blank": {
+      "name": "ttt_blank",
+      "id": 0,
+      "comment": "Set id to your custom emoji ID, or leave as 0 for empty buttons"
+    },
+    "win": {
+      "name": "ttt_win",
+      "id": 0,
+      "comment": "Set id to your custom emoji ID, or leave as 0 to keep X/O on winning cells"
+    }
+  },
+  "text_fallbacks": {
+    "x": "✕",
+    "o": "○"
+  },
+  "instructions": "To use custom emojis: 1) Upload emojis to your server, 2) Type \\:emoji_name: in Discord to get the ID, 3) Replace the id values above with your emoji IDs"
+}

@@ -1,0 +1,69 @@
+{
+  "content": "",
+  "embeds": [
+    {
+      "color": 3092790,
+      "image": {
+        "url": "https://media.discordapp.net/attachments/1420777119805345802/1430071791736586371/Untitled_960_x_540_px_2.png?ex=68fdb7a4&is=68fc6624&hm=2bb11fa014b4930fb10bc4ef5744938460dabcd54d56167181a920a933b079b3&=&format=webp&quality=lossless&width=1125&height=250"
+      }
+    },
+    {
+      "description": "**﹐　ᶻ 𝗓 𐰁　ꜜ CHAT LEVEL-UP PERKS <a:originals_sakura:1430075697422012516>◝\n﹒˚ ₊ ︵﹒⊹ ๑ ︵︵ ๑ ⊹﹒︵\n◦ ⁺  Level up, progress through milestones, and unlock powerful perks!**<a:original_No:1421570558415339591>\n\n<:original_cc:1420245871127302205> : **__Requirements__ -**",
+      "color": 3092790,
+      "footer": {
+        "text": " Stay active • Earn XP • Unlock perks",
+        "icon_url": "https://images-ext-1.discordapp.net/external/2lcN4_yt68_z-5fjiX8uC1NO_dDcFLAlRaHCQIVcFes/https/cdn.discordapp.com/emojis/1266638865343709256.gif"
+      },
+      "image": {
+        "url": "https://64.media.tumblr.com/c539d526ae97f826732ab7da36aaf4ef/6eabe8cd53a3e20b-67/s2048x3072/c4283f9986a7dcd440d51559db21c0ed77c150e0.gifv"
+      },
+      "fields": [
+        {
+          "name": "--- `Level 10`",
+          "value": "<:ogs_symbol:1428968317271543869> **React perms**\nYou can react to messages.",
+          "inline": true
+        },
+        {
+          "name": "--- `Level 20`",
+          "value": "<:ogs_symbol:1428968317271543869> **External emotes**\nUse emotes from other servers.",
+          "inline": true
+        },
+        {
+          "name": "--- `Level 30`",
+          "value": "<:ogs_symbol:1428968317271543869> **External stickers**\nPost stickers globally.",
+          "inline": true
+        },
+        {
+          "name": "--- `Level 40`",
+          "value": "<:ogs_symbol:1428968317271543869> **Custom Nickname**\nChange your display name freely.",
+          "inline": true
+        },
+        {
+          "name": "--- `Level 50`",
+          "value": "<:ogs_symbol:1428968317271543869> **Bot Immunity**\nYou can’t be muted by the bot.",
+          "inline": true
+        },
+        {
+          "name": "--- `Level 60`",
+          "value": "<:ogs_symbol:1428968317271543869> **Voice Messages**\nSend audio clips in chat.",
+          "inline": true
+        },
+        {
+          "name": "--- `Level 70`",
+          "value": "<:ogs_symbol:1428968317271543869> **GIF Permissions**\nPost animated GIFs in chat.",
+          "inline": true
+        },
+        {
+          "name": "--- `Level 80`",
+          "value": "<:ogs_symbol:1428968317271543869> **Media Permissions**\nShare images and videos.",
+          "inline": true
+        },
+        {
+          "name": "--- `Level 90`",
+          "value": "<:ogs_symbol:1428968317271543869> **Unjail Power**\nGain 3 Unjail Cards to release jailed/muted users.",
+          "inline": true
+        }
+      ]
+    }
+  ]
+}
