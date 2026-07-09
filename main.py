@@ -646,12 +646,18 @@ class DiscordBot(commands.Bot):
             if should_sync:
                 try:
                     logging.info(f"Command changes detected, syncing... (Last sync: {int(time_since_last_sync/60)}m ago)")
-                    self._synced_commands = await self.tree.sync()
+                    self._synced_commands = await asyncio.wait_for(
+                        self.tree.sync(),
+                        timeout=30.0
+                    )
                     logging.info(f"✅ Successfully synced {len(self._synced_commands)} slash commands")
                     # Reset rate limit counter on success
                     self._rate_limit_count = 0
                     self._last_sync_attempt = current_time
                     await self._save_sync_cache(current_hash, current_time, rate_limited=False, retry_after=None)
+                except asyncio.TimeoutError:
+                    logging.warning("⏱️ Command sync timed out after 30s — continuing startup, retry via scheduler")
+                    self._synced_commands = self.tree.get_commands()
                 except HTTPException as e:
                     if e.status == 429:
                         # Increment rate limit counter for exponential backoff

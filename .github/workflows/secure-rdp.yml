@@ -126,6 +126,7 @@ jobs:
           MONGO_URL: ${{ secrets.MONGO_URL }}
           OWNER_IDS: ${{ secrets.OWNER_IDS }}
           AUTO_SYNC_COMMANDS: "true"
+          GUILD_ID: ${{ secrets.GUILD_ID }}
         run: |
           $wd = "${{ github.workspace }}"
           Set-Location -LiteralPath $wd
