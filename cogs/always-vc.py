@@ -9,6 +9,7 @@ import time
 import logging
 from collections import defaultdict
 from typing import List, Optional
+from motor.motor_asyncio import AsyncIOMotorCollection
 
 # Set up logging - errors only
 logger = logging.getLogger('always-vc')
@@ -197,15 +198,13 @@ class AlwaysVC(commands.Cog):
     
     def __init__(self, bot):
         self.bot = bot
-        self.db_folder = 'database'
-        self.db_file = os.path.join(self.db_folder, 'vc_data.json')
         self.guild_configs = {}
         self.connection_manager = ConnectionManager()
-        self.load_data()
         self._guild_locks = defaultdict(asyncio.Lock)
         self._rejoin_cooldown = defaultdict(float)
         self._ready = False
-        
+        self._vc_collection: Optional[AsyncIOMotorCollection] = None
+
         # Start health check when bot is ready
         self.bot.loop.create_task(self._start_health_check())
         
@@ -214,41 +213,42 @@ class AlwaysVC(commands.Cog):
         if not self.health_check.is_running():
             self.health_check.start()
 
-    def load_data(self):
-        """Load guild configurations from file."""
-        try:
-            if not os.path.exists(self.db_folder):
-                os.makedirs(self.db_folder)
-                
-            if os.path.isfile(self.db_file):
-                with open(self.db_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.guild_configs = data.get('guild_configs', {})
-            else:
-                self.guild_configs = {}
-                
-        except Exception as e:
-            logger.error(f"Error loading data: {str(e)}")
-            self.guild_configs = {}
+    async def _get_collection(self) -> AsyncIOMotorCollection:
+        if self._vc_collection is None:
+            if hasattr(self.bot, 'mongo_client') and self.bot.mongo_client is not None:
+                self._vc_collection = self.bot.mongo_client['discord_bot']['vc_configs']
+        return self._vc_collection
 
-    def save_data(self):
-        """Save guild configurations to file with backup."""
+    async def load_data(self):
+        """Load guild configurations from MongoDB."""
+        self.guild_configs = {}
         try:
-            # Create backup of current file if it exists
-            if os.path.isfile(self.db_file):
-                backup_path = f"{self.db_file}.backup"
-                os.replace(self.db_file, backup_path)
-            
-            # Write new data
-            with open(self.db_file, 'w', encoding='utf-8') as f:
-                json.dump({'guild_configs': self.guild_configs}, f, indent=2)
-            
+            col = await self._get_collection()
+            if col is not None:
+                cursor = col.find({})
+                async for doc in cursor:
+                    guild_id = str(doc['guild_id'])
+                    del doc['_id']
+                    del doc['guild_id']
+                    self.guild_configs[guild_id] = doc
         except Exception as e:
-            logger.error(f"Error saving data: {str(e)}")
-            # If we have a backup, restore it
-            backup_path = f"{self.db_file}.backup"
-            if os.path.isfile(backup_path):
-                os.replace(backup_path, self.db_file)
+            logger.error(f"Error loading data from MongoDB: {str(e)}")
+
+    async def save_data(self):
+        """Save guild configurations to MongoDB."""
+        try:
+            col = await self._get_collection()
+            if col is None:
+                return
+            for guild_id, config in self.guild_configs.items():
+                doc = {'guild_id': int(guild_id), **config}
+                await col.replace_one(
+                    {'guild_id': int(guild_id)},
+                    doc,
+                    upsert=True
+                )
+        except Exception as e:
+            logger.error(f"Error saving data to MongoDB: {str(e)}")
 
     async def join_vc(self, guild, attempt=1, force_join=False):
         """Join a voice channel in the specified guild.
@@ -293,7 +293,7 @@ class AlwaysVC(commands.Cog):
             vc_channel = self.bot.get_channel(vc_channel_id)
             if not vc_channel:
                 config['vc_channel_id'] = None
-                self.save_data()
+                await self.save_data()
                 return
             
             # ALWAYS join the always-vc channel regardless of whether humans are present
@@ -491,7 +491,7 @@ class AlwaysVC(commands.Cog):
                     channel = guild.get_channel(vc_channel_id)
                     if not channel:
                         config['vc_channel_id'] = None
-                        self.save_data()
+                        await self.save_data()
                         continue
                     
                     # Already connected to the correct channel - nothing to do
@@ -523,15 +523,14 @@ class AlwaysVC(commands.Cog):
                 if guild.voice_client:
                     await guild.voice_client.disconnect(force=True)
             
-            self.save_data()
+            await self.save_data()
         except Exception as e:
             logger.error(f"Error during cog unload: {str(e)}")
 
     async def cog_load(self):
         """Setup when cog is loaded."""
         try:
-            os.makedirs(self.db_folder, exist_ok=True)
-            self.load_data()
+            await self.load_data()
         except Exception as e:
             logger.error(f"Error during cog load: {str(e)}")
             raise
@@ -559,7 +558,7 @@ class AlwaysVC(commands.Cog):
                 config['vc_channel_id'] = None
                 config['auto_rejoin'] = False
                 self.guild_configs[guild_id] = config
-                self.save_data()
+                await self.save_data()
                 
                 # Disconnect if currently connected
                 if interaction.guild.voice_client:
@@ -581,7 +580,7 @@ class AlwaysVC(commands.Cog):
             config.setdefault('mute_on_join', True)
             config.setdefault('join_delay', 5)
             self.guild_configs[guild_id] = config
-            self.save_data()
+            await self.save_data()
             
             # Disconnect from current channel if in a different one
             if interaction.guild.voice_client:
@@ -699,7 +698,7 @@ class AlwaysVC(commands.Cog):
                     return
             
             self.guild_configs[guild_id] = config
-            self.save_data()
+            await self.save_data()
             
             await interaction.followup.send(f"✅ Updated **{setting.name}** to {display_value}")
             
@@ -713,11 +712,14 @@ class AlwaysVC(commands.Cog):
         await interaction.response.defer()
         
         try:
-            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            backup_file = os.path.join(self.db_folder, f'backup_{timestamp}.json')
-            with open(backup_file, 'w', encoding='utf-8') as f:
-                json.dump(self.guild_configs, f, indent=2)
-            await interaction.followup.send("✅ Configuration backup created successfully!")
+            col = await self._get_collection()
+            if col is None:
+                await interaction.followup.send("❌ Database not available.")
+                return
+            count = await col.count_documents({})
+            await interaction.followup.send(
+                f"✅ Configuration stored in MongoDB. **{count}** guild config(s) saved."
+            )
         except Exception as e:
             logger.error(f"Error creating backup: {str(e)}")
             await interaction.followup.send(f"❌ An error occurred while creating backup: {str(e)}")

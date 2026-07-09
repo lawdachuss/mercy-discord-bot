@@ -1,5 +1,4 @@
 aiohttp
-aiosqlite
 backoff
 discord.py[voice]
 tzdata

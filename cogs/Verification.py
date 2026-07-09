@@ -7,6 +7,10 @@ import os
 from typing import Optional
 from datetime import datetime, timezone
 import io
+from motor.motor_asyncio import AsyncIOMotorCollection
+import logging
+
+logger = logging.getLogger(__name__)
 
 class VerificationTicketSystem(commands.Cog):
     """
@@ -15,37 +19,57 @@ class VerificationTicketSystem(commands.Cog):
     
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.config_file = "database/verification_config.json"
-        self.ensure_database_folder()
-        self.config = self.load_config()
-        
-    def ensure_database_folder(self):
-        """Ensure database folder exists"""
-        os.makedirs("database", exist_ok=True)
-    
-    def load_config(self):
-        """Load configuration from JSON file"""
-        if os.path.exists(self.config_file):
-            with open(self.config_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {}
-    
-    def save_config(self):
-        """Save configuration to JSON file"""
-        with open(self.config_file, 'w', encoding='utf-8') as f:
-            json.dump(self.config, f, indent=4)
-    
+        self.config = {}
+        self._verification_col: Optional[AsyncIOMotorCollection] = None
+
+    async def _get_collection(self) -> AsyncIOMotorCollection:
+        if self._verification_col is None:
+            if hasattr(self.bot, 'mongo_client') and self.bot.mongo_client is not None:
+                self._verification_col = self.bot.mongo_client['discord_bot']['verification_configs']
+        return self._verification_col
+
+    async def load_config(self):
+        """Load configuration from MongoDB."""
+        self.config = {}
+        try:
+            col = await self._get_collection()
+            if col is not None:
+                cursor = col.find({})
+                async for doc in cursor:
+                    guild_id = str(doc['guild_id'])
+                    del doc['_id']
+                    del doc['guild_id']
+                    self.config[guild_id] = doc
+        except Exception as e:
+            logger.error(f"Error loading verification config: {e}")
+
+    async def save_config(self):
+        """Save configuration to MongoDB."""
+        try:
+            col = await self._get_collection()
+            if col is None:
+                return
+            for guild_id, cfg in self.config.items():
+                doc = {'guild_id': int(guild_id), **cfg}
+                await col.replace_one(
+                    {'guild_id': int(guild_id)},
+                    doc,
+                    upsert=True
+                )
+        except Exception as e:
+            logger.error(f"Error saving verification config: {e}")
+
     def get_server_config(self, guild_id: int):
         """Get configuration for a specific server"""
         return self.config.get(str(guild_id), {})
-    
-    def set_server_config(self, guild_id: int, key: str, value):
+
+    async def set_server_config(self, guild_id: int, key: str, value):
         """Set configuration for a specific server"""
         guild_id_str = str(guild_id)
         if guild_id_str not in self.config:
             self.config[guild_id_str] = {}
         self.config[guild_id_str][key] = value
-        self.save_config()
+        await self.save_config()
         
     def get_verification_example_path(self):
         """Get the path to the verification example image"""
@@ -53,6 +77,7 @@ class VerificationTicketSystem(commands.Cog):
     
     async def cog_load(self):
         """Add persistent views when cog loads"""
+        await self.load_config()
         self.bot.add_view(VerifyButton(self))
         self.bot.add_view(TicketControls(self))
         self.bot.add_view(TranscriptControls(self))
@@ -84,13 +109,13 @@ class VerificationTicketSystem(commands.Cog):
         guild_id = interaction.guild.id
         
         # Save configuration
-        self.set_server_config(guild_id, 'embed_channel_id', embed_channel.id)
-        self.set_server_config(guild_id, 'ticket_category_id', ticket_category.id)
-        self.set_server_config(guild_id, 'verified_role_id', verified_role.id)
-        self.set_server_config(guild_id, 'staff_role_id', staff_role.id)
-        self.set_server_config(guild_id, 'log_channel_id', log_channel.id)
-        self.set_server_config(guild_id, 'ticket_message', ticket_message)
-        self.set_server_config(guild_id, 'decline_message', decline_message)
+        await self.set_server_config(guild_id, 'embed_channel_id', embed_channel.id)
+        await self.set_server_config(guild_id, 'ticket_category_id', ticket_category.id)
+        await self.set_server_config(guild_id, 'verified_role_id', verified_role.id)
+        await self.set_server_config(guild_id, 'staff_role_id', staff_role.id)
+        await self.set_server_config(guild_id, 'log_channel_id', log_channel.id)
+        await self.set_server_config(guild_id, 'ticket_message', ticket_message)
+        await self.set_server_config(guild_id, 'decline_message', decline_message)
         
         # Create and send the verification embed
         banner_embed = discord.Embed(color=0x2F3136)

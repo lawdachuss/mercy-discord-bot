@@ -34,7 +34,6 @@ AUTO_SYNC_COMMANDS = os.getenv("AUTO_SYNC_COMMANDS", "true").lower() == "true"
 LOGS_DIR = "logs"
 DATABASE_DIR = "database"
 COGS_DIR = "cogs"
-COMMAND_CACHE_FILE = "database/command_sync_cache.json"
 
 def setup_directories() -> None:
     for directory in (LOGS_DIR, DATABASE_DIR, COGS_DIR):
@@ -197,7 +196,7 @@ class DiscordBot(commands.Bot):
                     current_hash = self._get_command_hash()
                     # Reset rate limit counter on successful manual sync
                     self._rate_limit_count = 0
-                    self._save_sync_cache(current_hash, time.time(), rate_limited=False, retry_after=None)
+                    await self._save_sync_cache(current_hash, time.time(), rate_limited=False, retry_after=None)
                     await msg.edit(content=f"<a:white_tick:1426439810733572136> Successfully synced {len(synced)} commands!")
                     logging.info(f"Manual sync triggered by {ctx.author}")
             except HTTPException as e:
@@ -205,7 +204,7 @@ class DiscordBot(commands.Bot):
                     self._rate_limit_count += 1
                     retry_after = e.response.headers.get('Retry-After', 'unknown')
                     backoff_hours = min(2 ** self._rate_limit_count, 24)
-                    self._save_sync_cache(self._get_command_hash(), time.time(), rate_limited=True, retry_after=retry_after)
+                    await self._save_sync_cache(self._get_command_hash(), time.time(), rate_limited=True, retry_after=retry_after)
                     await msg.edit(
                         content=f"❌ Rate limited! Discord says wait {retry_after}s. "
                         f"Bot will wait {backoff_hours}h before auto-sync. "
@@ -377,7 +376,7 @@ class DiscordBot(commands.Bot):
         @commands.is_owner()
         async def syncstatus(ctx):
             """Check command sync status (owner only)"""
-            cache = self._load_sync_cache()
+            cache = await self._load_sync_cache()
             last_sync = cache.get('last_sync', 0)
             was_rate_limited = cache.get('rate_limited', False)
             rate_limit_count = cache.get('rate_limit_count', 0)
@@ -527,28 +526,42 @@ class DiscordBot(commands.Bot):
         commands_str = json.dumps(commands_data, sort_keys=True)
         return hashlib.md5(commands_str.encode()).hexdigest()
     
-    def _load_sync_cache(self) -> dict:
-        """Load the last sync cache."""
+    async def _get_sync_cache_collection(self):
+        if self.mongo_client is not None:
+            return self.mongo_client['discord_bot']['command_sync_cache']
+        return None
+
+    async def _load_sync_cache(self) -> dict:
+        """Load the last sync cache from MongoDB."""
         try:
-            if os.path.exists(COMMAND_CACHE_FILE):
-                with open(COMMAND_CACHE_FILE, 'r') as f:
-                    return json.load(f)
+            col = await self._get_sync_cache_collection()
+            if col is not None:
+                doc = await col.find_one({'_id': 'sync_cache'})
+                if doc:
+                    del doc['_id']
+                    return doc
         except Exception as e:
             logging.warning(f"Failed to load sync cache: {e}")
         return {}
     
-    def _save_sync_cache(self, command_hash: str, sync_time: float, rate_limited: bool = False, retry_after: int = None):
-        """Save the sync cache."""
+    async def _save_sync_cache(self, command_hash: str, sync_time: float, rate_limited: bool = False, retry_after: int = None):
+        """Save the sync cache to MongoDB."""
         try:
-            cache_data = {
-                'command_hash': command_hash,
-                'last_sync': sync_time,
-                'rate_limited': rate_limited,
-                'rate_limit_count': self._rate_limit_count,
-                'retry_after': retry_after
-            }
-            with open(COMMAND_CACHE_FILE, 'w') as f:
-                json.dump(cache_data, f, indent=2)
+            col = await self._get_sync_cache_collection()
+            if col is not None:
+                cache_data = {
+                    '_id': 'sync_cache',
+                    'command_hash': command_hash,
+                    'last_sync': sync_time,
+                    'rate_limited': rate_limited,
+                    'rate_limit_count': self._rate_limit_count,
+                    'retry_after': retry_after
+                }
+                await col.replace_one(
+                    {'_id': 'sync_cache'},
+                    cache_data,
+                    upsert=True
+                )
         except Exception as e:
             logging.warning(f"Failed to save sync cache: {e}")
 
@@ -590,7 +603,7 @@ class DiscordBot(commands.Bot):
                 return
             
             current_hash = self._get_command_hash()
-            cache = self._load_sync_cache()
+            cache = await self._load_sync_cache()
             last_hash = cache.get('command_hash')
             last_sync = cache.get('last_sync', 0)
             was_rate_limited = cache.get('rate_limited', False)
@@ -638,7 +651,7 @@ class DiscordBot(commands.Bot):
                     # Reset rate limit counter on success
                     self._rate_limit_count = 0
                     self._last_sync_attempt = current_time
-                    self._save_sync_cache(current_hash, current_time, rate_limited=False, retry_after=None)
+                    await self._save_sync_cache(current_hash, current_time, rate_limited=False, retry_after=None)
                 except HTTPException as e:
                     if e.status == 429:
                         # Increment rate limit counter for exponential backoff
@@ -664,7 +677,7 @@ class DiscordBot(commands.Bot):
                         self._last_sync_attempt = current_time
                         
                         # Save that we were rate limited to prevent retries
-                        self._save_sync_cache(current_hash, current_time, rate_limited=True, retry_after=retry_after_seconds)
+                        await self._save_sync_cache(current_hash, current_time, rate_limited=True, retry_after=retry_after_seconds)
                         self._synced_commands = self.tree.get_commands()
                     else:
                         logging.error(f"Failed to sync slash commands: {e}")
@@ -688,7 +701,7 @@ class DiscordBot(commands.Bot):
                 await asyncio.sleep(300)  # Check every 5 minutes
                 
                 # Load cache to check status
-                cache = self._load_sync_cache()
+                cache = await self._load_sync_cache()
                 was_rate_limited = cache.get('rate_limited', False)
                 last_sync = cache.get('last_sync', 0)
                 rate_limit_count = cache.get('rate_limit_count', 0)
@@ -712,7 +725,7 @@ class DiscordBot(commands.Bot):
                             
                             # Reset rate limit on success
                             self._rate_limit_count = 0
-                            self._save_sync_cache(current_hash, current_time, rate_limited=False, retry_after=None)
+                            await self._save_sync_cache(current_hash, current_time, rate_limited=False, retry_after=None)
                         except HTTPException as e:
                             if e.status == 429:
                                 # Still rate limited, increase backoff
@@ -729,7 +742,7 @@ class DiscordBot(commands.Bot):
                                     f"⚠️ Auto-sync still rate limited. "
                                     f"Will retry in {hours}h (attempt #{self._rate_limit_count})"
                                 )
-                                self._save_sync_cache(current_hash, current_time, rate_limited=True, retry_after=retry_after_seconds)
+                                await self._save_sync_cache(current_hash, current_time, rate_limited=True, retry_after=retry_after_seconds)
                             else:
                                 logging.error(f"Auto-sync failed: {e}")
                         except Exception as e:
@@ -941,7 +954,7 @@ class DiscordBot(commands.Bot):
         print(f"\033[33mLoaded {len(self._synced_commands)} slash commands\033[0m")
         
         # Display auto-sync status
-        cache = self._load_sync_cache()
+        cache = await self._load_sync_cache()
         if cache.get('rate_limited', False):
             rate_limit_count = cache.get('rate_limit_count', 0)
             print(f"\033[33m⚠️  Auto-Sync: Rate limited ({rate_limit_count}x) - Will retry automatically\033[0m")
