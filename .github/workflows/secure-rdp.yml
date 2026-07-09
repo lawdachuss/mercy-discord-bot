@@ -129,26 +129,58 @@ jobs:
         run: |
           $wd = "${{ github.workspace }}"
           Set-Location -LiteralPath $wd
-          $env:PYTHONIOENCODING = 'utf-8'
 
-          $proc = Start-Process -FilePath python -ArgumentList "-u main.py" -NoNewWindow -PassThru -RedirectStandardOutput "bot_stdout.log" -RedirectStandardError "bot_stderr.log"
-          "BOT_PID=$($proc.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Bot started (PID: $($proc.Id)). Waiting 8s for startup..."
+          $job = Start-Job -Name "mercybot" -ScriptBlock {
+            param($wd, $token, $webhook, $mongo, $owners)
+            $env:PYTHONIOENCODING = 'utf-8'
+            $env:DISCORD_TOKEN = $token
+            $env:WEBHOOK_URL = $webhook
+            $env:MONGO_URL = $mongo
+            $env:OWNER_IDS = $owners
+            $env:AUTO_SYNC_COMMANDS = "true"
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "python"
+            $psi.Arguments = "-u main.py"
+            $psi.WorkingDirectory = $wd
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $envTable = $psi.EnvironmentVariables
+            $envTable["PYTHONIOENCODING"] = "utf-8"
+            $envTable["DISCORD_TOKEN"] = $token
+            $envTable["WEBHOOK_URL"] = $webhook
+            $envTable["MONGO_URL"] = $mongo
+            $envTable["OWNER_IDS"] = $owners
+            $envTable["AUTO_SYNC_COMMANDS"] = "true"
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $outLines = New-Object System.Collections.ArrayList
+            $errLines = New-Object System.Collections.ArrayList
+            $p.OutputDataReceived.Add({ param($s, $e); if ($e.Data) { [void]$outLines.Add($e.Data) } })
+            $p.ErrorDataReceived.Add({ param($s, $e); if ($e.Data) { [void]$errLines.Add($e.Data) } })
+            $p.BeginOutputReadLine()
+            $p.BeginErrorReadLine()
+            $p.WaitForExit()
+            [System.IO.File]::WriteAllLines("$wd\bot_stdout.log", $outLines)
+            [System.IO.File]::WriteAllLines("$wd\bot_stderr.log", $errLines)
+            exit $p.ExitCode
+          } -ArgumentList $wd, $env:DISCORD_TOKEN, $env:WEBHOOK_URL, $env:MONGO_URL, $env:OWNER_IDS
 
-          Start-Sleep -Seconds 8
+          Start-Sleep -Seconds 12
 
-          if ($proc.HasExited) {
-            Write-Host "::error::Bot exited with code $($proc.ExitCode)"
-            Write-Host "=== STDERR ==="
-            Get-Content "bot_stderr.log" -ErrorAction SilentlyContinue
-            Write-Host "=== STDOUT ==="
-            Get-Content "bot_stdout.log" -ErrorAction SilentlyContinue
+          if ($job.State -eq "Failed") {
+            Write-Host "::error::Bot job failed"
+            Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+          if ($job.State -eq "Completed") {
+            Write-Host "::error::Bot exited too early"
+            Get-Content "$wd\bot_stderr.log" -ErrorAction SilentlyContinue
+            Get-Content "$wd\bot_stdout.log" -ErrorAction SilentlyContinue
             exit 1
           }
 
           Write-Host "Bot is running."
-          $log = Get-Content "bot_stdout.log" -ErrorAction SilentlyContinue
-          if ($log) { Write-Host "=== Startup ==="; $log | Select-Object -Last 10 }
 
       - name: Verify RDP and Show Connection Details
         shell: powershell
@@ -176,11 +208,12 @@ jobs:
       - name: Keep Alive
         shell: powershell
         run: |
+          $wd = "${{ github.workspace }}"
           $endTime = (Get-Date).AddMinutes(345)
           while ((Get-Date) -lt $endTime) {
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            $log = Get-Content "bot_stdout.log" -ErrorAction SilentlyContinue
-            $err = Get-Content "bot_stderr.log" -ErrorAction SilentlyContinue
+            $log = Get-Content "$wd\bot_stdout.log" -ErrorAction SilentlyContinue
+            $err = Get-Content "$wd\bot_stderr.log" -ErrorAction SilentlyContinue
             if ($log) { Write-Host "=== STDOUT (last 5 lines) ==="; $log | Select-Object -Last 5 }
             if ($err) { Write-Host "=== STDERR (last 3 lines) ==="; $err | Select-Object -Last 3 }
             Write-Host "[$ts] Runner active... (bot running in background)"
