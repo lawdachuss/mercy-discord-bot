@@ -2,17 +2,11 @@ name: Secure RDP + Mercy Bot
 
 on:
   workflow_dispatch:
-    inputs:
-      skip_restore:
-        description: "Skip restoring previous session data from cache?"
-        required: false
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
   schedule:
     - cron: "0 */6 * * *"
+
+permissions:
+  contents: read
 
 jobs:
   rdp:
@@ -23,194 +17,99 @@ jobs:
       - name: Checkout bot code
         uses: actions/checkout@v4
 
-      - name: Setup Dirs and Start Background Tasks
-        shell: powershell
+      - name: Setup RDP + Tailscale + pip (parallel)
+        shell: pwsh
         run: |
-          $dirs = @(
-            "C:\rdp-session",
-            "C:\rdp-userdata\Desktop","C:\rdp-userdata\Documents",
-            "C:\rdp-userdata\Downloads","C:\rdp-userdata\Pictures",
-            "C:\rdp-userdata\Videos","C:\rdp-userdata\Music",
-            "C:\rdp-appdata\Roaming","C:\rdp-appdata\Local",
-            "C:\rdp-browser\Chrome","C:\rdp-browser\Edge",
-            "C:\rdp-cache-staging"
-          )
-          foreach ($d in $dirs) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
-          Write-Host "Cache directories created."
+          $wd = "${{ github.workspace }}"
+          Write-Host "=== Starting pip install in background ==="
+          $pipProc = Start-Process -FilePath pip -ArgumentList "install -r requirements.txt" -WorkingDirectory $wd -NoNewWindow -PassThru -RedirectStandardOutput "pip_stdout.log" -RedirectStandardError "pip_stderr.log"
+          "PIP_PID=$($pipProc.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "pip started (PID: $($pipProc.Id))."
 
+          Write-Host "=== Setting up directories ==="
+          New-Item -ItemType Directory -Force -Path "C:\rdp-session" | Out-Null
+
+          Write-Host "=== Downloading Tailscale ==="
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $tsInstaller = "$env:TEMP\tailscale.msi"
-          $tsJob = Start-Job -ScriptBlock {
-            param($url, $out)
-            Invoke-WebRequest -Uri $url -OutFile $out
-          } -ArgumentList $tsUrl, $tsInstaller
+          $tsJob = Start-Job -ScriptBlock { param($u,$o) Invoke-WebRequest -Uri $u -OutFile $o } -ArgumentList $tsUrl, $tsInstaller
 
-          $rdpJob = Start-Job -ScriptBlock {
-            Set-ItemProperty `
-              -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-              -Name "fDenyTSConnections" -Value 0
-            Set-ItemProperty `
-              -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-              -Name "UserAuthentication" -Value 1
-            Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-            Restart-Service TermService -Force
-          }
+          Write-Host "=== Configuring RDP ==="
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Restart-Service TermService -Force
 
+          Write-Host "=== Creating RDP user ==="
           $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
           $password = -join ((1..20) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name "RDP"
-          }
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) { Remove-LocalUser -Name "RDP" }
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "RDP user created."
 
-          $rdpJob | Wait-Job | Out-Null
-          $rdpJob | Remove-Job
-          Write-Host "RDP configured."
+          Write-Host "=== Waiting for Tailscale download ==="
+          $tsJob | Wait-Job | Out-Null; $tsJob | Remove-Job
 
-          Write-Host "Waiting for Tailscale download..."
-          $tsJob | Wait-Job | Out-Null
-          $tsJob | Remove-Job
-          Write-Host "Tailscale downloaded. Installing..."
+          Write-Host "=== Installing Tailscale ==="
           Start-Process msiexec.exe -ArgumentList "/i `"$tsInstaller`" /qn /norestart" -Wait
           Remove-Item $tsInstaller -Force -ErrorAction SilentlyContinue
-          Write-Host "Tailscale installed."
+          Write-Host "RDP + Tailscale ready. pip still installing in background."
 
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
           path: ~\AppData\Local\pip\Cache
           key: pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            pip-
 
-      - name: Setup Python and install dependencies
-        shell: powershell
+      - name: Finalize Setup (pip check + env + session)
+        shell: pwsh
         run: |
-          python --version
-          pip install -r requirements.txt
-          Write-Host "Python dependencies installed."
-
-      - name: Create .env from secrets
-        shell: powershell
-        run: |
-          @"
-          DISCORD_TOKEN=${{ secrets.DISCORD_TOKEN }}
-          WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
-          MONGO_URL=${{ secrets.MONGO_URL }}
-          OWNER_IDS=${{ secrets.OWNER_IDS }}
-          AUTO_SYNC_COMMANDS=true
-          "@ | Out-File -FilePath .env -Encoding utf8
-          Write-Host ".env file created."
-
-      - name: Resolve Restore Flag
-        shell: powershell
-        run: |
-          $skipRestore = "${{ github.event.inputs.skip_restore }}"
-          if ($skipRestore -eq "true") {
-            "SHOULD_RESTORE=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "=== Waiting for pip install ==="
+          $pipProc = Get-Process -Id $env:PIP_PID -ErrorAction SilentlyContinue
+          if ($pipProc) {
+            $pipProc.WaitForExit()
+            if ($pipProc.ExitCode -ne 0) {
+              Write-Host "::error::pip install failed (exit $($pipProc.ExitCode))"
+              Get-Content "pip_stderr.log" -ErrorAction SilentlyContinue
+              exit 1
+            }
+            Remove-Variable pipProc
           } else {
-            "SHOULD_RESTORE=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "pip already finished."
+            $pipLog = Get-Content "pip_stdout.log" -ErrorAction SilentlyContinue
+            if ($pipLog -match "error|failed") {
+              Write-Host "::error::pip may have failed. Check logs."
+              Get-Content "pip_stderr.log" -ErrorAction SilentlyContinue
+            }
           }
+          Write-Host "pip install completed."
 
-      - name: Restore Session Metadata Cache
-        if: env.SHOULD_RESTORE == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: C:\rdp-session
-          key: rdp-session-data
-          restore-keys: rdp-session-
-
-      - name: Restore User Data Cache
-        if: env.SHOULD_RESTORE == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: C:\rdp-userdata
-          key: rdp-userdata-v1
-          restore-keys: rdp-userdata-
-
-      - name: Restore AppData Cache
-        if: env.SHOULD_RESTORE == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: C:\rdp-appdata
-          key: rdp-appdata-v1
-          restore-keys: rdp-appdata-
-
-      - name: Restore Browser Data Cache
-        if: env.SHOULD_RESTORE == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: C:\rdp-browser
-          key: rdp-browser-v1
-          restore-keys: rdp-browser-
-
-      - name: Load Session Data and Restore Files
-        shell: powershell
-        run: |
+          Write-Host "=== Loading session metadata ==="
           $cacheFile = "C:\rdp-session\session.json"
           if (Test-Path $cacheFile) {
-            $session = Get-Content $cacheFile | ConvertFrom-Json
-            $runCount  = $session.run_count
-            $createdAt = $session.created_at
-            Write-Host "Previous runs: $runCount | First created: $createdAt"
+            $s = Get-Content $cacheFile | ConvertFrom-Json
+            $runCount = $s.run_count; $createdAt = $s.created_at
           } else {
-            $runCount  = 0
-            $createdAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            Write-Host "No previous cache - fresh session."
+            $runCount = 0; $createdAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
           }
           "CACHED_RUN_COUNT=$runCount"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CACHED_CREATED_AT=$createdAt" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Session: #$runCount | Created: $createdAt"
 
           $rdpHome = "C:\Users\RDP"
-          for ($i = 0; $i -lt 15; $i++) {
-            if (Test-Path $rdpHome) { break }
-            Start-Sleep -Seconds 2
-          }
           if (-not (Test-Path $rdpHome)) {
             New-Item -ItemType Directory -Force -Path $rdpHome | Out-Null
           }
-
-          $restoreMap = @{
-            "C:\rdp-userdata\Desktop"   = "$rdpHome\Desktop"
-            "C:\rdp-userdata\Documents" = "$rdpHome\Documents"
-            "C:\rdp-userdata\Downloads" = "$rdpHome\Downloads"
-            "C:\rdp-userdata\Pictures"  = "$rdpHome\Pictures"
-            "C:\rdp-userdata\Videos"    = "$rdpHome\Videos"
-            "C:\rdp-userdata\Music"     = "$rdpHome\Music"
-            "C:\rdp-appdata\Roaming"    = "$rdpHome\AppData\Roaming"
-            "C:\rdp-appdata\Local"      = "$rdpHome\AppData\Local"
-            "C:\rdp-browser\Chrome"     = "$rdpHome\AppData\Local\Google\Chrome\User Data"
-            "C:\rdp-browser\Edge"       = "$rdpHome\AppData\Local\Microsoft\Edge\User Data"
-          }
-
-          $restoreJobs = @()
-          foreach ($src in $restoreMap.Keys) {
-            $dst = $restoreMap[$src]
-            if ((Test-Path $src) -and (Get-ChildItem $src -ErrorAction SilentlyContinue)) {
-              New-Item -ItemType Directory -Force -Path $dst | Out-Null
-              $restoreJobs += Start-Job -ScriptBlock {
-                param($s, $d)
-                robocopy $s $d /MIR /MT:8 /R:1 /W:1 /NFL /NDL /NJH /NJS /XJ /XF "*.lock" "*.ldb" "*.log" 2>$null | Out-Null
-              } -ArgumentList $src, $dst
-            }
-          }
-
-          if ($restoreJobs.Count -gt 0) {
-            Write-Host "Restoring $($restoreJobs.Count) folders in parallel..."
-            $restoreJobs | Wait-Job | Out-Null
-            $restoreJobs | Remove-Job
-            Write-Host "All files restored."
-          } else {
-            Write-Host "No cached files to restore (first run)."
+          @("Desktop","Documents","Downloads","Pictures","Videos","Music") | ForEach-Object {
+            $p = "$rdpHome\$_"
+            if (-not (Test-Path $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
           }
 
       - name: Connect Tailscale
-        shell: powershell
+        shell: pwsh
         run: |
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
           $hostname  = "mercy-bot-${{ github.run_id }}"
@@ -218,12 +117,7 @@ jobs:
           Start-Service Tailscale
           Start-Sleep -Seconds 5
 
-          & $tailscale up `
-            --authkey="${{ secrets.TAILSCALE_KEY }}" `
-            --hostname="$hostname" `
-            --accept-routes `
-            --reset
-
+          & $tailscale up --authkey="${{ secrets.TAILSCALE_KEY }}" --hostname="$hostname" --accept-routes --reset
           if ($LASTEXITCODE -ne 0) { Write-Error "Tailscale failed"; exit 1 }
 
           $ip = $null
@@ -236,10 +130,10 @@ jobs:
 
           "TAILSCALE_IP=$ip"      | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TS_HOSTNAME=$hostname" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          & $tailscale status
+          Write-Host "Tailscale IP: $ip"
 
       - name: Start Mercy Bot
-        shell: powershell
+        shell: pwsh
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
@@ -252,45 +146,33 @@ jobs:
           $env:PYTHONIOENCODING = 'utf-8'
 
           $proc = Start-Process -FilePath python -ArgumentList "-u main.py" -NoNewWindow -PassThru -RedirectStandardOutput "bot_stdout.log" -RedirectStandardError "bot_stderr.log"
-
           "BOT_PID=$($proc.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Bot started (PID: $($proc.Id)). Waiting 15s for startup..."
+          Write-Host "Bot started (PID: $($proc.Id)). Waiting 8s for startup..."
 
-          Start-Sleep -Seconds 15
+          Start-Sleep -Seconds 8
 
           if ($proc.HasExited) {
-            Write-Host "::error::Bot exited immediately with code $($proc.ExitCode)"
+            Write-Host "::error::Bot exited with code $($proc.ExitCode)"
             Write-Host "=== STDERR ==="
             Get-Content "bot_stderr.log" -ErrorAction SilentlyContinue
-            Write-Host "=== STDOUT (last 20 lines) ==="
-            Get-Content "bot_stdout.log" -ErrorAction SilentlyContinue | Select-Object -Last 20
+            Write-Host "=== STDOUT ==="
+            Get-Content "bot_stdout.log" -ErrorAction SilentlyContinue
             exit 1
           }
 
-          Write-Host "Bot process is running (PID: $($proc.Id))."
-          $stdout = Get-Content "bot_stdout.log" -ErrorAction SilentlyContinue
-          if ($stdout) {
-            Write-Host "=== Startup output ==="
-            $stdout | Select-Object -Last 10
-          }
+          Write-Host "Bot is running."
+          $log = Get-Content "bot_stdout.log" -ErrorAction SilentlyContinue
+          if ($log) { Write-Host "=== Startup ==="; $log | Select-Object -Last 10 }
 
       - name: Verify RDP and Show Connection Details
-        shell: powershell
+        shell: pwsh
         run: |
-          $ipJob = Start-Job -ScriptBlock { Invoke-RestMethod "https://api.ipify.org" }
-
           $rdpOk = $false
           for ($i = 0; $i -lt 10; $i++) {
             $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
             if ($test.TcpTestSucceeded) { $rdpOk = $true; break }
-            Start-Sleep -Seconds 5
+            Start-Sleep -Seconds 3
           }
-
-          $ipJob | Wait-Job | Out-Null
-          $publicIP = Receive-Job $ipJob
-          Remove-Job $ipJob
-
-          if (-not $rdpOk) { Write-Error "RDP port not reachable"; exit 1 }
 
           $runCount = [int]$env:CACHED_RUN_COUNT + 1
           Write-Host ""
@@ -300,145 +182,36 @@ jobs:
           Write-Host "Tailscale IP : $env:TAILSCALE_IP"
           Write-Host "Username     : RDP"
           Write-Host "Password     : $env:RDP_PASSWORD"
-          Write-Host "Public IP    : $publicIP"
           Write-Host "Session #    : $runCount"
-          Write-Host "Bot running  : YES (background job)"
+          Write-Host "Bot running  : YES"
           Write-Host "Bot logs     : bot_stdout.log / bot_stderr.log"
           Write-Host "======================================="
 
-      - name: Keep Alive + Real-Time File Sync
-        shell: powershell
+      - name: Keep Alive
+        shell: pwsh
         run: |
-          $rdpHome  = "C:\Users\RDP"
-          $syncFlag = "C:\rdp-cache-staging\.needs_sync"
-
-          $watchPaths = @(
-            "$rdpHome\Desktop","$rdpHome\Documents","$rdpHome\Downloads",
-            "$rdpHome\Pictures","$rdpHome\Videos","$rdpHome\Music",
-            "$rdpHome\AppData\Roaming","$rdpHome\AppData\Local"
-          )
-
-          foreach ($path in $watchPaths) {
-            if (-not (Test-Path $path)) { New-Item -ItemType Directory -Force -Path $path | Out-Null }
-            $w = New-Object System.IO.FileSystemWatcher
-            $w.Path                  = $path
-            $w.IncludeSubdirectories = $true
-            $w.EnableRaisingEvents   = $true
-            $action = {
-              $flag = "C:\rdp-cache-staging\.needs_sync"
-              if (-not (Test-Path $flag)) { New-Item -ItemType File -Force -Path $flag | Out-Null }
-            }
-            Register-ObjectEvent $w "Changed" -Action $action | Out-Null
-            Register-ObjectEvent $w "Created" -Action $action | Out-Null
-            Register-ObjectEvent $w "Deleted" -Action $action | Out-Null
-            Register-ObjectEvent $w "Renamed" -Action $action | Out-Null
-          }
-
-          Write-Host "FileSystemWatcher active. Changes sync every 5 min."
-          Write-Host "Bot is running in background. Check bot_stdout.log for status."
-
-          function Sync-ToStaging {
-            $ts = Get-Date -Format "HH:mm:ss"
-            Write-Host "[$ts] Syncing changes..."
-            $map = @{
-              "$rdpHome\Desktop"         = "C:\rdp-userdata\Desktop"
-              "$rdpHome\Documents"       = "C:\rdp-userdata\Documents"
-              "$rdpHome\Downloads"       = "C:\rdp-userdata\Downloads"
-              "$rdpHome\Pictures"        = "C:\rdp-userdata\Pictures"
-              "$rdpHome\Videos"          = "C:\rdp-userdata\Videos"
-              "$rdpHome\Music"           = "C:\rdp-userdata\Music"
-              "$rdpHome\AppData\Roaming" = "C:\rdp-appdata\Roaming"
-              "$rdpHome\AppData\Local"   = "C:\rdp-appdata\Local"
-            }
-            $chrome = "$rdpHome\AppData\Local\Google\Chrome\User Data"
-            $edge   = "$rdpHome\AppData\Local\Microsoft\Edge\User Data"
-            if (Test-Path $chrome) { $map[$chrome] = "C:\rdp-browser\Chrome" }
-            if (Test-Path $edge)   { $map[$edge]   = "C:\rdp-browser\Edge" }
-
-            $syncJobs = @()
-            foreach ($src in $map.Keys) {
-              $dst = $map[$src]
-              if (Test-Path $src) {
-                New-Item -ItemType Directory -Force -Path $dst | Out-Null
-                $syncJobs += Start-Job -ScriptBlock {
-                  param($s, $d)
-                  robocopy $s $d /MIR /MT:8 /R:1 /W:1 /NFL /NDL /NJH /NJS /XJ /XF "*.lock" "*.ldb" "*.log" 2>$null | Out-Null
-                } -ArgumentList $src, $dst
-              }
-            }
-            if ($syncJobs.Count -gt 0) {
-              $syncJobs | Wait-Job | Out-Null
-              $syncJobs | Remove-Job
-            }
-            Remove-Item $syncFlag -Force -ErrorAction SilentlyContinue
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Sync complete."
-          }
-
-          $endTime      = (Get-Date).AddMinutes(345)
-          $lastSyncTime = Get-Date
-          $syncCooldown = 300
-
+          $endTime = (Get-Date).AddMinutes(345)
           while ((Get-Date) -lt $endTime) {
-            $secsSinceLast = ((Get-Date) - $lastSyncTime).TotalSeconds
-
-            if ((Test-Path $syncFlag) -and ($secsSinceLast -ge $syncCooldown)) {
-              Sync-ToStaging
-              $lastSyncTime = Get-Date
-            }
-
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            Write-Host "[$ts] Runner active..."
+            Write-Host "[$ts] Runner active... (bot running in background)"
             Start-Sleep -Seconds 60
           }
 
-          Write-Host "Session ending - final sync..."
-          Sync-ToStaging
-          Write-Host "Done."
-
       - name: Save Session Metadata
         if: always()
-        shell: powershell
+        shell: pwsh
         run: |
           $runCount = [int]$env:CACHED_RUN_COUNT + 1
           New-Item -ItemType Directory -Force -Path "C:\rdp-session" | Out-Null
           $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
           $createdAt = $env:CACHED_CREATED_AT
           if (-not $createdAt) { $createdAt = $now }
-          $json = @{
+          @{
             hostname     = "$env:TS_HOSTNAME"
             tailscale_ip = "$env:TAILSCALE_IP"
             run_count    = $runCount
             created_at   = $createdAt
             last_run_at  = $now
             last_run_id  = "${{ github.run_id }}"
-          } | ConvertTo-Json
-          $json | Set-Content "C:\rdp-session\session.json" -Encoding utf8
-          Write-Host "Metadata saved. Total sessions: $runCount"
-
-      - name: Store Session Metadata Cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: C:\rdp-session
-          key: rdp-session-data
-
-      - name: Store User Data Cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: C:\rdp-userdata
-          key: rdp-userdata-v1
-
-      - name: Store AppData Cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: C:\rdp-appdata
-          key: rdp-appdata-v1
-
-      - name: Store Browser Data Cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: C:\rdp-browser
-          key: rdp-browser-v1
+          } | ConvertTo-Json | Set-Content "C:\rdp-session\session.json" -Encoding utf8
+          Write-Host "Session saved. Total: $runCount"
