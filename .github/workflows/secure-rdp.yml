@@ -240,6 +240,12 @@ jobs:
 
       - name: Start Mercy Bot
         shell: powershell
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          MONGO_URL: ${{ secrets.MONGO_URL }}
+          OWNER_IDS: ${{ secrets.OWNER_IDS }}
+          AUTO_SYNC_COMMANDS: "true"
         run: |
           $wd = "${{ github.workspace }}"
           Set-Location -LiteralPath $wd
