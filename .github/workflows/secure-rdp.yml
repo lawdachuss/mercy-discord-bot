@@ -17,20 +17,15 @@ jobs:
       - name: Checkout bot code
         uses: actions/checkout@v4
 
-      - name: Setup RDP + Tailscale + pip (parallel)
+      - name: Setup RDP + Tailscale + pip
         shell: powershell
         run: |
           $wd = "${{ github.workspace }}"
           Set-Location -LiteralPath $wd
-          Write-Host "=== Starting pip install in background ==="
-          $pipProc = Start-Process -FilePath python -ArgumentList "-m pip install -r requirements.txt" -NoNewWindow -PassThru -RedirectStandardOutput "pip_stdout.log" -RedirectStandardError "pip_stderr.log"
-          "PIP_PID=$($pipProc.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "pip started (PID: $($pipProc.Id))."
 
-          Write-Host "=== Setting up directories ==="
           New-Item -ItemType Directory -Force -Path "C:\rdp-session" | Out-Null
 
-          Write-Host "=== Downloading Tailscale ==="
+          Write-Host "=== Downloading Tailscale (background) ==="
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $tsInstaller = "$env:TEMP\tailscale.msi"
           $tsJob = Start-Job -ScriptBlock { param($u,$o) Invoke-WebRequest -Uri $u -OutFile $o } -ArgumentList $tsUrl, $tsInstaller
@@ -51,13 +46,22 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+          Write-Host "=== Installing Python dependencies (parallel with Tailscale download) ==="
+          python -m pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed"; exit 1 }
+          Write-Host "pip install completed."
+
+          Write-Host "=== Verifying discord module ==="
+          python -c "import discord; print(f'discord.py {discord.__version__}')"
+          if ($LASTEXITCODE -ne 0) { Write-Error "discord not found"; exit 1 }
+
           Write-Host "=== Waiting for Tailscale download ==="
           $tsJob | Wait-Job | Out-Null; $tsJob | Remove-Job
 
           Write-Host "=== Installing Tailscale ==="
           Start-Process msiexec.exe -ArgumentList "/i `"$tsInstaller`" /qn /norestart" -Wait
           Remove-Item $tsInstaller -Force -ErrorAction SilentlyContinue
-          Write-Host "RDP + Tailscale ready. pip still installing in background."
+          Write-Host "Setup complete."
 
       - name: Cache pip packages
         uses: actions/cache@v4
@@ -65,31 +69,9 @@ jobs:
           path: ~\AppData\Local\pip\Cache
           key: pip-${{ hashFiles('requirements.txt') }}
 
-      - name: Finalize Setup (pip check + env + session)
+      - name: Finalize Setup (session metadata + user dirs)
         shell: powershell
         run: |
-          Write-Host "=== Waiting for pip install ==="
-          $pipProc = Get-Process -Id $env:PIP_PID -ErrorAction SilentlyContinue
-          if ($pipProc) {
-            $pipProc.WaitForExit()
-            if ($pipProc.ExitCode -ne 0) {
-              Write-Host "::error::pip install failed (exit $($pipProc.ExitCode))"
-              Get-Content "pip_stderr.log" -ErrorAction SilentlyContinue
-              exit 1
-            }
-          } else {
-            Write-Host "pip already finished."
-          }
-          Write-Host "pip install completed."
-
-          Write-Host "=== Verifying Python modules ==="
-          python -c "import discord; print(f'discord.py {discord.__version__}')" 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::discord module not found after pip install"
-            Get-Content "pip_stdout.log" -ErrorAction SilentlyContinue | Select-Object -Last 30
-            Get-Content "pip_stderr.log" -ErrorAction SilentlyContinue | Select-Object -Last 10
-            exit 1
-          }
 
           Write-Host "=== Loading session metadata ==="
           $cacheFile = "C:\rdp-session\session.json"
