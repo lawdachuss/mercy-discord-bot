@@ -118,7 +118,7 @@ jobs:
           "TS_HOSTNAME=$hostname" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tailscale IP: $ip"
 
-      - name: Start Mercy Bot
+      - name: Start Mercy Bot + Keep Alive
         shell: powershell
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
@@ -129,32 +129,35 @@ jobs:
         run: |
           $wd = "${{ github.workspace }}"
 
-          $proc = Start-Process -FilePath python -ArgumentList "-u main.py" -WorkingDirectory $wd -WindowStyle Hidden -PassThru -RedirectStandardOutput "$wd\bot_stdout.log" -RedirectStandardError "$wd\bot_stderr.log"
-          Write-Host "Bot started (PID: $($proc.Id)). Waiting 12s for startup..."
+          $job = Start-Job -Name "mercybot" -ScriptBlock {
+            param($wd, $token, $webhook, $mongo, $owners)
+            Set-Location -LiteralPath $wd
+            $env:DISCORD_TOKEN = $token
+            $env:WEBHOOK_URL = $webhook
+            $env:MONGO_URL = $mongo
+            $env:OWNER_IDS = $owners
+            $env:AUTO_SYNC_COMMANDS = "true"
+            python -u main.py
+          } -ArgumentList $wd, $env:DISCORD_TOKEN, $env:WEBHOOK_URL, $env:MONGO_URL, $env:OWNER_IDS
 
-          Start-Sleep -Seconds 12
+          Start-Sleep -Seconds 15
 
-          if ($proc.HasExited) {
-            Write-Host "::error::Bot exited with code $($proc.ExitCode)"
-            Write-Host "=== STDERR ==="
-            Get-Content "$wd\bot_stderr.log" -ErrorAction SilentlyContinue
-            Write-Host "=== STDOUT ==="
-            Get-Content "$wd\bot_stdout.log" -ErrorAction SilentlyContinue
+          # Show initial bot output
+          $initialOutput = Receive-Job $job -ErrorAction SilentlyContinue
+          if ($initialOutput) { Write-Host $initialOutput }
+
+          if ($job.State -eq "Failed") {
+            Write-Host "::error::Bot job failed"
+            Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+          if ($job.State -eq "Completed") {
+            Write-Host "::error::Bot exited too early"
+            Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
             exit 1
           }
 
-          Write-Host "Bot is running."
-
-      - name: Verify RDP and Show Connection Details
-        shell: powershell
-        run: |
-          $rdpOk = $false
-          for ($i = 0; $i -lt 10; $i++) {
-            $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-            if ($test.TcpTestSucceeded) { $rdpOk = $true; break }
-            Start-Sleep -Seconds 3
-          }
-
+          # Show connection details once
           $runCount = [int]$env:CACHED_RUN_COUNT + 1
           Write-Host ""
           Write-Host "======================================="
@@ -164,23 +167,28 @@ jobs:
           Write-Host "Username     : RDP"
           Write-Host "Password     : $env:RDP_PASSWORD"
           Write-Host "Session #    : $runCount"
-          Write-Host "Bot running  : YES"
-          Write-Host "Bot logs     : bot_stdout.log / bot_stderr.log"
+          Write-Host "Bot PID      : (see job output above)"
           Write-Host "======================================="
 
-      - name: Keep Alive
-        shell: powershell
-        run: |
-          $wd = "${{ github.workspace }}"
+          # Keep Alive: stream bot output + keep runner alive
           $endTime = (Get-Date).AddMinutes(345)
           while ((Get-Date) -lt $endTime) {
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            $log = Get-Content "$wd\bot_stdout.log" -ErrorAction SilentlyContinue
-            $err = Get-Content "$wd\bot_stderr.log" -ErrorAction SilentlyContinue
-            if ($log) { Write-Host "=== STDOUT (last 5 lines) ==="; $log | Select-Object -Last 5 }
-            if ($err) { Write-Host "=== STDERR (last 3 lines) ==="; $err | Select-Object -Last 3 }
-            Write-Host "[$ts] Runner active... (bot running in background)"
-            Start-Sleep -Seconds 60
+            $output = Receive-Job $job -ErrorAction SilentlyContinue
+            if ($output) { $output | ForEach-Object { Write-Host $_ } }
+
+            if ($job.State -eq "Failed") {
+              Write-Host "::error::Bot crashed"
+              Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              exit 1
+            }
+            if ($job.State -eq "Completed") {
+              Write-Host "Bot exited gracefully."
+              exit 0
+            }
+
+            Write-Host "[$ts] Bot alive (PID via job)..."
+            Start-Sleep -Seconds 30
           }
 
       - name: Save Session Metadata
