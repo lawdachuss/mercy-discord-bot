@@ -18,11 +18,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup RDP + Tailscale + pip (parallel)
-        shell: pwsh
+        shell: powershell
         run: |
           $wd = "${{ github.workspace }}"
+          Set-Location -LiteralPath $wd
           Write-Host "=== Starting pip install in background ==="
-          $pipProc = Start-Process -FilePath pip -ArgumentList "install -r requirements.txt" -WorkingDirectory $wd -NoNewWindow -PassThru -RedirectStandardOutput "pip_stdout.log" -RedirectStandardError "pip_stderr.log"
+          $pipProc = Start-Process -FilePath pip -ArgumentList "install -r requirements.txt" -NoNewWindow -PassThru -RedirectStandardOutput "pip_stdout.log" -RedirectStandardError "pip_stderr.log"
           "PIP_PID=$($pipProc.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "pip started (PID: $($pipProc.Id))."
 
@@ -41,7 +42,7 @@ jobs:
           Restart-Service TermService -Force
 
           Write-Host "=== Creating RDP user ==="
-          $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+          $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#"
           $password = -join ((1..20) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) { Remove-LocalUser -Name "RDP" }
@@ -65,7 +66,7 @@ jobs:
           key: pip-${{ hashFiles('requirements.txt') }}
 
       - name: Finalize Setup (pip check + env + session)
-        shell: pwsh
+        shell: powershell
         run: |
           Write-Host "=== Waiting for pip install ==="
           $pipProc = Get-Process -Id $env:PIP_PID -ErrorAction SilentlyContinue
@@ -109,7 +110,7 @@ jobs:
           }
 
       - name: Connect Tailscale
-        shell: pwsh
+        shell: powershell
         run: |
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
           $hostname  = "mercy-bot-${{ github.run_id }}"
@@ -133,7 +134,7 @@ jobs:
           Write-Host "Tailscale IP: $ip"
 
       - name: Start Mercy Bot
-        shell: pwsh
+        shell: powershell
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
@@ -165,7 +166,7 @@ jobs:
           if ($log) { Write-Host "=== Startup ==="; $log | Select-Object -Last 10 }
 
       - name: Verify RDP and Show Connection Details
-        shell: pwsh
+        shell: powershell
         run: |
           $rdpOk = $false
           for ($i = 0; $i -lt 10; $i++) {
@@ -188,7 +189,7 @@ jobs:
           Write-Host "======================================="
 
       - name: Keep Alive
-        shell: pwsh
+        shell: powershell
         run: |
           $endTime = (Get-Date).AddMinutes(345)
           while ((Get-Date) -lt $endTime) {
@@ -199,7 +200,7 @@ jobs:
 
       - name: Save Session Metadata
         if: always()
-        shell: pwsh
+        shell: powershell
         run: |
           $runCount = [int]$env:CACHED_RUN_COUNT + 1
           New-Item -ItemType Directory -Force -Path "C:\rdp-session" | Out-Null
