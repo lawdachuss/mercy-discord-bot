@@ -791,7 +791,90 @@ class Matchmaker(commands.Cog):
                     raise
                 await asyncio.sleep(0.1 * (attempt + 1))
 
-    # ----- Matching Loop -----
+    # ----- Matching -----
+
+    async def get_config(self, guild_id: int) -> Optional[dict]:
+        try:
+            cfg = await self.guild_config_col.find_one({"guild_id": guild_id})
+            return cfg
+        except Exception:
+            return None
+
+    async def _create_match_thread(self, guild: discord.Guild, u1_id: int, u2_id: int) -> Optional[discord.Thread]:
+        try:
+            cfg = await self.get_config(guild.id)
+            channel_id = cfg.get("channel_id") if cfg else None
+            channel = guild.get_channel(channel_id) if channel_id else None
+            if not channel:
+                for ch in guild.text_channels:
+                    if ch.permissions_for(guild.me).create_private_threads:
+                        channel = ch
+                        break
+            if not channel:
+                return None
+
+            ts = int(time.time())
+            thread = await channel.create_thread(
+                name=f"match-{u1_id}-{u2_id}-{ts}",
+                type=discord.ChannelType.private_thread,
+                reason="Matchmaking"
+            )
+
+            m1 = guild.get_member(u1_id) or await guild.fetch_member(u1_id)
+            m2 = guild.get_member(u2_id) or await guild.fetch_member(u2_id)
+            for m in (m1, m2):
+                if m:
+                    await self._grant_thread_overwrites(thread, m)
+                    await thread.add_user(m)
+
+            meta = {"pairs": [u1_id, u2_id], "created_at": ts}
+            self.match_meta[thread.id] = meta
+
+            await self.matches_col.update_one(
+                {"thread_id": thread.id},
+                {"$set": {
+                    "thread_id": thread.id,
+                    "guild_id": guild.id,
+                    "user1_id": u1_id,
+                    "user2_id": u2_id,
+                    "status": "open",
+                    "created_at": ts,
+                    "last_activity": ts
+                }},
+                upsert=True
+            )
+
+            self.bot.add_view(ThreadControls(self, guild.id, thread.id))
+            return thread
+        except Exception:
+            return None
+
+    async def _attempt_match(self, guild: discord.Guild):
+        try:
+            async with self._locks[guild.id]:
+                pair = await self.dequeue_pair(guild)
+                if pair is None:
+                    return
+                u1_doc, u2_doc = pair
+                u1_id = int(u1_doc["user_id"])
+                u2_id = int(u2_doc["user_id"])
+
+                await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u1_id})
+                await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u2_id})
+
+                thread = await self._create_match_thread(guild, u1_id, u2_id)
+                if thread:
+                    try:
+                        m1 = guild.get_member(u1_id) or await guild.fetch_member(u1_id)
+                        m2 = guild.get_member(u2_id) or await guild.fetch_member(u2_id)
+                        if m1:
+                            await notif_manager.send(m1, f"Match found! Join your private thread: {thread.mention}", "match")
+                        if m2:
+                            await notif_manager.send(m2, f"Match found! Join your private thread: {thread.mention}", "match")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     @tasks.loop(seconds=5)
     async def match_loop(self):
@@ -876,6 +959,21 @@ class Matchmaker(commands.Cog):
     async def before_cleanup_loop(self):
         await self.bot.wait_until_ready()
 
+    @tasks.loop(minutes=5)
+    async def queue_panel_loop(self):
+        if not self._initialized:
+            return
+
+    @tasks.loop(minutes=2)
+    async def cleanup_loop(self):
+        if not self._initialized:
+            return
+
+    @tasks.loop(minutes=5)
+    async def dm_cleanup_loop(self):
+        if not self._initialized:
+            return
+
     @match_loop.before_loop
     async def before_loop(self):
         await self.bot.wait_until_ready()
@@ -887,3 +985,6 @@ class Matchmaker(commands.Cog):
             self.dm_cleanup_loop.start()
         if not self.cleanup_inactive_threads.is_running():
             self.cleanup_inactive_threads.start()
+
+async def setup(bot):
+    await bot.add_cog(Matchmaker(bot))

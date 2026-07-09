@@ -17,6 +17,11 @@ import json
 import hashlib
 from motor.motor_asyncio import AsyncIOMotorClient
 
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 # Load environment variables
 load_dotenv()
 

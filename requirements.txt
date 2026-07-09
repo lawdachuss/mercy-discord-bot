@@ -2,6 +2,7 @@ aiohttp
 aiosqlite
 backoff
 discord.py[voice]
+tzdata
 python-dotenv
 humanize
 matplotlib
