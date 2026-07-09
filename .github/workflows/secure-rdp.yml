@@ -128,29 +128,17 @@ jobs:
           AUTO_SYNC_COMMANDS: "true"
         run: |
           $wd = "${{ github.workspace }}"
-          Set-Location -LiteralPath $wd
 
-          $job = Start-Job -Name "mercybot" -ScriptBlock {
-            param($wd, $token, $webhook, $mongo, $owners)
-            $env:DISCORD_TOKEN = $token
-            $env:WEBHOOK_URL = $webhook
-            $env:MONGO_URL = $mongo
-            $env:OWNER_IDS = $owners
-            $env:AUTO_SYNC_COMMANDS = "true"
-            python "$wd\start_bot.py" "$wd"
-            exit $LASTEXITCODE
-          } -ArgumentList $wd, $env:DISCORD_TOKEN, $env:WEBHOOK_URL, $env:MONGO_URL, $env:OWNER_IDS
+          $proc = Start-Process -FilePath python -ArgumentList "-u main.py" -WorkingDirectory $wd -WindowStyle Hidden -PassThru -RedirectStandardOutput "$wd\bot_stdout.log" -RedirectStandardError "$wd\bot_stderr.log"
+          Write-Host "Bot started (PID: $($proc.Id)). Waiting 12s for startup..."
 
           Start-Sleep -Seconds 12
 
-          if ($job.State -eq "Failed") {
-            Write-Host "::error::Bot job failed"
-            Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-            exit 1
-          }
-          if ($job.State -eq "Completed") {
-            Write-Host "::error::Bot exited too early"
+          if ($proc.HasExited) {
+            Write-Host "::error::Bot exited with code $($proc.ExitCode)"
+            Write-Host "=== STDERR ==="
             Get-Content "$wd\bot_stderr.log" -ErrorAction SilentlyContinue
+            Write-Host "=== STDOUT ==="
             Get-Content "$wd\bot_stdout.log" -ErrorAction SilentlyContinue
             exit 1
           }
