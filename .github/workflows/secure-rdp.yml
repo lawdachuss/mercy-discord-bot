@@ -233,16 +233,32 @@ jobs:
       - name: Start Mercy Bot
         shell: powershell
         run: |
-          $botJob = Start-Job -ScriptBlock {
-            param($wd)
-            Set-Location -LiteralPath $wd
-            $env:PYTHONIOENCODING = 'utf-8'
-            $process = Start-Process -FilePath python -ArgumentList "main.py" -NoNewWindow -PassThru -RedirectStandardOutput "bot_stdout.log" -RedirectStandardError "bot_stderr.log"
-            $process.WaitForExit()
-          } -ArgumentList ${{ github.workspace }}
+          $wd = "${{ github.workspace }}"
+          Set-Location -LiteralPath $wd
+          $env:PYTHONIOENCODING = 'utf-8'
 
-          "BOT_JOB_ID=$($botJob.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Bot started as background job."
+          $proc = Start-Process -FilePath python -ArgumentList "-u main.py" -NoNewWindow -PassThru -RedirectStandardOutput "bot_stdout.log" -RedirectStandardError "bot_stderr.log"
+
+          "BOT_PID=$($proc.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Bot started (PID: $($proc.Id)). Waiting 15s for startup..."
+
+          Start-Sleep -Seconds 15
+
+          if ($proc.HasExited) {
+            Write-Host "::error::Bot exited immediately with code $($proc.ExitCode)"
+            Write-Host "=== STDERR ==="
+            Get-Content "bot_stderr.log" -ErrorAction SilentlyContinue
+            Write-Host "=== STDOUT (last 20 lines) ==="
+            Get-Content "bot_stdout.log" -ErrorAction SilentlyContinue | Select-Object -Last 20
+            exit 1
+          }
+
+          Write-Host "Bot process is running (PID: $($proc.Id))."
+          $stdout = Get-Content "bot_stdout.log" -ErrorAction SilentlyContinue
+          if ($stdout) {
+            Write-Host "=== Startup output ==="
+            $stdout | Select-Object -Last 10
+          }
 
       - name: Verify RDP and Show Connection Details
         shell: powershell
