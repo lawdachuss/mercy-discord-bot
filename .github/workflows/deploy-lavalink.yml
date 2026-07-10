@@ -109,8 +109,16 @@ jobs:
       - name: Open firewall for Lavalink
         shell: powershell
         run: |
-          New-NetFirewallRule -DisplayName "Lavalink 2333" -Direction Inbound -LocalPort 2333 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
-          Write-Host "Firewall rule added"
+          netsh advfirewall firewall add rule name="Lavalink 2333" dir=in protocol=tcp localport=2333 action=allow profile=any
+          $tailscaleIF = (Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*Tailscale*" }).Name
+          if ($tailscaleIF) {
+            Set-NetFirewallProfile -Profile Public -Enabled False -ErrorAction SilentlyContinue
+            Write-Host "Disabled Public firewall for Tailscale interface: $tailscaleIF"
+          } else {
+            Write-Host "No Tailscale interface found, disabling public firewall anyway"
+            Set-NetFirewallProfile -Profile Public -Enabled False -ErrorAction SilentlyContinue
+          }
+          Write-Host "Firewall configured"
 
       - name: Start Lavalink server
         shell: powershell
