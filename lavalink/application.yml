@@ -21,11 +21,11 @@ lavalink:
       local: false
     youtubeConfig:
       clients:
+        - TVHTML5EMBEDDED
+        - TV
         - ANDROID_MUSIC
         - ANDROID_VR
         - MUSIC
-        - TVHTML5_SIMPLY
-        - ANDROID
       playlistLoadLimit: 6
     filters:
       volume: true
@@ -58,13 +58,17 @@ plugins:
     allowDirectVideoIds: true
     allowDirectPlaylistIds: true
     clients:
+      - TVHTML5EMBEDDED
+      - TV
       - ANDROID_MUSIC
       - ANDROID_VR
       - MUSIC
-      - TVHTML5_SIMPLY
-      - ANDROID
+    oauth:
+      enabled: true
   pulselink:
     providers:
+      - "ytsearch:\"%ISRC%\""
+      - "ytsearch:%QUERY%"
       - "spsearch:%QUERY%"
       - "amsearch:%QUERY%"
       - "tdsearch:%QUERY%"
@@ -84,7 +88,7 @@ plugins:
       vkmusic: false
       tidal: true
       qobuz: true
-      ytdlp: true
+      ytdlp: false
       jiosaavn: true
       audiomack: true
       gaana: true
@@ -92,7 +96,7 @@ plugins:
       pandora: true
       amazonmusic: true
       flowerytts: true
-      youtube: false
+      youtube: true
       soundcloud: true
     lyrics-sources:
       spotify: true
