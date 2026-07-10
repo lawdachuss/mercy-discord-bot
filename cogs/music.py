@@ -141,7 +141,11 @@ class Music(commands.Cog):
 
     @commands.hybrid_command(name="play", aliases=["p"], description="Play a song or add it to the queue")
     async def play(self, ctx: commands.Context, *, query: str) -> None:
-        await ctx.defer()
+        try:
+            await ctx.defer()
+        except:
+            pass
+
         player = await self.get_player(ctx)
         if not player:
             return
@@ -152,22 +156,39 @@ class Music(commands.Cog):
         if not (URL_REGEX.match(query) or query.lower().startswith(prefixes)):
             query = f"spsearch:{query}"
 
-        tracks = await wavelink.Playable.search(query)
-        if not tracks:
-            await ctx.send(f"No results found for `{query}`.")
+        try:
+            tracks = await asyncio.wait_for(wavelink.Playable.search(query), timeout=10)
+        except asyncio.TimeoutError:
+            try:
+                await ctx.send("Search timed out. Try a more specific query.")
+            except:
+                pass
             return
 
-        if isinstance(tracks, wavelink.Playlist):
-            added = await player.queue.put_wait(tracks)
-            await ctx.send(f"Added playlist **`{tracks.name}`** ({added} tracks) to the queue.")
-        else:
-            track = tracks[0]
-            await player.queue.put_wait(track)
-            await ctx.send(f"Added **`{track}`** to the queue.")
+        if not tracks:
+            try:
+                await ctx.send(f"No results found for `{query}`.")
+            except:
+                pass
+            return
 
-        if not player.playing:
-            next_track = player.queue.get()
-            await player.play(next_track, volume=30)
+        try:
+            if isinstance(tracks, wavelink.Playlist):
+                added = await player.queue.put_wait(tracks)
+                await ctx.send(f"Added playlist **`{tracks.name}`** ({added} tracks) to the queue.")
+            else:
+                track = tracks[0]
+                await player.queue.put_wait(track)
+                await ctx.send(f"Added **`{track}`** to the queue.")
+
+            if not player.playing:
+                next_track = player.queue.get()
+                await player.play(next_track, volume=30)
+        except Exception as e:
+            try:
+                await ctx.send(f"Error: {e}")
+            except:
+                pass
 
     @commands.hybrid_command(name="skip", aliases=["s", "next"], description="Skip the current track")
     async def skip(self, ctx: commands.Context) -> None:
