@@ -932,8 +932,6 @@ class DiscordBot(commands.Bot):
         while not self.is_closed():
             try:
                 await asyncio.sleep(300)
-                import gc
-                gc.collect()
             except asyncio.CancelledError:
                 break
             except Exception as e:

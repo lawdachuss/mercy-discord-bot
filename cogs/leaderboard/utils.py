@@ -31,12 +31,12 @@ class ConfigValidator:
         Falls back to UTC if invalid.
         Handles case-insensitive matching for common timezones.
         """
-        if timezone in pytz.all_timezones:
+        if timezone in pytz.all_timezones_set:
             return timezone
         
         # Try case-insensitive match for common timezone errors
         timezone_lower = timezone.lower()
-        for valid_tz in pytz.all_timezones:
+        for valid_tz in pytz.all_timezones_set:
             if valid_tz.lower() == timezone_lower:
                 logger.info(f"Auto-corrected timezone '{timezone}' to '{valid_tz}'")
                 return valid_tz

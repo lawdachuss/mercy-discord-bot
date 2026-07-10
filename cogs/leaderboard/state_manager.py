@@ -61,7 +61,7 @@ class BulletproofStateManager:
         try:
             # Get timezone with validation
             tz_name = guild_config.get('timezone', 'UTC') if guild_config else 'UTC'
-            if tz_name not in pytz.all_timezones:
+            if tz_name not in pytz.all_timezones_set:
                 self.logger.warning(f"Invalid timezone '{tz_name}' for guild {guild_id}, using UTC")
                 tz_name = 'UTC'
             tz = pytz.timezone(tz_name)
@@ -120,7 +120,7 @@ class BulletproofStateManager:
         try:
             # Get timezone
             tz_name = guild_config.get('timezone', 'UTC')
-            if tz_name not in pytz.all_timezones:
+            if tz_name not in pytz.all_timezones_set:
                 tz_name = 'UTC'
             tz = pytz.timezone(tz_name)
             now = datetime.now(tz)
@@ -176,7 +176,7 @@ class BulletproofStateManager:
         try:
             # Get timezone
             tz_name = guild_config.get('timezone', 'UTC')
-            if tz_name not in pytz.all_timezones:
+            if tz_name not in pytz.all_timezones_set:
                 tz_name = 'UTC'
             tz = pytz.timezone(tz_name)
             now = datetime.now(tz)
@@ -225,7 +225,7 @@ class BulletproofStateManager:
         try:
             # Get timezone
             tz_name = guild_config.get('timezone', 'UTC')
-            if tz_name not in pytz.all_timezones:
+            if tz_name not in pytz.all_timezones_set:
                 tz_name = 'UTC'
             tz = pytz.timezone(tz_name)
             now = datetime.now(tz)
@@ -313,7 +313,7 @@ class BulletproofStateManager:
                 return {'healthy': False, 'error': 'No guild configuration found'}
             
             tz_name = guild_config.get('timezone', 'UTC')
-            if tz_name not in pytz.all_timezones:
+            if tz_name not in pytz.all_timezones_set:
                 tz_name = 'UTC'
             tz = pytz.timezone(tz_name)
             now = datetime.now(tz)
@@ -445,7 +445,7 @@ class RecoveryManager:
                 if star_config:
                     # Get timezone for logging
                     tz_name = guild_config.get('timezone', 'UTC')
-                    if tz_name not in pytz.all_timezones:
+                    if tz_name not in pytz.all_timezones_set:
                         tz_name = 'UTC'
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)

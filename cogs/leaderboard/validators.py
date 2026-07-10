@@ -87,10 +87,10 @@ class DataValidator:
         if not isinstance(tz_name, str):
             return False, 'UTC', f"Invalid type: expected string, got {type(tz_name).__name__}"
         
-        if tz_name not in pytz.all_timezones:
+        if tz_name not in pytz.all_timezones_set:
             # Try case-insensitive match for common timezone errors
             tz_lower = tz_name.lower()
-            for valid_tz in pytz.all_timezones:
+            for valid_tz in pytz.all_timezones_set:
                 if valid_tz.lower() == tz_lower:
                     logger.info(f"Auto-corrected timezone '{tz_name}' to '{valid_tz}'")
                     return True, valid_tz, ""

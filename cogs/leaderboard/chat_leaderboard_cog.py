@@ -921,10 +921,10 @@ class ChatLeaderboardCog(commands.Cog):
                 tz_name = config.get('timezone', 'UTC')
                 try:
                     # Validate timezone with case-insensitive matching
-                    if tz_name not in pytz.all_timezones:
+                    if tz_name not in pytz.all_timezones_set:
                         tz_lower = tz_name.lower()
                         corrected = False
-                        for valid_tz in pytz.all_timezones:
+                        for valid_tz in pytz.all_timezones_set:
                             if valid_tz.lower() == tz_lower:
                                 self.logger.info(f"Auto-corrected timezone '{tz_name}' to '{valid_tz}' for guild {guild_id}")
                                 tz_name = valid_tz

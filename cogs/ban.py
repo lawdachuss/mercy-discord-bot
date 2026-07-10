@@ -41,8 +41,10 @@ class BanCog(commands.Cog):
                 if os.path.exists("responses.txt"):
                     current_modified = os.path.getmtime("responses.txt")
                     if current_modified > last_modified:
-                        with open("responses.txt", "r", encoding="utf-8") as f:
-                            self.responses = [line.strip() for line in f if line.strip()]
+                        def _read():
+                            with open("responses.txt", "r", encoding="utf-8") as f:
+                                return [line.strip() for line in f if line.strip()]
+                        self.responses = await asyncio.to_thread(_read)
                         last_modified = current_modified
             except:
                 pass
