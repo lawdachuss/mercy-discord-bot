@@ -858,32 +858,21 @@ class VoiceLeaderboardCog(commands.Cog):
                         # Update daily message
                         if daily_id:
                             try:
-                                self.logger.debug(f"Fetching daily message {daily_id} for guild {guild_id}")
-                                daily_message = await channel.fetch_message(daily_id)
-                                await asyncio.sleep(0.2)  # Rate limit protection
-                                self.logger.debug(f"Successfully fetched daily message {daily_id}")
-                                if daily_message.author.id == self.bot.user.id:
-                                    # Get or create cached view to preserve page state
-                                    cache_key = (guild_id, 'daily')
-                                    if cache_key not in self.view_cache:
-                                        self.view_cache[cache_key] = VoiceLeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
-                                    daily_view = self.view_cache[cache_key]
-                                    # Build embed with current page from cached view
-                                    daily_embed = await self._build_period_embed(guild_id, 'daily', page=daily_view.page)
-                                    await daily_message.edit(embed=daily_embed, view=daily_view)
-                                    await asyncio.sleep(0.2)  # Rate limit protection
-                                    self.logger.debug(f"Updated daily voice leaderboard for guild {guild_id}")
-                                    daily_updated = True
-                                    updated_message_ids['daily_message_id'] = daily_id
-                                else:
-                                    self.logger.warning(f"Daily message {daily_id} not owned by bot for guild {guild_id}")
+                                cache_key = (guild_id, 'daily')
+                                if cache_key not in self.view_cache:
+                                    self.view_cache[cache_key] = VoiceLeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
+                                daily_view = self.view_cache[cache_key]
+                                daily_embed = await self._build_period_embed(guild_id, 'daily', page=daily_view.page)
+                                await channel.get_partial_message(daily_id).edit(embed=daily_embed, view=daily_view)
+                                await asyncio.sleep(0.2)
+                                daily_updated = True
+                                updated_message_ids['daily_message_id'] = daily_id
                             except discord.NotFound:
                                 self.logger.warning(f"Daily message {daily_id} not found for guild {guild_id}")
                             except discord.Forbidden as e:
                                 self.logger.error(f"Permission denied for daily message {daily_id}: {e}")
                             except discord.HTTPException as e:
                                 if e.status in [503, 502, 500]:
-                                    # Discord API temporarily unavailable, skip this update
                                     self.logger.warning(f"Discord API unavailable (HTTP {e.status}) for guild {guild_id}, will retry next cycle")
                                 else:
                                     self.logger.error(f"HTTP error updating daily message for guild {guild_id}: {e}")
@@ -893,24 +882,15 @@ class VoiceLeaderboardCog(commands.Cog):
                         # Update weekly message
                         if weekly_id:
                             try:
-                                self.logger.debug(f"Fetching weekly message {weekly_id} for guild {guild_id}")
-                                weekly_message = await channel.fetch_message(weekly_id)
-                                await asyncio.sleep(0.2)  # Rate limit protection
-                                self.logger.debug(f"Successfully fetched weekly message {weekly_id}")
-                                if weekly_message.author.id == self.bot.user.id:
-                                    # Get or create cached view
-                                    cache_key = (guild_id, 'weekly')
-                                    if cache_key not in self.view_cache:
-                                        self.view_cache[cache_key] = VoiceLeaderboardPaginator(self, guild_id, 'weekly', page=0, vibe_channel_id=vibe_channel_id)
-                                    weekly_view = self.view_cache[cache_key]
-                                    weekly_embed = await self._build_period_embed(guild_id, 'weekly', page=0)
-                                    await weekly_message.edit(embed=weekly_embed, view=weekly_view)
-                                    await asyncio.sleep(0.2)  # Rate limit protection
-                                    self.logger.debug(f"Updated weekly voice leaderboard for guild {guild_id}")
-                                    weekly_updated = True
-                                    updated_message_ids['weekly_message_id'] = weekly_id
-                                else:
-                                    self.logger.warning(f"Weekly message {weekly_id} not owned by bot for guild {guild_id}")
+                                cache_key = (guild_id, 'weekly')
+                                if cache_key not in self.view_cache:
+                                    self.view_cache[cache_key] = VoiceLeaderboardPaginator(self, guild_id, 'weekly', page=0, vibe_channel_id=vibe_channel_id)
+                                weekly_view = self.view_cache[cache_key]
+                                weekly_embed = await self._build_period_embed(guild_id, 'weekly', page=0)
+                                await channel.get_partial_message(weekly_id).edit(embed=weekly_embed, view=weekly_view)
+                                await asyncio.sleep(0.2)
+                                weekly_updated = True
+                                updated_message_ids['weekly_message_id'] = weekly_id
                             except discord.NotFound:
                                 self.logger.warning(f"Weekly message {weekly_id} not found for guild {guild_id}")
                             except discord.Forbidden as e:
@@ -926,22 +906,15 @@ class VoiceLeaderboardCog(commands.Cog):
                         # Update monthly message
                         if monthly_id:
                             try:
-                                self.logger.debug(f"Fetching monthly message {monthly_id} for guild {guild_id}")
-                                monthly_message = await channel.fetch_message(monthly_id)
-                                await asyncio.sleep(0.2)  # Rate limit protection
-                                self.logger.debug(f"Successfully fetched monthly message {monthly_id}")
-                                if monthly_message.author.id == self.bot.user.id:
-                                    # Get or create cached view
-                                    cache_key = (guild_id, 'monthly')
-                                    if cache_key not in self.view_cache:
-                                        self.view_cache[cache_key] = VoiceLeaderboardPaginator(self, guild_id, 'monthly', page=0, vibe_channel_id=vibe_channel_id)
-                                    monthly_view = self.view_cache[cache_key]
-                                    monthly_embed = await self._build_period_embed(guild_id, 'monthly', page=0)
-                                    await monthly_message.edit(embed=monthly_embed, view=monthly_view)
-                                    await asyncio.sleep(0.2)  # Rate limit protection
-                                    self.logger.debug(f"Updated monthly voice leaderboard for guild {guild_id}")
-                                    monthly_updated = True
-                                    updated_message_ids['monthly_message_id'] = monthly_id
+                                cache_key = (guild_id, 'monthly')
+                                if cache_key not in self.view_cache:
+                                    self.view_cache[cache_key] = VoiceLeaderboardPaginator(self, guild_id, 'monthly', page=0, vibe_channel_id=vibe_channel_id)
+                                monthly_view = self.view_cache[cache_key]
+                                monthly_embed = await self._build_period_embed(guild_id, 'monthly', page=0)
+                                await channel.get_partial_message(monthly_id).edit(embed=monthly_embed, view=monthly_view)
+                                await asyncio.sleep(0.2)
+                                monthly_updated = True
+                                updated_message_ids['monthly_message_id'] = monthly_id
                                 else:
                                     self.logger.warning(f"Monthly message {monthly_id} not owned by bot for guild {guild_id}")
                             except discord.NotFound:
