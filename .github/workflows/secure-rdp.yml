@@ -21,6 +21,22 @@ jobs:
       - name: Checkout bot code
         uses: actions/checkout@v4
 
+      - name: Setup Python with pip cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Restore cached dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache
+            C:\rdp-session
+          key: rdp-deps-v1-${{ hashFiles('requirements.txt') }}
+
       - name: Setup RDP + Tailscale + pip
         shell: powershell
         run: |
@@ -28,11 +44,17 @@ jobs:
           Set-Location -LiteralPath $wd
 
           New-Item -ItemType Directory -Force -Path "C:\rdp-session" | Out-Null
+          New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\.cache" | Out-Null
 
-          Write-Host "=== Downloading Tailscale (background) ==="
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $tsInstaller = "$env:TEMP\tailscale.msi"
-          $tsJob = Start-Job -ScriptBlock { param($u,$o) Invoke-WebRequest -Uri $u -OutFile $o } -ArgumentList $tsUrl, $tsInstaller
+          $cachedTs = "${{ github.workspace }}\.cache\tailscale.msi"
+          $tsJob = $null
+          if (Test-Path $cachedTs) {
+            Write-Host "=== Tailscale already cached ==="
+          } else {
+            Write-Host "=== Downloading Tailscale (background, parallel with pip) ==="
+            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+            $tsJob = Start-Job -ScriptBlock { param($u,$o) Invoke-WebRequest -Uri $u -OutFile $o } -ArgumentList $tsUrl, $cachedTs
+          }
 
           Write-Host "=== Configuring RDP ==="
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
@@ -59,19 +81,18 @@ jobs:
           python -c "import discord; print(f'discord.py {discord.__version__}')"
           if ($LASTEXITCODE -ne 0) { Write-Error "discord not found"; exit 1 }
 
-          Write-Host "=== Waiting for Tailscale download ==="
-          $tsJob | Wait-Job | Out-Null; $tsJob | Remove-Job
+          if ($tsJob) {
+            Write-Host "=== Waiting for Tailscale download ==="
+            $tsJob | Wait-Job | Out-Null; $tsJob | Remove-Job
+          }
 
-          Write-Host "=== Installing Tailscale ==="
-          Start-Process msiexec.exe -ArgumentList "/i `"$tsInstaller`" /qn /norestart" -Wait
-          Remove-Item $tsInstaller -Force -ErrorAction SilentlyContinue
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+            Write-Host "=== Installing Tailscale ==="
+            Start-Process msiexec.exe -ArgumentList "/i `"$cachedTs`" /qn /norestart" -Wait
+          } else {
+            Write-Host "=== Tailscale already installed ==="
+          }
           Write-Host "Setup complete."
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\pip\Cache
-          key: pip-${{ hashFiles('requirements.txt') }}
 
       - name: Finalize Setup (session metadata + user dirs)
         shell: powershell
