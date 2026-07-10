@@ -36,9 +36,16 @@ jobs:
         if: steps.cache-lavalink.outputs.cache-hit != 'true'
         shell: powershell
         run: |
-          Write-Host "Downloading Lavalink..."
-          Invoke-WebRequest -Uri "https://github.com/lavalink-devs/Lavalink/releases/latest/download/Lavalink.jar" -OutFile "${{ github.workspace }}\lavalink\Lavalink.jar"
+          $url = "https://github.com/lavalink-devs/Lavalink/releases/download/4.2.2/Lavalink.jar"
+          $out = "${{ github.workspace }}\lavalink\Lavalink.jar"
+          Write-Host "Downloading Lavalink 4.2.2 (~100MB)..."
+          curl.exe -L -o $out $url
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "curl failed, trying Invoke-WebRequest..."
+            Invoke-WebRequest -Uri $url -OutFile $out
+          }
           New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\lavalink\plugins" | Out-Null
+          Write-Host "Download complete: $(Get-Item $out).Length bytes"
 
       - name: Install yt-dlp
         shell: powershell
