@@ -50,16 +50,15 @@ jobs:
       - name: Install yt-dlp
         shell: powershell
         run: |
-          $cached = "${{ runner.temp }}\yt-dlp.exe"
-          if (Test-Path $cached) {
-            Copy-Item $cached "$env:USERPROFILE\.local\bin\yt-dlp.exe" -Force
+          pip install yt-dlp
+          if ($LASTEXITCODE -ne 0) {
+            $url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+            curl.exe -L -o "${{ runner.temp }}\yt-dlp.exe" $url
+            New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin" | Out-Null
+            Move-Item "${{ runner.temp }}\yt-dlp.exe" "$env:USERPROFILE\.local\bin\yt-dlp.exe" -Force
+            $env:Path += ";$env:USERPROFILE\.local\bin"
+            [Environment]::SetEnvironmentVariable("Path", $env:Path, "User")
           }
-          if (-not (Get-Command yt-dlp -ErrorAction SilentlyContinue)) {
-            scoop install yt-dlp 2>$null
-            if ($LASTEXITCODE -ne 0) { winget install yt-dlp 2>$null }
-            if (-not (Get-Command yt-dlp -ErrorAction SilentlyContinue)) { pip install yt-dlp }
-          }
-          Copy-Item (Get-Command yt-dlp).Source $cached -Force -ErrorAction SilentlyContinue
           Write-Host "yt-dlp: $(yt-dlp --version 2>$null)"
 
       - name: Start Lavalink server
