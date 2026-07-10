@@ -23,25 +23,36 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Restore Lavalink cache
+        id: cache-lavalink
+        uses: actions/cache@v4
+        with:
+          path: |
+            lavalink/Lavalink.jar
+            lavalink/plugins
+          key: lavalink-v1-${{ hashFiles('lavalink/application.yml') }}
+
       - name: Download Lavalink
+        if: steps.cache-lavalink.outputs.cache-hit != 'true'
         shell: powershell
         run: |
-          $jarPath = "${{ github.workspace }}\lavalink\Lavalink.jar"
-          if (-not (Test-Path $jarPath)) {
-            Write-Host "Downloading Lavalink..."
-            Invoke-WebRequest -Uri "https://github.com/lavalink-devs/Lavalink/releases/latest/download/Lavalink.jar" -OutFile $jarPath
-          } else {
-            Write-Host "Lavalink.jar already exists, skipping download"
-          }
+          Write-Host "Downloading Lavalink..."
+          Invoke-WebRequest -Uri "https://github.com/lavalink-devs/Lavalink/releases/latest/download/Lavalink.jar" -OutFile "${{ github.workspace }}\lavalink\Lavalink.jar"
           New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\lavalink\plugins" | Out-Null
 
       - name: Install yt-dlp
         shell: powershell
         run: |
-          scoop install yt-dlp 2>$null; if ($LASTEXITCODE -ne 0) { winget install yt-dlp 2>$null }
-          if (-not (Get-Command yt-dlp -ErrorAction SilentlyContinue)) {
-            pip install yt-dlp
+          $cached = "${{ runner.temp }}\yt-dlp.exe"
+          if (Test-Path $cached) {
+            Copy-Item $cached "$env:USERPROFILE\.local\bin\yt-dlp.exe" -Force
           }
+          if (-not (Get-Command yt-dlp -ErrorAction SilentlyContinue)) {
+            scoop install yt-dlp 2>$null
+            if ($LASTEXITCODE -ne 0) { winget install yt-dlp 2>$null }
+            if (-not (Get-Command yt-dlp -ErrorAction SilentlyContinue)) { pip install yt-dlp }
+          }
+          Copy-Item (Get-Command yt-dlp).Source $cached -Force -ErrorAction SilentlyContinue
           Write-Host "yt-dlp: $(yt-dlp --version 2>$null)"
 
       - name: Start Lavalink server
