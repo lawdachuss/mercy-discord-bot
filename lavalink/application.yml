@@ -65,8 +65,6 @@ plugins:
       - ANDROID
   pulselink:
     providers:
-      - "ytsearch:\"%ISRC%\""
-      - "ytsearch:%QUERY%"
       - "spsearch:%QUERY%"
       - "amsearch:%QUERY%"
       - "tdsearch:%QUERY%"
