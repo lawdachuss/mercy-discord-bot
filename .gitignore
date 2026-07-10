@@ -72,3 +72,4 @@ ts.json
 bot_output.txt
 bot_error.txt
 bot_log.txt
+lavalink/*.jar
