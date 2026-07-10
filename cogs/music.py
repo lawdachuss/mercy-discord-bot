@@ -150,7 +150,7 @@ class Music(commands.Cog):
 
         prefixes = ("ytsearch:", "ytmsearch:", "spsearch:", "amsearch:", "dzsearch:", "amzsearch:", "tdsearch:", "qbsearch:", "pdsearch:", "szsearch:", "ymsearch:", "vksearch:", "jssearch:", "admsearch:", "gnsearch:", "bcsearch:", "ncsearch:", "mcsearch:", "bilibili:", "ftts:", "scsearch:")
         if not (URL_REGEX.match(query) or query.lower().startswith(prefixes)):
-            query = f"ytsearch:{query}"
+            query = f"spsearch:{query}"
 
         tracks = await wavelink.Playable.search(query)
         if not tracks:
