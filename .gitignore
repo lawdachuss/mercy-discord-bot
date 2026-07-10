@@ -63,3 +63,9 @@ Thumbs.db
 command_sync_cache.json
 *.cache
 .cache/
+
+# Temp files
+run_log.txt
+stderr.txt
+stdout.txt
+ts.json
