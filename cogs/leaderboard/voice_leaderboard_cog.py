@@ -140,25 +140,11 @@ class VoiceLeaderboardCog(commands.Cog):
         self.last_daily_reset = {}  # {guild_id: datetime}
         self.last_weekly_reset = {}  # {guild_id: datetime}
         self.last_monthly_reset = {}  # {guild_id: datetime}
+        self.last_daily_recreate = {}  # {guild_id: datetime} - track last full delete+recreate
         self.view_cache = {}  # {(guild_id, period): view_instance} - cache views to preserve state
         self.last_month_winner_cache = {}  # FIX #10: Cache last month winner {guild_id: (winner_data, cached_at)}
         self.creation_locks = {}  # {guild_id: asyncio.Lock} - prevent concurrent message creation
         self.logger = logging.getLogger('discord.bot.voice_leaderboard')
-    
-    def _validate_timezone(self, tz_name: str, guild_id: int) -> str:
-        """Validate timezone with case-insensitive matching"""
-        if tz_name in pytz.all_timezones:
-            return tz_name
-        
-        # Try case-insensitive match
-        tz_lower = tz_name.lower()
-        for valid_tz in pytz.all_timezones:
-            if valid_tz.lower() == tz_lower:
-                self.logger.info(f"Auto-corrected timezone '{tz_name}' to '{valid_tz}' for guild {guild_id}")
-                return valid_tz
-        
-        self.logger.warning(f"Invalid timezone '{tz_name}' for guild {guild_id}, using UTC")
-        return 'UTC'
     
     async def cog_load(self):
         # Reuse bot's shared MongoDB connection
@@ -442,7 +428,18 @@ class VoiceLeaderboardCog(commands.Cog):
     
     async def _get_leaderboard_message(self, guild_id: int) -> Optional[Dict]:
         return await self.db.leaderboard_messages.find_one({'guild_id': guild_id, 'type': 'voice'})
-    
+
+    async def _delete_old_leaderboard_messages(self, msg_data: Dict, channel: discord.TextChannel):
+        """Try to delete old leaderboard messages before recreating. Best-effort, ignores errors."""
+        for key in ('daily_message_id', 'weekly_message_id', 'monthly_message_id', 'message_id'):
+            msg_id = msg_data.get(key)
+            if msg_id:
+                try:
+                    old = await channel.fetch_message(msg_id)
+                    await old.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+
     async def _save_leaderboard_messages(self, guild_id: int, channel_id: int, daily_id: int, weekly_id: int, monthly_id: int):
         """Save all three leaderboard message IDs"""
         await self.db.leaderboard_messages.update_one(
@@ -626,11 +623,6 @@ class VoiceLeaderboardCog(commands.Cog):
         except Exception as e:
             self.logger.error(f"Error building period embed: {e}", exc_info=True)
             return discord.Embed(title="Error", description="Failed to build leaderboard", color=EMBED_COLOR)
-        
-        # Divider image
-        embed.set_image(url=Images.DIVIDER)
-        
-        return embed
     
     async def _create_full_leaderboard_message(self, channel: discord.TextChannel, guild_id: int, vibe_channel_id: int = None):
         """Create separate leaderboard messages for each period with individual buttons"""
@@ -651,6 +643,9 @@ class VoiceLeaderboardCog(commands.Cog):
                     if daily_id and weekly_id and monthly_id:
                         self.logger.info(f"Voice leaderboard messages already exist for guild {guild_id}, skipping creation")
                         return
+                    
+                    # Partial data - delete any existing old messages before recreating
+                    await self._delete_old_leaderboard_messages(existing_msg_data, channel)
                 
                 # Check permissions before creating
                 permissions = channel.permissions_for(channel.guild.me)
@@ -792,6 +787,29 @@ class VoiceLeaderboardCog(commands.Cog):
                 try:
                     msg_data = await self._get_leaderboard_message(guild_id)
                     vibe_channel_id = config.get('vibe_channel_id')
+                    
+                    # Daily full recreate based on guild's timezone
+                    tz_name = config.get('timezone', 'Asia/Kolkata')
+                    is_valid, validated_tz, _ = DataValidator.validate_timezone(tz_name)
+                    if not is_valid:
+                        validated_tz = 'Asia/Kolkata'
+                    try:
+                        tz = pytz.timezone(validated_tz)
+                    except Exception:
+                        tz = pytz.timezone('Asia/Kolkata')
+                    today_date = datetime.now(tz).date()
+                    last_recreate_date = self.last_daily_recreate.get(guild_id)
+                    if last_recreate_date != today_date:
+                        voice_channel_id = config.get('voice_channel_id') or (msg_data.get('channel_id') if msg_data else None)
+                        if voice_channel_id:
+                            channel = guild.get_channel(voice_channel_id)
+                            if channel:
+                                self.logger.info(f"Daily recreate triggered for voice leaderboard guild {guild_id} (tz: {validated_tz})")
+                                if msg_data:
+                                    await self._delete_old_leaderboard_messages(msg_data, channel)
+                                await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'voice'})
+                                await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                        self.last_daily_recreate[guild_id] = today_date
                     
                     # If no message data exists, try to create messages if channel is configured
                     if not msg_data:
@@ -942,8 +960,9 @@ class VoiceLeaderboardCog(commands.Cog):
                             await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'voice'})
                             await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
                         elif not daily_updated and not weekly_updated and not monthly_updated and (daily_id or weekly_id or monthly_id):
-                            # All messages failed but IDs exist - likely all deleted
+                            # All messages failed but IDs exist - delete old messages before recreating
                             self.logger.warning(f"All voice leaderboard messages failed to update for guild {guild_id}, recreating all embeds")
+                            await self._delete_old_leaderboard_messages(msg_data, channel)
                             await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'voice'})
                             await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
                         else:
@@ -957,6 +976,7 @@ class VoiceLeaderboardCog(commands.Cog):
                             f"Permission denied editing message for guild {guild_id}: {e}. "
                             f"Removing invalid reference and recreating."
                         )
+                        await self._delete_old_leaderboard_messages(msg_data, channel)
                         await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'voice'})
                         await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
                     except discord.HTTPException as e:
@@ -999,7 +1019,7 @@ class VoiceLeaderboardCog(commands.Cog):
                 tz_name = config.get('timezone', 'UTC')
                 try:
                     # Validate timezone
-                    tz_name = self._validate_timezone(tz_name, guild_id)
+                    tz_name = DataValidator.validate_timezone(tz_name)[1]
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
                     
@@ -1059,7 +1079,7 @@ class VoiceLeaderboardCog(commands.Cog):
                 tz_name = config.get('timezone', 'UTC')
                 try:
                     # Validate timezone
-                    tz_name = self._validate_timezone(tz_name, guild_id)
+                    tz_name = DataValidator.validate_timezone(tz_name)[1]
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
                     # Check for reset window (midnight to 1 AM)
@@ -1093,7 +1113,7 @@ class VoiceLeaderboardCog(commands.Cog):
                 tz_name = config.get('timezone', 'UTC')
                 try:
                     # Validate timezone
-                    tz_name = self._validate_timezone(tz_name, guild_id)
+                    tz_name = DataValidator.validate_timezone(tz_name)[1]
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
                     # Check for monthly reset window (1st of month, midnight to 1 AM)

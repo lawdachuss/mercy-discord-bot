@@ -269,22 +269,9 @@ class StarOfTheWeekCog(commands.Cog):
         self.state_manager = None
         self.recovery_manager = None
         self.role_manager = RoleAssignmentManager(bot, logging.getLogger('discord.bot.star_of_the_week.roles'))
+        self.star_retry_count = {}  # {guild_id: int} - track consecutive failures
+        self.max_star_retries = 12  # give up after ~1 hour of failures
         self.logger = logging.getLogger('discord.bot.star_of_the_week')
-    
-    def _validate_timezone(self, tz_name: str, guild_id: int) -> str:
-        """Validate timezone with case-insensitive matching"""
-        if tz_name in pytz.all_timezones:
-            return tz_name
-        
-        # Try case-insensitive match
-        tz_lower = tz_name.lower()
-        for valid_tz in pytz.all_timezones:
-            if valid_tz.lower() == tz_lower:
-                self.logger.info(f"Auto-corrected timezone '{tz_name}' to '{valid_tz}' for guild {guild_id}")
-                return valid_tz
-        
-        self.logger.warning(f"Invalid timezone '{tz_name}' for guild {guild_id}, using UTC")
-        return 'UTC'
     
     async def cog_load(self):
         """Initialize MongoDB connection on cog load"""
@@ -643,106 +630,6 @@ class StarOfTheWeekCog(commands.Cog):
             self.logger.error(f"Error assigning Star role in guild {guild.id}: {e}", exc_info=True)
             return False
     
-    async def _add_role_with_retry(self, member: discord.Member, role: discord.Role, reason: str, max_retries: int = 3) -> bool:
-        """Add role with retry logic for rate limits"""
-        for attempt in range(max_retries):
-            try:
-                # Skip if member already has the role
-                if role in member.roles:
-                    self.logger.info(f"Member {member.display_name} already has role {role.name}")
-                    return True
-                
-                await member.add_roles(role, reason=reason)
-                
-                # Verify the role was actually added by refetching the member
-                await asyncio.sleep(0.5)  # Small delay to ensure Discord's cache updates
-                updated_member = member.guild.get_member(member.id)
-                if not updated_member:
-                    # Fallback to API fetch
-                    try:
-                        updated_member = await member.guild.fetch_member(member.id)
-                    except discord.HTTPException:
-                        self.logger.warning(f"Could not verify role assignment for {member.display_name}")
-                        return True  # Assume success if we can't verify
-                
-                if role in updated_member.roles:
-                    self.logger.info(f"Successfully verified role {role.name} added to {member.display_name}")
-                    return True
-                else:
-                    self.logger.warning(f"Role {role.name} not found on {member.display_name} after add_roles call (attempt {attempt + 1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(1)
-                        continue
-                    return False
-                    
-            except discord.HTTPException as e:
-                if e.status == 429:  # Rate limited
-                    retry_after = float(e.response.headers.get('Retry-After', 1))
-                    self.logger.warning(f"Rate limited adding role, retrying after {retry_after}s (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(retry_after)
-                elif e.status == 403:  # Forbidden
-                    self.logger.error(f"Missing permissions to add role: {e}")
-                    return False
-                else:
-                    self.logger.error(f"HTTP error adding role: {e}")
-                    if attempt == max_retries - 1:
-                        return False
-                    await asyncio.sleep(1)
-            except Exception as e:
-                self.logger.error(f"Unexpected error adding role: {e}")
-                return False
-        return False
-    
-    async def _remove_role_with_retry(self, member: discord.Member, role: discord.Role, reason: str, max_retries: int = 3) -> bool:
-        """Remove role with retry logic for rate limits"""
-        for attempt in range(max_retries):
-            try:
-                # Skip if member doesn't have the role
-                if role not in member.roles:
-                    self.logger.info(f"Member {member.display_name} doesn't have role {role.name}, skipping removal")
-                    return True
-                
-                await member.remove_roles(role, reason=reason)
-                
-                # Verify the role was actually removed by refetching the member
-                await asyncio.sleep(0.5)  # Small delay to ensure Discord's cache updates
-                updated_member = member.guild.get_member(member.id)
-                if not updated_member:
-                    # Fallback to API fetch
-                    try:
-                        updated_member = await member.guild.fetch_member(member.id)
-                    except discord.HTTPException:
-                        self.logger.warning(f"Could not verify role removal for {member.display_name}")
-                        return True  # Assume success if we can't verify
-                
-                if role not in updated_member.roles:
-                    self.logger.info(f"Successfully verified role {role.name} removed from {member.display_name}")
-                    return True
-                else:
-                    self.logger.warning(f"Role {role.name} still on {member.display_name} after remove_roles call (attempt {attempt + 1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(1)
-                        continue
-                    return False
-                    
-            except discord.HTTPException as e:
-                if e.status == 429:  # Rate limited
-                    retry_after = float(e.response.headers.get('Retry-After', 1))
-                    self.logger.warning(f"Rate limited removing role, retrying after {retry_after}s (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(retry_after)
-                elif e.status == 403:  # Forbidden
-                    self.logger.error(f"Missing permissions to remove role: {e}")
-                    return False
-                else:
-                    self.logger.error(f"HTTP error removing role: {e}")
-                    if attempt == max_retries - 1:
-                        return False
-                    await asyncio.sleep(1)
-            except Exception as e:
-                self.logger.error(f"Unexpected error removing role: {e}")
-                return False
-        return False
-    
     # ==================== NOTIFICATIONS ====================
     
     def _create_winner_dm_embed(self, guild: discord.Guild, score: float, 
@@ -928,7 +815,7 @@ class StarOfTheWeekCog(commands.Cog):
                 
                 try:
                     # Validate timezone
-                    tz_name = self._validate_timezone(tz_name, guild_id)
+                    tz_name = DataValidator.validate_timezone(tz_name)[1]
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
                     
@@ -938,16 +825,21 @@ class StarOfTheWeekCog(commands.Cog):
                     )
                     
                     if should_run_selection:
-                        # Select Star of the Week
                         self.logger.info(f"Triggering Star selection for guild {guild_id}")
                         success = await self._process_star_selection(guild)
-                        # ALWAYS mark selection as complete to prevent infinite retries
-                        # Even if it failed, we don't want to retry every 5 minutes
-                        await self.state_manager.mark_star_selection_complete(guild_id)
                         if success:
+                            await self.state_manager.mark_star_selection_complete(guild_id)
+                            self.star_retry_count.pop(guild_id, None)
                             self.logger.info(f"Star selection completed successfully for guild {guild_id}")
                         else:
-                            self.logger.warning(f"Star selection failed or had no eligible users for guild {guild_id}, but marked as complete to prevent retries")
+                            retries = self.star_retry_count.get(guild_id, 0) + 1
+                            self.star_retry_count[guild_id] = retries
+                            if retries >= self.max_star_retries:
+                                self.logger.warning(f"Star selection failed {retries} times for guild {guild_id}, giving up until next week")
+                                await self.state_manager.mark_star_selection_complete(guild_id)
+                                self.star_retry_count.pop(guild_id, None)
+                            else:
+                                self.logger.warning(f"Star selection failed for guild {guild_id} (attempt {retries}/{self.max_star_retries}), will retry")
                 
                 except pytz.exceptions.UnknownTimeZoneError:
                     self.logger.error(f"Invalid timezone for guild {guild_id}: {tz_name}")
@@ -1237,7 +1129,7 @@ class StarOfTheWeekCog(commands.Cog):
                 tz_name = guild_config.get('timezone', 'UTC') if guild_config else 'UTC'
                 try:
                     # Validate timezone
-                    tz_name = self._validate_timezone(tz_name, interaction.guild.id)
+                    tz_name = DataValidator.validate_timezone(tz_name)[1]
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
                     
@@ -1459,7 +1351,7 @@ class StarOfTheWeekCog(commands.Cog):
             
             try:
                 # Validate timezone
-                tz_name = self._validate_timezone(tz_name, interaction.guild.id)
+                tz_name = DataValidator.validate_timezone(tz_name)[1]
                 tz = pytz.timezone(tz_name)
                 now = datetime.now(tz)
                 now_utc = datetime.utcnow()

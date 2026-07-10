@@ -137,6 +137,7 @@ class ChatLeaderboardCog(commands.Cog):
         self.last_weekly_reset = {}  # {guild_id: datetime}
         self.last_monthly_reset = {}  # {guild_id: datetime}
         self.last_update_time = {}  # {guild_id: datetime} - track when leaderboard was last updated
+        self.last_daily_recreate = {}  # {guild_id: datetime} - track last full delete+recreate
         self.view_cache = {}  # {(guild_id, period): view_instance} - cache views to preserve state
         self.last_month_winner_cache = {}  # FIX #10: Cache last month winner {guild_id: (winner_data, cached_at)}
         self.creation_locks = {}  # {guild_id: asyncio.Lock} - prevent concurrent message creation
@@ -320,6 +321,17 @@ class ChatLeaderboardCog(commands.Cog):
     
     async def _get_leaderboard_message(self, guild_id: int) -> Optional[Dict]:
         return await self.db.leaderboard_messages.find_one({'guild_id': guild_id, 'type': 'chat'})
+
+    async def _delete_old_leaderboard_messages(self, msg_data: Dict, channel: discord.TextChannel):
+        """Try to delete old leaderboard messages before recreating. Best-effort, ignores errors."""
+        for key in ('daily_message_id', 'weekly_message_id', 'monthly_message_id', 'message_id'):
+            msg_id = msg_data.get(key)
+            if msg_id:
+                try:
+                    old = await channel.fetch_message(msg_id)
+                    await old.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
     
     async def _save_leaderboard_messages(self, guild_id: int, channel_id: int, daily_id: int, weekly_id: int, monthly_id: int):
         """Save all three leaderboard message IDs"""
@@ -516,6 +528,9 @@ class ChatLeaderboardCog(commands.Cog):
                     if daily_id and weekly_id and monthly_id:
                         self.logger.info(f"Chat leaderboard messages already exist for guild {guild_id}, skipping creation")
                         return
+                    
+                    # Partial data - delete any existing old messages before recreating
+                    await self._delete_old_leaderboard_messages(existing_msg_data, channel)
                 
                 # Check permissions before creating
                 permissions = channel.permissions_for(channel.guild.me)
@@ -607,6 +622,29 @@ class ChatLeaderboardCog(commands.Cog):
                 try:
                     msg_data = await self._get_leaderboard_message(guild_id)
                     vibe_channel_id = config.get('vibe_channel_id')
+                    
+                    # Daily full recreate based on guild's timezone
+                    tz_name = config.get('timezone', 'Asia/Kolkata')
+                    is_valid, validated_tz, _ = DataValidator.validate_timezone(tz_name)
+                    if not is_valid:
+                        validated_tz = 'Asia/Kolkata'
+                    try:
+                        tz = pytz.timezone(validated_tz)
+                    except Exception:
+                        tz = pytz.timezone('Asia/Kolkata')
+                    today_date = datetime.now(tz).date()
+                    last_recreate_date = self.last_daily_recreate.get(guild_id)
+                    if last_recreate_date != today_date:
+                        chat_channel_id = config.get('chat_channel_id') or (msg_data.get('channel_id') if msg_data else None)
+                        if chat_channel_id:
+                            channel = guild.get_channel(chat_channel_id)
+                            if channel:
+                                self.logger.info(f"Daily recreate triggered for chat leaderboard guild {guild_id} (tz: {validated_tz})")
+                                if msg_data:
+                                    await self._delete_old_leaderboard_messages(msg_data, channel)
+                                await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'chat'})
+                                await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                        self.last_daily_recreate[guild_id] = today_date
                     
                     # If no message data exists, try to create messages if channel is configured
                     if not msg_data:
@@ -759,8 +797,9 @@ class ChatLeaderboardCog(commands.Cog):
                             await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'chat'})
                             await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
                         elif not daily_updated and not weekly_updated and not monthly_updated and (daily_id or weekly_id or monthly_id):
-                            # All messages failed but IDs exist - likely all deleted
+                            # All messages failed but IDs exist - delete old messages before recreating
                             self.logger.warning(f"All chat leaderboard messages failed to update for guild {guild_id}, recreating all embeds")
+                            await self._delete_old_leaderboard_messages(msg_data, channel)
                             await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'chat'})
                             await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
                         else:
@@ -776,6 +815,7 @@ class ChatLeaderboardCog(commands.Cog):
                             f"Permission denied editing message for guild {guild_id}: {e}. "
                             f"Removing invalid reference and recreating."
                         )
+                        await self._delete_old_leaderboard_messages(msg_data, channel)
                         await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'chat'})
                         await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
                     except discord.HTTPException as e:
@@ -1289,8 +1329,6 @@ class ChatLeaderboardCog(commands.Cog):
                     )
                     return
                 
-                # FIX #6: Validate and normalize timezone before saving
-                from .validators import DataValidator
                 is_valid, validated_tz, error_msg = DataValidator.validate_timezone(timezone)
                 if not is_valid:
                     await interaction.followup.send(

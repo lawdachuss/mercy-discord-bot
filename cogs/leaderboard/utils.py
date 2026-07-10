@@ -391,6 +391,7 @@ class UserDisplayFormatter:
     # Class-level cache for username lookups (guild_id, user_id) -> (name, timestamp)
     _username_cache = {}
     _cache_ttl = 300  # 5 minutes cache
+    _max_cache_size = 1000
     
     @staticmethod
     async def get_display_name(guild, user_id: int, max_length: int = 20) -> str:
@@ -455,7 +456,7 @@ class UserDisplayFormatter:
         UserDisplayFormatter._username_cache[cache_key] = (name, datetime.utcnow())
         
         # Clean old cache entries periodically (keep cache size manageable)
-        if len(UserDisplayFormatter._username_cache) > 1000:
+        if len(UserDisplayFormatter._username_cache) > UserDisplayFormatter._max_cache_size:
             UserDisplayFormatter._clean_cache()
         
         # Truncate if necessary
@@ -463,7 +464,7 @@ class UserDisplayFormatter:
     
     @staticmethod
     def _clean_cache():
-        """Remove expired entries from cache"""
+        """Remove expired entries, then evict oldest if still over max size"""
         from datetime import datetime
         current_time = datetime.utcnow()
         expired_keys = [
@@ -472,7 +473,19 @@ class UserDisplayFormatter:
         ]
         for key in expired_keys:
             del UserDisplayFormatter._username_cache[key]
-        logger.debug(f"Cleaned {len(expired_keys)} expired username cache entries")
+
+        if len(UserDisplayFormatter._username_cache) > UserDisplayFormatter._max_cache_size:
+            sorted_keys = sorted(
+                UserDisplayFormatter._username_cache.keys(),
+                key=lambda k: UserDisplayFormatter._username_cache[k][1]
+            )
+            excess = len(UserDisplayFormatter._username_cache) - UserDisplayFormatter._max_cache_size
+            for key in sorted_keys[:excess]:
+                del UserDisplayFormatter._username_cache[key]
+            logged_excess = excess
+        else:
+            logged_excess = 0
+        logger.debug(f"Cleaned {len(expired_keys)} expired + {logged_excess} oldest username cache entries")
     
     @staticmethod
     def generate_fallback_name(user_id: int) -> str:
