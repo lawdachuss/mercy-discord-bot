@@ -165,12 +165,8 @@ class StealEmoji(commands.Cog):
         )
         processing_message = await ctx.send(embed=embed)
 
-        total = len(emojis)
-        added = 0
-        for i, emoji in enumerate(emojis):
-            if i > 0:
-                await asyncio.sleep(0.5)
-
+        parsed = []
+        for emoji in emojis:
             emoji_parts = emoji.strip("<>").split(":")
             emoji_id = emoji_parts[-1]
             emoji_name = emoji_parts[1] if len(emoji_parts) > 2 else emoji_parts[0]
@@ -178,7 +174,34 @@ class StealEmoji(commands.Cog):
                 emoji_name = f"{branding}_{emoji_name}"
             emoji_ext = "gif" if emoji.startswith("<a:") else "png"
             emoji_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{emoji_ext}"
-            result = await self.add_emoji(ctx, emoji_url, emoji_name)
+            parsed.append((emoji_url, emoji_name))
+
+        async def fetch(url):
+            if not self.session or self.session.closed:
+                self.session = aiohttp.ClientSession()
+            headers = {
+                "User-Agent": "MercyBot/1.0",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
+            }
+            async with self.session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                return await resp.read()
+
+        image_data_list = await asyncio.gather(*[fetch(url) for url, _ in parsed], return_exceptions=True)
+
+        total = len(parsed)
+        added = 0
+        for (url, name), image_data in zip(parsed, image_data_list):
+            if isinstance(image_data, Exception) or image_data is None:
+                await ctx.send(f"Failed to fetch emoji: {url.split('/')[-1]}")
+                continue
+            guild = ctx.guild
+            if not guild.me.guild_permissions.manage_emojis_and_stickers:
+                await ctx.send("I lack the necessary permissions to manage emojis.")
+                return added
+            name = await self.get_unique_emoji_name(name, guild)
+            result = await self._create_emoji(ctx, name, image_data)
             if result:
                 added += 1
 
@@ -195,33 +218,32 @@ class StealEmoji(commands.Cog):
         """Extract custom emojis from a message."""
         return [word for word in message.content.split() if word.startswith("<:") or word.startswith("<a:")]
 
-    async def add_emoji(self, ctx, emoji_url, name):
-        """Add emoji to the server."""
+    async def add_emoji(self, ctx, emoji_url, name, image_data=None):
+        """Add emoji to the server. If image_data is provided, skip download."""
         guild = ctx.guild
         if not guild.me.guild_permissions.manage_emojis_and_stickers:
             await ctx.send("I lack the necessary permissions to manage emojis.")
             return None
 
-        if len(emoji_url) > 256000:
-            await ctx.send("Emoji file too large.")
-            return None
-
-        if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession()
-
-        headers = {
-            "User-Agent": "MercyBot/1.0",
-            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
-        }
-
-        async with self.session.get(emoji_url, headers=headers) as resp:
-            if resp.status != 200:
-                await ctx.send(f"Failed to fetch emoji: HTTP {resp.status}")
-                return None
-            image_data = await resp.read()
+        if image_data is None:
+            if not self.session or self.session.closed:
+                self.session = aiohttp.ClientSession()
+            headers = {
+                "User-Agent": "MercyBot/1.0",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
+            }
+            async with self.session.get(emoji_url, headers=headers) as resp:
+                if resp.status != 200:
+                    await ctx.send(f"Failed to fetch emoji: HTTP {resp.status}")
+                    return None
+                image_data = await resp.read()
 
         name = await self.get_unique_emoji_name(name, guild)
+        return await self._create_emoji(ctx, name, image_data)
 
+    async def _create_emoji(self, ctx, name, image_data):
+        """Create emoji on Discord with rate limit retry."""
+        guild = ctx.guild
         retries = 0
         max_retries = 3
         while retries < max_retries:
