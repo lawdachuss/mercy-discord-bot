@@ -316,12 +316,23 @@ class BrandModal(discord.ui.Modal, title="Set Brand Prefix"):
         max_length=50
     )
 
-    def __init__(self):
+    def __init__(self, view):
         super().__init__()
-        self.submitted = False
+        self.view = view
 
     async def on_submit(self, interaction):
-        self.submitted = True
+        text = self.answer.value.strip()
+        if text:
+            self.view.brand = text
+            self.view.result = "brand"
+            for child in self.view.children:
+                child.disabled = True
+            if self.view._message:
+                try:
+                    await self.view._message.edit(content=f"Brand set to: `{text}`", view=self.view)
+                except discord.HTTPException:
+                    pass
+            self.view.stop()
         try:
             await interaction.response.defer()
         except discord.HTTPException:
@@ -347,26 +358,11 @@ class BrandView(discord.ui.View):
 
     @discord.ui.button(label="Set Brand", style=discord.ButtonStyle.primary)
     async def set_brand(self, interaction, button):
-        modal = BrandModal()
+        modal = BrandModal(self)
         try:
             await interaction.response.send_modal(modal)
         except discord.HTTPException:
             return
-
-        submitted = await modal.wait(timeout=120)
-        if self.result is not None:
-            return
-        if submitted and modal.submitted and (text := modal.answer.value.strip()):
-            self.brand = text
-            self.result = "brand"
-            for child in self.children:
-                child.disabled = True
-            if self._message:
-                try:
-                    await self._message.edit(content=f"Brand set to: `{text}`", view=self)
-                except discord.HTTPException:
-                    pass
-            self.stop()
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary)
     async def skip(self, interaction, button):
