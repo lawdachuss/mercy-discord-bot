@@ -301,7 +301,6 @@ class BrandModal(discord.ui.Modal, title="Set Brand Prefix"):
             await interaction.response.defer()
         except discord.HTTPException:
             pass
-        self.stop()
 
 
 class BrandView(discord.ui.View):
@@ -335,6 +334,13 @@ class BrandView(discord.ui.View):
         if submitted and modal.submitted and (text := modal.answer.value.strip()):
             self.brand = text
             self.result = "brand"
+            for child in self.children:
+                child.disabled = True
+            if self._message:
+                try:
+                    await self._message.edit(content=f"Brand set to: `{text}`", view=self)
+                except discord.HTTPException:
+                    pass
             self.stop()
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary)
