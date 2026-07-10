@@ -93,7 +93,7 @@ class StealEmoji(commands.Cog):
         if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession()
 
-        sticker_url = sticker.url.replace("cdn.discordapp.com", "media.discordapp.net")
+        sticker_url = sticker.url
         embed = discord.Embed(
             description="<a:sukoon_loading:1322897472338526240> **Processing** to Steal Sticker...",
             color=EMBED_COLOR
@@ -165,7 +165,8 @@ class StealEmoji(commands.Cog):
         )
         processing_message = await ctx.send(embed=embed)
 
-        parsed = []
+        total = len(emojis)
+        added = 0
         for emoji in emojis:
             emoji_parts = emoji.strip("<>").split(":")
             emoji_id = emoji_parts[-1]
@@ -174,37 +175,7 @@ class StealEmoji(commands.Cog):
                 emoji_name = f"{branding}_{emoji_name}"
             emoji_ext = "gif" if emoji.startswith("<a:") else "png"
             emoji_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{emoji_ext}"
-            parsed.append((emoji_url, emoji_name))
-
-        async def fetch(url):
-            if not self.session or self.session.closed:
-                self.session = aiohttp.ClientSession()
-            headers = {
-                "User-Agent": "MercyBot/1.0",
-                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
-            }
-            try:
-                async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        return None
-                    return await resp.read()
-            except (asyncio.TimeoutError, aiohttp.ClientError):
-                return None
-
-        image_data_list = await asyncio.gather(*[fetch(url) for url, _ in parsed], return_exceptions=True)
-
-        total = len(parsed)
-        added = 0
-        for (url, name), image_data in zip(parsed, image_data_list):
-            if isinstance(image_data, Exception) or image_data is None:
-                await ctx.send(f"Failed to fetch emoji: {url.split('/')[-1]}")
-                continue
-            guild = ctx.guild
-            if not guild.me.guild_permissions.manage_emojis_and_stickers:
-                await ctx.send("I lack the necessary permissions to manage emojis.")
-                return added
-            name = await self.get_unique_emoji_name(name, guild)
-            result = await self._create_emoji(ctx, name, image_data)
+            result = await self.add_emoji(ctx, emoji_url, emoji_name)
             if result:
                 added += 1
 
@@ -265,12 +236,19 @@ class StealEmoji(commands.Cog):
                     return None
 
     async def get_unique_emoji_name(self, name, guild):
-        """Generate a unique name for the emoji."""
+        """Generate a unique name for the emoji (must be 2-32 chars)."""
+        clean = re.sub(r"[^a-zA-Z0-9_]", "", name).strip("_") or "emoji"
+        while len(clean) < 2:
+            clean += "_"
+        clean = clean[:32]
+
         existing_names = {emoji.name for emoji in guild.emojis}
-        unique_name = name
+        unique_name = clean
         counter = 1
         while unique_name in existing_names:
-            unique_name = f"{name}_{counter}"
+            suffix = f"_{counter}"
+            max_base = 32 - len(suffix)
+            unique_name = f"{clean[:max_base]}{suffix}"
             counter += 1
         return unique_name
 
