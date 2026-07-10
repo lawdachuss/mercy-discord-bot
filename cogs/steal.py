@@ -183,10 +183,13 @@ class StealEmoji(commands.Cog):
                 "User-Agent": "MercyBot/1.0",
                 "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
             }
-            async with self.session.get(url, headers=headers) as resp:
-                if resp.status != 200:
-                    return None
-                return await resp.read()
+            try:
+                async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        return None
+                    return await resp.read()
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                return None
 
         image_data_list = await asyncio.gather(*[fetch(url) for url, _ in parsed], return_exceptions=True)
 
