@@ -55,7 +55,7 @@ class Music(commands.Cog):
         ]
         try:
             await asyncio.wait_for(
-                wavelink.Pool.connect(nodes=nodes, client=self.bot, cache_capacity=100),
+                wavelink.Pool.connect(nodes=nodes, cache_capacity=100),
                 timeout=20
             )
         except asyncio.TimeoutError:
