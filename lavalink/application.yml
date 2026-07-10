@@ -4,6 +4,8 @@ server:
 
 lavalink:
   plugins:
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.1"
+      snapshot: false
     - dependency: "com.github.ItzRandom23:PulseLink:v1.6.6"
       repository: "https://jitpack.io"
   server:
@@ -37,15 +39,26 @@ lavalink:
     useSeekGhosting: true
     youtubePlaylistLoadLimit: 6
     playerUpdateInterval: 5
-    youtubeSearchEnabled: true
+    youtubeSearchEnabled: false
     soundcloudSearchEnabled: true
     gc-warnings: true
 
 plugins:
+  youtube:
+    enabled: true
+    allowSearch: true
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
+    clients:
+      - TVHTML5EMBEDDED
+      - TV
+      - ANDROID_MUSIC
+      - ANDROID_VR
+      - MUSIC
+    oauth:
+      enabled: true
   pulselink:
     providers:
-      - "ytsearch:\"%ISRC%\""
-      - "ytsearch:%QUERY%"
       - "spsearch:%QUERY%"
       - "amsearch:%QUERY%"
       - "tdsearch:%QUERY%"
@@ -73,7 +86,7 @@ plugins:
       pandora: true
       amazonmusic: true
       flowerytts: true
-      youtube: true
+      youtube: false
       soundcloud: true
     lyrics-sources:
       spotify: true

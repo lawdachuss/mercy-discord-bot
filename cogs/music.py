@@ -148,6 +148,10 @@ class Music(commands.Cog):
 
         player.autoplay = wavelink.AutoPlayMode.enabled
 
+        prefixes = ("ytsearch:", "ytmsearch:", "spsearch:", "amsearch:", "dzsearch:", "amzsearch:", "tdsearch:", "qbsearch:", "pdsearch:", "szsearch:", "ymsearch:", "vksearch:", "jssearch:", "admsearch:", "gnsearch:", "bcsearch:", "ncsearch:", "mcsearch:", "bilibili:", "ftts:", "scsearch:")
+        if not (URL_REGEX.match(query) or query.lower().startswith(prefixes)):
+            query = f"ytmsearch:{query}"
+
         tracks = await wavelink.Playable.search(query)
         if not tracks:
             await ctx.send(f"No results found for `{query}`.")
