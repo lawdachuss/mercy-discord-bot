@@ -39,10 +39,14 @@ class Music(commands.Cog):
         self.bot = bot
 
     async def cog_load(self) -> None:
+        import os
+        host = os.getenv("LAVALINK_HOST", "localhost")
+        port = os.getenv("LAVALINK_PORT", "2333")
+        password = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
         nodes = [
             wavelink.Node(
-                uri="http://localhost:2333",
-                password="youshallnotpass",
+                uri=f"http://{host}:{port}",
+                password=password,
             )
         ]
         await wavelink.Pool.connect(nodes=nodes, client=self.bot, cache_capacity=100)

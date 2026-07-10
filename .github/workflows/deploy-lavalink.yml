@@ -61,6 +61,38 @@ jobs:
           }
           Write-Host "yt-dlp: $(yt-dlp --version 2>$null)"
 
+      - name: Download & Install Tailscale
+        shell: powershell
+        run: |
+          $tsInstaller = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $tsInstaller
+          Start-Process msiexec.exe -ArgumentList "/i `"$tsInstaller`" /qn /norestart" -Wait
+          Remove-Item $tsInstaller -Force -ErrorAction SilentlyContinue
+          Write-Host "Tailscale installed"
+
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $hostname  = "lavalink-${{ github.run_id }}"
+
+          Start-Service Tailscale
+          Start-Sleep -Seconds 5
+
+          & $tailscale up --authkey="${{ secrets.TAILSCALE_KEY }}" --hostname="$hostname" --accept-routes --reset
+          if ($LASTEXITCODE -ne 0) { Write-Error "Tailscale failed"; exit 1 }
+
+          $ip = $null
+          for ($i = 0; $i -lt 20; $i++) {
+            try { $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim() } catch {}
+            if ($ip) { break }
+            Start-Sleep -Seconds 3
+          }
+          if (-not $ip) { Write-Error "No Tailscale IP assigned"; exit 1 }
+
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale IP: $ip"
+
       - name: Start Lavalink server
         shell: powershell
         run: |
@@ -104,14 +136,20 @@ jobs:
           Write-Host "======================================="
           Write-Host "        LAVALINK DEPLOYED"
           Write-Host "======================================="
-          Write-Host "Endpoint    : http://localhost:2333"
-          Write-Host "Password    : youshallnotpass"
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Port         : 2333"
+          Write-Host "Password     : youshallnotpass"
+          Write-Host "======================================="
+          Write-Host "Use these in your local .env:"
+          Write-Host "  LAVALINK_HOST=$env:TAILSCALE_IP"
+          Write-Host "  LAVALINK_PORT=2333"
+          Write-Host "  LAVALINK_PASSWORD=youshallnotpass"
           Write-Host "======================================="
           Write-Host ""
 
           $endTime = (Get-Date).AddMinutes(345)
           while ((Get-Date) -lt $endTime) {
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            Write-Host "[$ts] Lavalink alive"
+            Write-Host "[$ts] Lavalink alive | $env:TAILSCALE_IP:2333"
             Start-Sleep -Seconds 60
           }
