@@ -57,10 +57,14 @@ jobs:
         run: |
           $cached = "${{ github.workspace }}\.cache\yt-dlp.exe"
           if (Test-Path $cached) {
-            New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin" | Out-Null
-            Copy-Item $cached "$env:USERPROFILE\.local\bin\yt-dlp.exe" -Force
-            $env:Path += ";$env:USERPROFILE\.local\bin"
-            [Environment]::SetEnvironmentVariable("Path", $env:Path, "User")
+            $ytDir = "$env:ProgramFiles\yt-dlp"
+            New-Item -ItemType Directory -Force $ytDir | Out-Null
+            Copy-Item $cached "$ytDir\yt-dlp.exe" -Force
+            $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            if ($machinePath -notlike "*$ytDir*") {
+              [Environment]::SetEnvironmentVariable("Path", "$machinePath;$ytDir", "Machine")
+              $env:Path += ";$ytDir"
+            }
           }
           Write-Host "yt-dlp: $(yt-dlp --version 2>$null)"
 
@@ -119,6 +123,7 @@ jobs:
           $lavalinkDir = "${{ github.workspace }}\lavalink"
           $headers = @{ Authorization = "youshallnotpass" }
           $endTime = (Get-Date).AddMinutes(345)
+          $env:Path += ";$env:ProgramFiles\yt-dlp"
 
           while ((Get-Date) -lt $endTime) {
             Write-Host "Starting Lavalink..."
