@@ -128,6 +128,7 @@ class Music(commands.Cog):
 
     @commands.hybrid_command(name="play", aliases=["p"], description="Play a song or add it to the queue")
     async def play(self, ctx: commands.Context, *, query: str) -> None:
+        await ctx.defer()
         player = await self.get_player(ctx)
         if not player:
             return
