@@ -49,7 +49,7 @@ class StatusCog(commands.Cog):
                 "{uptime}": uptime,
                 "{date}": datetime.now().strftime("%d/%m/%Y"),
                 "{time}": datetime.now().strftime("%H:%M"),
-                "{bot}": self.bot.user.name if self.bot.user else "Nescafe",
+                "{bot}": self.bot.user.name if self.bot.user else "Eclairs",
             }
             
             for placeholder, value in replacements.items():
