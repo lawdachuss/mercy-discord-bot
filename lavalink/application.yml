@@ -4,12 +4,14 @@ server:
 
 lavalink:
   plugins:
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.1"
+      snapshot: false
     - dependency: "com.github.ItzRandom23:PulseLink:v1.6.6"
       repository: "https://jitpack.io"
   server:
     password: "youshallnotpass"
     sources:
-      youtube: true
+      youtube: false
       bandcamp: true
       soundcloud: true
       twitch: true
@@ -17,6 +19,12 @@ lavalink:
       nico: true
       http: true
       local: false
+    youtubeConfig:
+      clients:
+        - MUSIC
+        - ANDROID
+        - WEB
+      playlistLoadLimit: 6
     filters:
       volume: true
       equalizer: true
