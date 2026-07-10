@@ -58,8 +58,9 @@ class Music(commands.Cog):
                 wavelink.Pool.connect(nodes=nodes, client=self.bot, cache_capacity=100),
                 timeout=20
             )
+            print(f"Lavalink connected ({host}:{port})")
         except asyncio.TimeoutError:
-            print(f"WARNING: Lavalink connection timed out (http://{host}:{port})")
+            print(f"WARNING: Lavalink connection timed out ({host}:{port})")
         except Exception as e:
             print(f"WARNING: Lavalink connection failed: {e}")
 

@@ -110,69 +110,53 @@ jobs:
         shell: powershell
         run: |
           netsh advfirewall set allprofiles state off
-          Write-Host "Windows Firewall disabled on all profiles"
-          Write-Host "IP config:"
-          ipconfig | Select-String "Tailscale|IPv4"
+          netsh advfirewall firewall add rule name="Lavalink ALL" dir=in action=allow protocol=any localip=any remoteip=any
+          Write-Host "Firewall fully disabled"
 
-      - name: Start Lavalink server
+      - name: Start and keep Lavalink alive
         shell: powershell
         run: |
           $lavalinkDir = "${{ github.workspace }}\lavalink"
-          $lavalinkJob = Start-Job -Name "lavalink" -ScriptBlock {
-            param($dir)
-            Set-Location -LiteralPath $dir
-            java -jar Lavalink.jar
-          } -ArgumentList $lavalinkDir
-
-          $hostUrl = "http://127.0.0.1:2333"
           $headers = @{ Authorization = "youshallnotpass" }
-          for ($i = 0; $i -lt 20; $i++) {
-            Start-Sleep -Seconds 10
-            $output = Receive-Job $lavalinkJob -ErrorAction SilentlyContinue
-            if ($output) { Write-Host $output }
-
-            if ($lavalinkJob.State -eq "Failed") {
-              Write-Error "Lavalink process failed"
-              exit 1
-            }
-
-            try {
-              $version = Invoke-RestMethod -Uri "$hostUrl/version" -TimeoutSec 8 -Headers $headers -ErrorAction Stop
-              Write-Host "Lavalink ready! Version: $version"
-              $info = Invoke-RestMethod -Uri "$hostUrl/v4/info" -TimeoutSec 8 -Headers $headers -ErrorAction Stop
-              $info.plugins | ForEach-Object { Write-Host "  Plugin: $($_.name) v$($_.version)" }
-              $lavalinkJob | Out-Null
-              break
-            } catch {
-              if ($i -eq 19) {
-                Write-Error "Lavalink failed to start within 200s"
-                exit 1
-              }
-              Write-Host "Waiting for Lavalink... ($(($i+1)*10)s)"
-            }
-          }
-
-      - name: Keep Lavalink alive
-        shell: powershell
-        run: |
-          Write-Host ""
-          Write-Host "======================================="
-          Write-Host "        LAVALINK DEPLOYED"
-          Write-Host "======================================="
-          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
-          Write-Host "Port         : 2333"
-          Write-Host "Password     : youshallnotpass"
-          Write-Host "======================================="
-          Write-Host "Use these in your local .env:"
-          Write-Host "  LAVALINK_HOST=$env:TAILSCALE_IP"
-          Write-Host "  LAVALINK_PORT=2333"
-          Write-Host "  LAVALINK_PASSWORD=youshallnotpass"
-          Write-Host "======================================="
-          Write-Host ""
-
           $endTime = (Get-Date).AddMinutes(345)
+
           while ((Get-Date) -lt $endTime) {
-            $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            Write-Host "[$ts] Lavalink alive | $env:TAILSCALE_IP:2333"
-            Start-Sleep -Seconds 60
+            Write-Host "Starting Lavalink..."
+            $job = Start-Job -ScriptBlock {
+              param($dir) Set-Location $dir; java -jar Lavalink.jar
+            } -ArgumentList $lavalinkDir
+
+            $ok = $false
+            for ($i = 0; $i -lt 20; $i++) {
+              Start-Sleep -Seconds 10
+              $o = Receive-Job $job -ErrorAction SilentlyContinue
+              if ($o) { Write-Host $o }
+              if ($job.State -eq "Failed") { break }
+              try {
+                $v = Invoke-RestMethod "http://127.0.0.1:2333/version" -TimeoutSec 8 -Headers $headers -ErrorAction Stop
+                Write-Host "Lavalink ready! v$v"
+                $info = Invoke-RestMethod "http://127.0.0.1:2333/v4/info" -TimeoutSec 8 -Headers $headers -ErrorAction Stop
+                $info.plugins | ForEach-Object { Write-Host "  $($_.name) v$($_.version)" }
+                $ok = $true; break
+              } catch { Write-Host "Waiting... ($(($i+1)*10)s)" }
+            }
+
+            if (-not $ok) { Write-Host "Retry in 30s..."; Start-Sleep 30; continue }
+
+            Write-Host "======================================="
+            Write-Host "TAILSCALE_IP=$env:TAILSCALE_IP :2333"
+            Write-Host "PASSWORD=youshallnotpass"
+            Write-Host "======================================="
+
+            while ((Get-Date) -lt $endTime) {
+              Start-Sleep -Seconds 30
+              $o = Receive-Job $job -ErrorAction SilentlyContinue
+              if ($o) { Write-Host $o }
+              if ($job.State -ne "Running") { Write-Host "Lavalink died, restarting..."; break }
+              try {
+                $null = Invoke-RestMethod "http://127.0.0.1:2333/version" -TimeoutSec 5 -Headers $headers -ErrorAction Stop
+                Write-Host "$(Get-Date -Format HH:mm:ss) alive | $env:TAILSCALE_IP:2333"
+              } catch { Write-Host "Health check failed, restarting..."; break }
+            }
+            Remove-Job $job -Force -ErrorAction SilentlyContinue
           }
