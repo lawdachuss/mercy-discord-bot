@@ -106,6 +106,12 @@ jobs:
           "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tailscale IP: $ip"
 
+      - name: Open firewall for Lavalink
+        shell: powershell
+        run: |
+          New-NetFirewallRule -DisplayName "Lavalink 2333" -Direction Inbound -LocalPort 2333 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
+          Write-Host "Firewall rule added"
+
       - name: Start Lavalink server
         shell: powershell
         run: |
@@ -116,30 +122,25 @@ jobs:
             java -jar Lavalink.jar
           } -ArgumentList $lavalinkDir
 
-          Start-Sleep -Seconds 30
-
-          $output = Receive-Job $lavalinkJob -ErrorAction SilentlyContinue
-          if ($output) { Write-Host $output }
-
-          if ($lavalinkJob.State -eq "Failed") {
-            Write-Error "Lavalink failed to start"
-            Receive-Job $lavalinkJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-            exit 1
-          }
-
-          Write-Host "Lavalink server started (Job ID: $($lavalinkJob.Id))"
-
-      - name: Verify Lavalink is running
-        shell: powershell
-        run: |
-          Start-Sleep -Seconds 10
-          try {
-            $version = Invoke-RestMethod -Uri "http://localhost:2333/version" -TimeoutSec 10
-            Write-Host "Lavalink version: $version"
-            $info = Invoke-RestMethod -Uri "http://localhost:2333/v4/info" -TimeoutSec 10
-            $info.plugins | ForEach-Object { Write-Host "  Plugin: $($_.name) v$($_.version)" }
-          } catch {
-            Write-Warning "Could not verify Lavalink (may still be booting)"
+          for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Seconds 10
+            $output = Receive-Job $lavalinkJob -ErrorAction SilentlyContinue
+            if ($output) { Write-Host $output }
+            try {
+              $version = Invoke-RestMethod -Uri "http://localhost:2333/version" -TimeoutSec 5
+              Write-Host "Lavalink ready! Version: $version"
+              $info = Invoke-RestMethod -Uri "http://localhost:2333/v4/info" -TimeoutSec 5
+              $info.plugins | ForEach-Object { Write-Host "  Plugin: $($_.name) v$($_.version)" }
+              break
+            } catch {
+              if ($i -eq 11) {
+                Write-Error "Lavalink failed to start within 120s"
+                $output = Receive-Job $lavalinkJob -ErrorAction SilentlyContinue
+                if ($output) { Write-Host $output }
+                exit 1
+              }
+              Write-Host "Waiting for Lavalink... ($(($i+1)*10)s)"
+            }
           }
 
       - name: Keep Lavalink alive
