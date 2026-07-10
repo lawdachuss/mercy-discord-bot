@@ -1,4 +1,4 @@
-name: Deploy Lavalink + Music Bot
+name: Deploy Lavalink
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  lavalink-bot:
+  lavalink:
     runs-on: windows-latest
     timeout-minutes: 360
 
@@ -22,17 +22,6 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Python dependencies
-        shell: powershell
-        run: |
-          python -m pip install -r requirements.txt
-          if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed"; exit 1 }
 
       - name: Download Lavalink
         shell: powershell
@@ -85,72 +74,27 @@ jobs:
           try {
             $version = Invoke-RestMethod -Uri "http://localhost:2333/version" -TimeoutSec 10
             Write-Host "Lavalink version: $version"
-            $plugins = Invoke-RestMethod -Uri "http://localhost:2333/v4/info" -TimeoutSec 10
-            $plugins.plugins | ForEach-Object { Write-Host "  Plugin: $($_.name) v$($_.version)" }
+            $info = Invoke-RestMethod -Uri "http://localhost:2333/v4/info" -TimeoutSec 10
+            $info.plugins | ForEach-Object { Write-Host "  Plugin: $($_.name) v$($_.version)" }
           } catch {
             Write-Warning "Could not verify Lavalink (may still be booting)"
           }
 
-      - name: Start Discord bot
+      - name: Keep Lavalink alive
         shell: powershell
-        env:
-          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          MONGO_URL: ${{ secrets.MONGO_URL }}
-          OWNER_IDS: ${{ secrets.OWNER_IDS }}
-          AUTO_SYNC_COMMANDS: "true"
-          LAVALINK_HOST: "localhost"
-          LAVALINK_PORT: "2333"
-          LAVALINK_PASSWORD: "youshallnotpass"
         run: |
-          $wd = "${{ github.workspace }}"
-          $botJob = Start-Job -Name "musicbot" -ScriptBlock {
-            param($wd)
-            Set-Location -LiteralPath $wd
-            python -u main.py
-          } -ArgumentList $wd
-
-          Start-Sleep -Seconds 15
-
-          $output = Receive-Job $botJob -ErrorAction SilentlyContinue
-          if ($output) { Write-Host $output }
-
-          if ($botJob.State -eq "Failed") {
-            Write-Error "Bot failed to start"
-            Receive-Job $botJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-            exit 1
-          }
-
-          if ($botJob.State -eq "Completed") {
-            Write-Error "Bot exited too early"
-            exit 1
-          }
-
           Write-Host ""
           Write-Host "======================================="
-          Write-Host "   LAVALINK + MUSIC BOT DEPLOYED"
+          Write-Host "        LAVALINK DEPLOYED"
           Write-Host "======================================="
-          Write-Host "Lavalink    : http://localhost:2333"
-          Write-Host "Bot         : Running in background job"
+          Write-Host "Endpoint    : http://localhost:2333"
+          Write-Host "Password    : youshallnotpass"
           Write-Host "======================================="
           Write-Host ""
 
           $endTime = (Get-Date).AddMinutes(345)
           while ((Get-Date) -lt $endTime) {
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            $output = Receive-Job $botJob -ErrorAction SilentlyContinue
-            if ($output) { $output | ForEach-Object { Write-Host $_ } }
-
-            if ($botJob.State -eq "Failed") {
-              Write-Error "Bot crashed"
-              Receive-Job $botJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-              exit 1
-            }
-            if ($botJob.State -eq "Completed") {
-              Write-Host "Bot exited gracefully."
-              exit 0
-            }
-
-            Write-Host "[$ts] Bot alive"
-            Start-Sleep -Seconds 30
+            Write-Host "[$ts] Lavalink alive"
+            Start-Sleep -Seconds 60
           }
