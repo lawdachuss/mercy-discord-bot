@@ -23,17 +23,18 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Restore Lavalink cache
-        id: cache-lavalink
+      - name: Restore cached dependencies
+        id: cache-deps
         uses: actions/cache@v4
         with:
           path: |
             lavalink/Lavalink.jar
             lavalink/plugins
-          key: lavalink-v1-${{ hashFiles('lavalink/application.yml') }}
+            ${{ runner.temp }}\lavalink-cache
+          key: lavalink-deps-v2-${{ hashFiles('lavalink/application.yml') }}
 
       - name: Download Lavalink
-        if: steps.cache-lavalink.outputs.cache-hit != 'true'
+        if: steps.cache-deps.outputs.cache-hit != 'true'
         shell: powershell
         run: |
           $url = "https://github.com/lavalink-devs/Lavalink/releases/download/4.2.2/Lavalink.jar"
@@ -47,28 +48,55 @@ jobs:
           New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\lavalink\plugins" | Out-Null
           Write-Host "Download complete: $(Get-Item $out).Length bytes"
 
+      - name: Download dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          $cache = "${{ runner.temp }}\lavalink-cache"
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+
+          Write-Host "Downloading yt-dlp..."
+          $ytdlpUrl = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+          curl.exe -L -o "$cache\yt-dlp.exe" $ytdlpUrl
+
+          Write-Host "Downloading Tailscale..."
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          curl.exe -L -o "$cache\tailscale.msi" $tsUrl
+
+          Write-Host "Downloads cached"
+
       - name: Install yt-dlp
         shell: powershell
         run: |
-          pip install yt-dlp
-          if ($LASTEXITCODE -ne 0) {
-            $url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-            curl.exe -L -o "${{ runner.temp }}\yt-dlp.exe" $url
+          $cached = "${{ runner.temp }}\lavalink-cache\yt-dlp.exe"
+          if (Test-Path $cached) {
             New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin" | Out-Null
-            Move-Item "${{ runner.temp }}\yt-dlp.exe" "$env:USERPROFILE\.local\bin\yt-dlp.exe" -Force
+            Copy-Item $cached "$env:USERPROFILE\.local\bin\yt-dlp.exe" -Force
             $env:Path += ";$env:USERPROFILE\.local\bin"
             [Environment]::SetEnvironmentVariable("Path", $env:Path, "User")
+          } else {
+            pip install yt-dlp
           }
           Write-Host "yt-dlp: $(yt-dlp --version 2>$null)"
 
-      - name: Download & Install Tailscale
+      - name: Install Tailscale
         shell: powershell
         run: |
-          $tsInstaller = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $tsInstaller
-          Start-Process msiexec.exe -ArgumentList "/i `"$tsInstaller`" /qn /norestart" -Wait
-          Remove-Item $tsInstaller -Force -ErrorAction SilentlyContinue
-          Write-Host "Tailscale installed"
+          $cached = "${{ runner.temp }}\lavalink-cache\tailscale.msi"
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+            if (Test-Path $cached) {
+              Write-Host "Installing Tailscale from cache..."
+              Start-Process msiexec.exe -ArgumentList "/i `"$cached`" /qn /norestart" -Wait
+            } else {
+              Write-Host "Downloading and installing Tailscale..."
+              $tsInstaller = "$env:TEMP\tailscale.msi"
+              Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $tsInstaller
+              Start-Process msiexec.exe -ArgumentList "/i `"$tsInstaller`" /qn /norestart" -Wait
+              Remove-Item $tsInstaller -Force -ErrorAction SilentlyContinue
+            }
+          } else {
+            Write-Host "Tailscale already installed, skipping"
+          }
 
       - name: Connect Tailscale
         shell: powershell
