@@ -1,3 +1,4 @@
+import asyncio
 import discord
 from discord.ext import commands
 import wavelink
@@ -49,7 +50,15 @@ class Music(commands.Cog):
                 password=password,
             )
         ]
-        await wavelink.Pool.connect(nodes=nodes, client=self.bot, cache_capacity=100)
+        try:
+            await asyncio.wait_for(
+                wavelink.Pool.connect(nodes=nodes, client=self.bot, cache_capacity=100),
+                timeout=20
+            )
+        except asyncio.TimeoutError:
+            print(f"WARNING: Lavalink connection timed out (http://{host}:{port})")
+        except Exception as e:
+            print(f"WARNING: Lavalink connection failed: {e}")
 
     async def cog_unload(self) -> None:
         await wavelink.Pool.close()
