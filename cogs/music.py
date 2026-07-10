@@ -102,6 +102,18 @@ class Music(commands.Cog):
             await player.play(next_track)
 
     @commands.Cog.listener()
+    async def on_wavelink_track_exception(self, payload: wavelink.TrackExceptionEventPayload) -> None:
+        player = payload.player
+        if not player:
+            return
+        home = getattr(player, "home", None)
+        if home:
+            await home.send(f"Track failed: {payload.exception.message[:200]}")
+        if not player.queue.is_empty:
+            next_track = player.queue.get()
+            await player.play(next_track)
+
+    @commands.Cog.listener()
     async def on_wavelink_inactive_player(self, player: wavelink.Player) -> None:
         home = getattr(player, "home", None)
         if home:

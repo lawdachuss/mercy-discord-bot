@@ -5,6 +5,7 @@ server:
 lavalink:
   plugins:
     - dependency: "dev.lavalink.youtube:youtube-plugin:1.11.0"
+      snapshot: false
     - dependency: "com.github.ItzRandom23:PulseLink:v1.6.6"
       repository: "https://jitpack.io"
   server:
@@ -18,6 +19,12 @@ lavalink:
       nico: true
       http: true
       local: false
+    youtubeConfig:
+      clients:
+        - MUSIC
+        - WEB
+        - TVHTML5EMBEDDED
+      playlistLoadLimit: 6
     filters:
       volume: true
       equalizer: true
