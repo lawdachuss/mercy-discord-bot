@@ -122,21 +122,27 @@ jobs:
             java -jar Lavalink.jar
           } -ArgumentList $lavalinkDir
 
-          for ($i = 0; $i -lt 12; $i++) {
+          $hostUrl = "http://127.0.0.1:2333"
+          for ($i = 0; $i -lt 20; $i++) {
             Start-Sleep -Seconds 10
             $output = Receive-Job $lavalinkJob -ErrorAction SilentlyContinue
             if ($output) { Write-Host $output }
+
+            if ($lavalinkJob.State -eq "Failed") {
+              Write-Error "Lavalink process failed"
+              exit 1
+            }
+
             try {
-              $version = Invoke-RestMethod -Uri "http://localhost:2333/version" -TimeoutSec 5
+              $version = Invoke-RestMethod -Uri "$hostUrl/version" -TimeoutSec 8 -ErrorAction Stop
               Write-Host "Lavalink ready! Version: $version"
-              $info = Invoke-RestMethod -Uri "http://localhost:2333/v4/info" -TimeoutSec 5
+              $info = Invoke-RestMethod -Uri "$hostUrl/v4/info" -TimeoutSec 8 -ErrorAction Stop
               $info.plugins | ForEach-Object { Write-Host "  Plugin: $($_.name) v$($_.version)" }
+              $lavalinkJob | Out-Null
               break
             } catch {
-              if ($i -eq 11) {
-                Write-Error "Lavalink failed to start within 120s"
-                $output = Receive-Job $lavalinkJob -ErrorAction SilentlyContinue
-                if ($output) { Write-Host $output }
+              if ($i -eq 19) {
+                Write-Error "Lavalink failed to start within 200s"
                 exit 1
               }
               Write-Host "Waiting for Lavalink... ($(($i+1)*10)s)"
