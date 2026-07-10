@@ -40,6 +40,9 @@ class Music(commands.Cog):
         self.bot = bot
 
     async def cog_load(self) -> None:
+        self.bot.loop.create_task(self._connect_lavalink())
+
+    async def _connect_lavalink(self) -> None:
         import os
         host = os.getenv("LAVALINK_HOST", "localhost")
         port = os.getenv("LAVALINK_PORT", "2333")
