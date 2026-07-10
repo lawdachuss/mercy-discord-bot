@@ -141,16 +141,11 @@ class Music(commands.Cog):
 
     @commands.hybrid_command(name="play", aliases=["p"], description="Play a song or add it to the queue")
     async def play(self, ctx: commands.Context, *, query: str) -> None:
-        try:
-            await ctx.defer()
-        except:
-            pass
+        await ctx.defer()
 
         player = await self.get_player(ctx)
         if not player:
             return
-
-        player.autoplay = wavelink.AutoPlayMode.enabled
 
         prefixes = ("ytsearch:", "ytmsearch:", "spsearch:", "amsearch:", "dzsearch:", "amzsearch:", "tdsearch:", "qbsearch:", "pdsearch:", "szsearch:", "ymsearch:", "vksearch:", "jssearch:", "admsearch:", "gnsearch:", "bcsearch:", "ncsearch:", "mcsearch:", "bilibili:", "ftts:", "scsearch:")
         if not (URL_REGEX.match(query) or query.lower().startswith(prefixes)):
