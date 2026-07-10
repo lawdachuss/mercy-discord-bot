@@ -21,9 +21,11 @@ lavalink:
       local: false
     youtubeConfig:
       clients:
+        - ANDROID_MUSIC
+        - ANDROID_VR
         - MUSIC
+        - TVHTML5_SIMPLY
         - ANDROID
-        - WEB
       playlistLoadLimit: 6
     filters:
       volume: true
@@ -50,6 +52,17 @@ lavalink:
     gc-warnings: true
 
 plugins:
+  youtube:
+    enabled: true
+    allowSearch: true
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
+    clients:
+      - ANDROID_MUSIC
+      - ANDROID_VR
+      - MUSIC
+      - TVHTML5_SIMPLY
+      - ANDROID
   pulselink:
     providers:
       - "ytsearch:\"%ISRC%\""
@@ -81,7 +94,7 @@ plugins:
       pandora: true
       amazonmusic: true
       flowerytts: true
-      youtube: true
+      youtube: false
       soundcloud: true
     lyrics-sources:
       spotify: true
