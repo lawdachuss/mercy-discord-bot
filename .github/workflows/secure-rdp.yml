@@ -21,23 +21,34 @@ jobs:
       - name: Checkout bot code
         uses: actions/checkout@v4
 
-      - name: Setup Python with pip cache
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
-          cache-dependency-path: requirements.txt
 
-      - name: Restore cached dependencies
-        id: cache-deps
-        uses: actions/cache@v4
+      - name: Restore venv cache
+        id: cache-venv
+        uses: actions/cache/restore@v4
         with:
-          path: |
-            .cache
-            C:\rdp-session
-          key: rdp-deps-v1-${{ hashFiles('requirements.txt') }}
+          path: .venv
+          key: venv-${{ hashFiles('requirements.txt') }}
 
-      - name: Setup RDP + Tailscale + pip
+      - name: Create venv & install deps
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install -r requirements.txt
+          .venv\Scripts\python -c "import discord; print(f'discord.py {discord.__version__}')"
+
+      - name: Save venv cache
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .venv
+          key: venv-${{ hashFiles('requirements.txt') }}
+
+      - name: Setup RDP + Tailscale
         shell: powershell
         run: |
           $wd = "${{ github.workspace }}"
@@ -47,13 +58,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\.cache" | Out-Null
 
           $cachedTs = "${{ github.workspace }}\.cache\tailscale.msi"
-          $tsJob = $null
-          if (Test-Path $cachedTs) {
-            Write-Host "=== Tailscale already cached ==="
+          if (-not (Test-Path $cachedTs)) {
+            Write-Host "=== Downloading Tailscale ==="
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $cachedTs
           } else {
-            Write-Host "=== Downloading Tailscale (background, parallel with pip) ==="
-            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-            $tsJob = Start-Job -ScriptBlock { param($u,$o) Invoke-WebRequest -Uri $u -OutFile $o } -ArgumentList $tsUrl, $cachedTs
+            Write-Host "=== Tailscale already cached ==="
           }
 
           Write-Host "=== Configuring RDP ==="
@@ -71,20 +80,6 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          Write-Host "=== Installing Python dependencies (parallel with Tailscale download) ==="
-          python -m pip install -r requirements.txt
-          if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed"; exit 1 }
-          Write-Host "pip install completed."
-
-          Write-Host "=== Verifying discord module ==="
-          python -c "import discord; print(f'discord.py {discord.__version__}')"
-          if ($LASTEXITCODE -ne 0) { Write-Error "discord not found"; exit 1 }
-
-          if ($tsJob) {
-            Write-Host "=== Waiting for Tailscale download ==="
-            $tsJob | Wait-Job | Out-Null; $tsJob | Remove-Job
-          }
 
           if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
             Write-Host "=== Installing Tailscale ==="
@@ -162,7 +157,7 @@ jobs:
             $env:MONGO_URL = $mongo
             $env:OWNER_IDS = $owners
             $env:AUTO_SYNC_COMMANDS = "true"
-            python -u main.py
+            & "$wd\.venv\Scripts\python" -u main.py
           } -ArgumentList $wd, $env:DISCORD_TOKEN, $env:WEBHOOK_URL, $env:MONGO_URL, $env:OWNER_IDS
 
           Start-Sleep -Seconds 15
