@@ -117,6 +117,13 @@ jobs:
           netsh advfirewall firewall add rule name="Lavalink ALL" dir=in action=allow protocol=any localip=any remoteip=any
           Write-Host "Firewall fully disabled"
 
+      - name: Inject YouTube OAuth refresh token
+        shell: powershell
+        run: |
+          $config = "${{ github.workspace }}\lavalink\application.yml"
+          (Get-Content $config) -replace 'REFRESH_TOKEN_PLACEHOLDER', '${{ secrets.YOUTUBE_REFRESH_TOKEN }}' | Set-Content $config -Encoding utf8
+          Write-Host "Refresh token injected"
+
       - name: Start and keep Lavalink alive
         shell: powershell
         run: |

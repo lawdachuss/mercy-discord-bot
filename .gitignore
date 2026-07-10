@@ -73,3 +73,8 @@ bot_output.txt
 bot_error.txt
 bot_log.txt
 lavalink/*.jar
+lavalink/plugins/*.jar
+lavalink/*.log
+lavalink/*.err
+lavalink/cookies.txt
+.cache/

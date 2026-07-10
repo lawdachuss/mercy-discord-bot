@@ -39,7 +39,7 @@ lavalink:
     useSeekGhosting: true
     youtubePlaylistLoadLimit: 6
     playerUpdateInterval: 5
-    youtubeSearchEnabled: false
+    youtubeSearchEnabled: true
     soundcloudSearchEnabled: true
     gc-warnings: true
 
@@ -50,13 +50,14 @@ plugins:
     allowDirectVideoIds: true
     allowDirectPlaylistIds: true
     clients:
-      - TVHTML5EMBEDDED
-      - TV
+      - TVHTML5
       - ANDROID_MUSIC
-      - ANDROID_VR
-      - MUSIC
+      - WEB
+      - WEB_EMBEDDED_PLAYER
     oauth:
       enabled: true
+      refreshToken: "REFRESH_TOKEN_PLACEHOLDER"
+      skipInitialization: true
   pulselink:
     providers:
       - "spsearch:%QUERY%"
@@ -100,7 +101,6 @@ plugins:
       countryCode: "US"
       playlistLoadLimit: 6
       albumLoadLimit: 6
-
     tidal:
       countryCode: "US"
       searchLimit: 6
@@ -136,4 +136,3 @@ logging:
   level:
     root: INFO
     lavalink: INFO
-    dev.lavalink.youtube.http.YoutubeOauth2Handler: INFO
