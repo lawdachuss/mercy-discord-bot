@@ -137,7 +137,7 @@ class ChatLeaderboardCog(commands.Cog):
         self.last_weekly_reset = {}  # {guild_id: datetime}
         self.last_monthly_reset = {}  # {guild_id: datetime}
         self.last_update_time = {}  # {guild_id: datetime} - track when leaderboard was last updated
-        self.last_daily_recreate = {}  # {guild_id: datetime} - track last full delete+recreate
+        self._startup_cleanup_done = set()  # {guild_id} - guilds that have received startup cleanup
         self.view_cache = {}  # {(guild_id, period): view_instance} - cache views to preserve state
         self.last_month_winner_cache = {}  # FIX #10: Cache last month winner {guild_id: (winner_data, cached_at)}
         self.creation_locks = {}  # {guild_id: asyncio.Lock} - prevent concurrent message creation
@@ -652,47 +652,25 @@ class ChatLeaderboardCog(commands.Cog):
                     msg_data = await self._get_leaderboard_message(guild_id)
                     vibe_channel_id = config.get('vibe_channel_id')
                     
-                    # Daily full recreate based on guild's timezone
-                    tz_name = config.get('timezone', 'Asia/Kolkata')
-                    is_valid, validated_tz, _ = DataValidator.validate_timezone(tz_name)
-                    if not is_valid:
-                        validated_tz = 'Asia/Kolkata'
-                    try:
-                        tz = pytz.timezone(validated_tz)
-                    except Exception:
-                        tz = pytz.timezone('Asia/Kolkata')
-                    today_date = datetime.now(tz).date()
-                    # Load persisted recreate date from DB (survives restarts)
-                    stored_recreate = config.get('last_daily_recreate_date')
-                    if stored_recreate:
-                        try:
-                            self.last_daily_recreate[guild_id] = datetime.strptime(str(stored_recreate), '%Y-%m-%d').date()
-                        except (ValueError, TypeError):
-                            pass
-                    last_recreate_date = self.last_daily_recreate.get(guild_id)
-                    if last_recreate_date != today_date:
-                        target_channel_id = config.get('chat_channel_id') or (msg_data.get('channel_id') if msg_data else None)
-                        if target_channel_id:
-                            target_channel = guild.get_channel(target_channel_id)
+                    # Startup cleanup: delete old embeds and recreate fresh on first run only
+                    if guild_id not in self._startup_cleanup_done:
+                        if msg_data:
+                            target_channel_id = config.get('chat_channel_id') or msg_data.get('channel_id')
+                            target_channel = guild.get_channel(target_channel_id) if target_channel_id else None
                             if target_channel:
-                                self.logger.info(f"Daily recreate triggered for chat leaderboard guild {guild_id} (tz: {validated_tz})")
-                                # Delete old messages from their ORIGINAL channel (may differ from config)
-                                if msg_data:
-                                    old_channel_id = msg_data.get('channel_id')
-                                    if old_channel_id and old_channel_id != target_channel_id:
-                                        old_channel = guild.get_channel(old_channel_id)
-                                        if old_channel:
-                                            self.logger.info(f"Deleting old messages from original channel {old_channel.name} (config changed to {target_channel.name})")
-                                            await self._delete_old_leaderboard_messages(msg_data, old_channel)
-                                    await self._delete_old_leaderboard_messages(msg_data, target_channel)
+                                self.logger.info(f"Startup cleanup: recreating chat leaderboard for guild {guild_id}")
+                                old_channel_id = msg_data.get('channel_id')
+                                if old_channel_id and old_channel_id != target_channel_id:
+                                    old_channel = guild.get_channel(old_channel_id)
+                                    if old_channel:
+                                        await self._delete_old_leaderboard_messages(msg_data, old_channel)
+                                await self._delete_old_leaderboard_messages(msg_data, target_channel)
                                 await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'chat'})
                                 await self._create_full_leaderboard_message(target_channel, guild_id, vibe_channel_id)
-                        self.last_daily_recreate[guild_id] = today_date
-                        # Persist to MongoDB so it survives restarts
-                        await self.db.guild_configs.update_one(
-                            {'guild_id': guild_id},
-                            {'$set': {'last_daily_recreate_date': today_date.isoformat()}}
-                        )
+                                self._startup_cleanup_done.add(guild_id)
+                                continue
+                        # No msg_data or no valid channel — nothing to clean up, mark done
+                        self._startup_cleanup_done.add(guild_id)
                     
                     # If no message data exists, try to create messages if channel is configured
                     if not msg_data:
