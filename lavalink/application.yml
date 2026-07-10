@@ -67,6 +67,8 @@ plugins:
       enabled: true
   pulselink:
     providers:
+      - "ytsearch:\"%ISRC%\""
+      - "ytsearch:%QUERY%"
       - "spsearch:%QUERY%"
       - "amsearch:%QUERY%"
       - "tdsearch:%QUERY%"
@@ -94,7 +96,7 @@ plugins:
       pandora: true
       amazonmusic: true
       flowerytts: true
-      youtube: false
+      youtube: true
       soundcloud: true
     lyrics-sources:
       spotify: true
