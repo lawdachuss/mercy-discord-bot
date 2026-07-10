@@ -808,6 +808,13 @@ class VoiceLeaderboardCog(commands.Cog):
                     except Exception:
                         tz = pytz.timezone('Asia/Kolkata')
                     today_date = datetime.now(tz).date()
+                    # Load persisted recreate date from DB (survives restarts)
+                    stored_recreate = config.get('last_daily_recreate_date')
+                    if stored_recreate:
+                        try:
+                            self.last_daily_recreate[guild_id] = datetime.strptime(str(stored_recreate), '%Y-%m-%d').date()
+                        except (ValueError, TypeError):
+                            pass
                     last_recreate_date = self.last_daily_recreate.get(guild_id)
                     if last_recreate_date != today_date:
                         voice_channel_id = config.get('voice_channel_id') or (msg_data.get('channel_id') if msg_data else None)
@@ -820,6 +827,11 @@ class VoiceLeaderboardCog(commands.Cog):
                                 await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'voice'})
                                 await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
                         self.last_daily_recreate[guild_id] = today_date
+                        # Persist to MongoDB so it survives restarts
+                        await self.db.guild_configs.update_one(
+                            {'guild_id': guild_id},
+                            {'$set': {'last_daily_recreate_date': today_date.isoformat()}}
+                        )
                     
                     # If no message data exists, try to create messages if channel is configured
                     if not msg_data:
