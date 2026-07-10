@@ -437,17 +437,19 @@ class VoiceLeaderboardCog(commands.Cog):
             if msg_id:
                 try:
                     await channel.get_partial_message(msg_id).delete()
+                    self.logger.info(f"Deleted tracked msg {key}={msg_id} from {channel.name}")
                 except discord.NotFound:
-                    pass
+                    self.logger.debug(f"Tracked msg {msg_id} not found in {channel.name}")
                 except Exception as e:
-                    self.logger.debug(f"Could not delete tracked msg {msg_id}: {e}")
+                    self.logger.warning(f"Could not delete tracked msg {msg_id} from {channel.name}: {e}")
         
         # Step 2: Try to purge all remaining messages (needs manage_messages)
         try:
             deleted = await channel.purge(limit=200)
             if deleted:
                 self.logger.info(f"Purged {len(deleted)} messages from {channel.name}")
-        except discord.Forbidden:
+        except discord.Forbidden as e:
+            self.logger.warning(f"No manage_messages in {channel.name}, falling back to history scan: {e}")
             try:
                 count = 0
                 async for msg in channel.history(limit=200):
@@ -457,6 +459,8 @@ class VoiceLeaderboardCog(commands.Cog):
                         await asyncio.sleep(0.3)
                 if count:
                     self.logger.info(f"Deleted {count} bot messages from {channel.name}")
+                else:
+                    self.logger.warning(f"No bot messages found via history scan in {channel.name}")
             except Exception as e:
                 self.logger.warning(f"Could not delete messages from {channel.name}: {e}")
         except discord.HTTPException as e:
@@ -832,15 +836,22 @@ class VoiceLeaderboardCog(commands.Cog):
                             pass
                     last_recreate_date = self.last_daily_recreate.get(guild_id)
                     if last_recreate_date != today_date:
-                        voice_channel_id = config.get('voice_channel_id') or (msg_data.get('channel_id') if msg_data else None)
-                        if voice_channel_id:
-                            channel = guild.get_channel(voice_channel_id)
-                            if channel:
+                        target_channel_id = config.get('voice_channel_id') or (msg_data.get('channel_id') if msg_data else None)
+                        if target_channel_id:
+                            target_channel = guild.get_channel(target_channel_id)
+                            if target_channel:
                                 self.logger.info(f"Daily recreate triggered for voice leaderboard guild {guild_id} (tz: {validated_tz})")
+                                # Delete old messages from their ORIGINAL channel (may differ from config)
                                 if msg_data:
-                                    await self._delete_old_leaderboard_messages(msg_data, channel)
+                                    old_channel_id = msg_data.get('channel_id')
+                                    if old_channel_id and old_channel_id != target_channel_id:
+                                        old_channel = guild.get_channel(old_channel_id)
+                                        if old_channel:
+                                            self.logger.info(f"Deleting old messages from original channel {old_channel.name} (config changed to {target_channel.name})")
+                                            await self._delete_old_leaderboard_messages(msg_data, old_channel)
+                                    await self._delete_old_leaderboard_messages(msg_data, target_channel)
                                 await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'voice'})
-                                await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                                await self._create_full_leaderboard_message(target_channel, guild_id, vibe_channel_id)
                         self.last_daily_recreate[guild_id] = today_date
                         # Persist to MongoDB so it survives restarts
                         await self.db.guild_configs.update_one(
