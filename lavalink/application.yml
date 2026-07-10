@@ -67,8 +67,6 @@ plugins:
       enabled: true
   pulselink:
     providers:
-      - "ytsearch:\"%ISRC%\""
-      - "ytsearch:%QUERY%"
       - "spsearch:%QUERY%"
       - "amsearch:%QUERY%"
       - "tdsearch:%QUERY%"
