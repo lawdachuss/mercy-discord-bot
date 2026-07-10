@@ -323,27 +323,37 @@ class ChatLeaderboardCog(commands.Cog):
         return await self.db.leaderboard_messages.find_one({'guild_id': guild_id, 'type': 'chat'})
 
     async def _delete_old_leaderboard_messages(self, msg_data: Dict, channel: discord.TextChannel):
-        """Try to delete old leaderboard messages before recreating. Best-effort, ignores errors."""
-        for key in ('daily_message_id', 'weekly_message_id', 'monthly_message_id', 'message_id'):
-            msg_id = msg_data.get(key)
-            if msg_id:
-                try:
-                    old = await channel.fetch_message(msg_id)
-                    await old.delete()
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    pass
+        """Delete ALL messages in the leaderboard channel before recreating."""
+        try:
+            deleted = await channel.purge(limit=200)
+            if deleted:
+                self.logger.info(f"Purged {len(deleted)} messages from {channel.name}")
+        except discord.Forbidden:
+            count = 0
+            async for msg in channel.history(limit=200):
+                if msg.author == self.bot.user:
+                    await msg.delete()
+                    count += 1
+                    await asyncio.sleep(0.3)
+            if count:
+                self.logger.info(f"Deleted {count} bot messages from {channel.name}")
+        except discord.HTTPException as e:
+            self.logger.warning(f"HTTP error purging {channel.name}: {e.status}")
     
-    async def _save_leaderboard_messages(self, guild_id: int, channel_id: int, daily_id: int, weekly_id: int, monthly_id: int):
-        """Save all three leaderboard message IDs"""
+    async def _save_leaderboard_messages(self, guild_id: int, channel_id: int, daily_id: int, weekly_id: int, monthly_id: int, header_id: int = None):
+        """Save all leaderboard message IDs"""
+        data = {
+            'channel_id': channel_id,
+            'daily_message_id': daily_id,
+            'weekly_message_id': weekly_id,
+            'monthly_message_id': monthly_id,
+            'last_update': datetime.utcnow()
+        }
+        if header_id:
+            data['header_message_id'] = header_id
         await self.db.leaderboard_messages.update_one(
             {'guild_id': guild_id, 'type': 'chat'},
-            {'$set': {
-                'channel_id': channel_id,
-                'daily_message_id': daily_id,
-                'weekly_message_id': weekly_id,
-                'monthly_message_id': monthly_id,
-                'last_update': datetime.utcnow()
-            }},
+            {'$set': data},
             upsert=True
         )
     
@@ -547,7 +557,7 @@ class ChatLeaderboardCog(commands.Cog):
                 # Send header image
                 header_embed = discord.Embed(color=EMBED_COLOR)
                 header_embed.set_image(url=Images.CHAT_HEADER)
-                await channel.send(embed=header_embed)
+                header_message = await channel.send(embed=header_embed)
                 
                 # Small delay to avoid rate limits
                 await asyncio.sleep(0.5)
@@ -575,7 +585,7 @@ class ChatLeaderboardCog(commands.Cog):
                 self.view_cache[(guild_id, 'daily')] = daily_view
                 
                 # Save ALL message IDs for updates
-                await self._save_leaderboard_messages(guild_id, channel.id, daily_message.id, weekly_message.id, monthly_message.id)
+                await self._save_leaderboard_messages(guild_id, channel.id, daily_message.id, weekly_message.id, monthly_message.id, header_message.id)
                 self.logger.info(f"Created chat leaderboard messages for guild {guild_id}")
             except discord.Forbidden as e:
                 self.logger.error(f"Permission denied creating leaderboard for guild {guild_id}: {e}")
