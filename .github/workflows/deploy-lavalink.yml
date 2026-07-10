@@ -123,6 +123,7 @@ jobs:
           } -ArgumentList $lavalinkDir
 
           $hostUrl = "http://127.0.0.1:2333"
+          $headers = @{ Authorization = "youshallnotpass" }
           for ($i = 0; $i -lt 20; $i++) {
             Start-Sleep -Seconds 10
             $output = Receive-Job $lavalinkJob -ErrorAction SilentlyContinue
@@ -134,9 +135,9 @@ jobs:
             }
 
             try {
-              $version = Invoke-RestMethod -Uri "$hostUrl/version" -TimeoutSec 8 -ErrorAction Stop
+              $version = Invoke-RestMethod -Uri "$hostUrl/version" -TimeoutSec 8 -Headers $headers -ErrorAction Stop
               Write-Host "Lavalink ready! Version: $version"
-              $info = Invoke-RestMethod -Uri "$hostUrl/v4/info" -TimeoutSec 8 -ErrorAction Stop
+              $info = Invoke-RestMethod -Uri "$hostUrl/v4/info" -TimeoutSec 8 -Headers $headers -ErrorAction Stop
               $info.plugins | ForEach-Object { Write-Host "  Plugin: $($_.name) v$($_.version)" }
               $lavalinkJob | Out-Null
               break
