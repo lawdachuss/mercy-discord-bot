@@ -323,20 +323,35 @@ class ChatLeaderboardCog(commands.Cog):
         return await self.db.leaderboard_messages.find_one({'guild_id': guild_id, 'type': 'chat'})
 
     async def _delete_old_leaderboard_messages(self, msg_data: Dict, channel: discord.TextChannel):
-        """Delete ALL messages in the leaderboard channel before recreating."""
+        """Delete known old leaderboard messages by ID, then purge remaining messages."""
+        # Step 1: Delete tracked messages by ID (always works for own messages, no permissions needed)
+        for key in ('daily_message_id', 'weekly_message_id', 'monthly_message_id', 'header_message_id', 'message_id'):
+            msg_id = msg_data.get(key)
+            if msg_id:
+                try:
+                    await channel.get_partial_message(msg_id).delete()
+                except discord.NotFound:
+                    pass
+                except Exception as e:
+                    self.logger.debug(f"Could not delete tracked msg {msg_id}: {e}")
+        
+        # Step 2: Try to purge all remaining messages (needs manage_messages)
         try:
             deleted = await channel.purge(limit=200)
             if deleted:
                 self.logger.info(f"Purged {len(deleted)} messages from {channel.name}")
         except discord.Forbidden:
-            count = 0
-            async for msg in channel.history(limit=200):
-                if msg.author == self.bot.user:
-                    await msg.delete()
-                    count += 1
-                    await asyncio.sleep(0.3)
-            if count:
-                self.logger.info(f"Deleted {count} bot messages from {channel.name}")
+            try:
+                count = 0
+                async for msg in channel.history(limit=200):
+                    if msg.author == self.bot.user:
+                        await msg.delete()
+                        count += 1
+                        await asyncio.sleep(0.3)
+                if count:
+                    self.logger.info(f"Deleted {count} bot messages from {channel.name}")
+            except Exception as e:
+                self.logger.warning(f"Could not delete messages from {channel.name}: {e}")
         except discord.HTTPException as e:
             self.logger.warning(f"HTTP error purging {channel.name}: {e.status}")
     
