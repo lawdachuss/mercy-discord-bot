@@ -107,8 +107,9 @@ class Music(commands.Cog):
         if not player:
             return
         home = getattr(player, "home", None)
+        msg = str(getattr(payload.exception, "message", payload.exception))[:200]
         if home:
-            await home.send(f"Track failed: {payload.exception.message[:200]}")
+            await home.send(f"Track error: {msg}")
         if not player.queue.is_empty:
             next_track = player.queue.get()
             await player.play(next_track)

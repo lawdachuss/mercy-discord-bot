@@ -11,7 +11,7 @@ lavalink:
   server:
     password: "youshallnotpass"
     sources:
-      youtube: false
+      youtube: true
       bandcamp: true
       soundcloud: true
       twitch: true
@@ -19,12 +19,6 @@ lavalink:
       nico: true
       http: true
       local: false
-    youtubeConfig:
-      clients:
-        - MUSIC
-        - WEB
-        - TVHTML5EMBEDDED
-      playlistLoadLimit: 6
     filters:
       volume: true
       equalizer: true
