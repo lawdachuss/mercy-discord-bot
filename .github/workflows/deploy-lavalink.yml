@@ -1,0 +1,156 @@
+name: Deploy Lavalink + Music Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  lavalink-bot:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        shell: powershell
+        run: |
+          python -m pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed"; exit 1 }
+
+      - name: Download Lavalink
+        shell: powershell
+        run: |
+          $jarPath = "${{ github.workspace }}\lavalink\Lavalink.jar"
+          if (-not (Test-Path $jarPath)) {
+            Write-Host "Downloading Lavalink..."
+            Invoke-WebRequest -Uri "https://github.com/lavalink-devs/Lavalink/releases/latest/download/Lavalink.jar" -OutFile $jarPath
+          } else {
+            Write-Host "Lavalink.jar already exists, skipping download"
+          }
+          New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\lavalink\plugins" | Out-Null
+
+      - name: Install yt-dlp
+        shell: powershell
+        run: |
+          scoop install yt-dlp 2>$null; if ($LASTEXITCODE -ne 0) { winget install yt-dlp 2>$null }
+          if (-not (Get-Command yt-dlp -ErrorAction SilentlyContinue)) {
+            pip install yt-dlp
+          }
+          Write-Host "yt-dlp: $(yt-dlp --version 2>$null)"
+
+      - name: Start Lavalink server
+        shell: powershell
+        run: |
+          $lavalinkDir = "${{ github.workspace }}\lavalink"
+          $lavalinkJob = Start-Job -Name "lavalink" -ScriptBlock {
+            param($dir)
+            Set-Location -LiteralPath $dir
+            java -jar Lavalink.jar
+          } -ArgumentList $lavalinkDir
+
+          Start-Sleep -Seconds 30
+
+          $output = Receive-Job $lavalinkJob -ErrorAction SilentlyContinue
+          if ($output) { Write-Host $output }
+
+          if ($lavalinkJob.State -eq "Failed") {
+            Write-Error "Lavalink failed to start"
+            Receive-Job $lavalinkJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+
+          Write-Host "Lavalink server started (Job ID: $($lavalinkJob.Id))"
+
+      - name: Verify Lavalink is running
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 10
+          try {
+            $version = Invoke-RestMethod -Uri "http://localhost:2333/version" -TimeoutSec 10
+            Write-Host "Lavalink version: $version"
+            $plugins = Invoke-RestMethod -Uri "http://localhost:2333/v4/info" -TimeoutSec 10
+            $plugins.plugins | ForEach-Object { Write-Host "  Plugin: $($_.name) v$($_.version)" }
+          } catch {
+            Write-Warning "Could not verify Lavalink (may still be booting)"
+          }
+
+      - name: Start Discord bot
+        shell: powershell
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          MONGO_URL: ${{ secrets.MONGO_URL }}
+          OWNER_IDS: ${{ secrets.OWNER_IDS }}
+          AUTO_SYNC_COMMANDS: "true"
+          LAVALINK_HOST: "localhost"
+          LAVALINK_PORT: "2333"
+          LAVALINK_PASSWORD: "youshallnotpass"
+        run: |
+          $wd = "${{ github.workspace }}"
+          $botJob = Start-Job -Name "musicbot" -ScriptBlock {
+            param($wd)
+            Set-Location -LiteralPath $wd
+            python -u main.py
+          } -ArgumentList $wd
+
+          Start-Sleep -Seconds 15
+
+          $output = Receive-Job $botJob -ErrorAction SilentlyContinue
+          if ($output) { Write-Host $output }
+
+          if ($botJob.State -eq "Failed") {
+            Write-Error "Bot failed to start"
+            Receive-Job $botJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+
+          if ($botJob.State -eq "Completed") {
+            Write-Error "Bot exited too early"
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "======================================="
+          Write-Host "   LAVALINK + MUSIC BOT DEPLOYED"
+          Write-Host "======================================="
+          Write-Host "Lavalink    : http://localhost:2333"
+          Write-Host "Bot         : Running in background job"
+          Write-Host "======================================="
+          Write-Host ""
+
+          $endTime = (Get-Date).AddMinutes(345)
+          while ((Get-Date) -lt $endTime) {
+            $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            $output = Receive-Job $botJob -ErrorAction SilentlyContinue
+            if ($output) { $output | ForEach-Object { Write-Host $_ } }
+
+            if ($botJob.State -eq "Failed") {
+              Write-Error "Bot crashed"
+              Receive-Job $botJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              exit 1
+            }
+            if ($botJob.State -eq "Completed") {
+              Write-Host "Bot exited gracefully."
+              exit 0
+            }
+
+            Write-Host "[$ts] Bot alive"
+            Start-Sleep -Seconds 30
+          }

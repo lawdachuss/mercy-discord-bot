@@ -1,0 +1,148 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+
+lavalink:
+  plugins:
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.11.0"
+    - dependency: "com.github.ItzRandom23:PulseLink:v1.6.1"
+      repository: "https://jitpack.io"
+  server:
+    password: "youshallnotpass"
+    sources:
+      youtube: false
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      nico: true
+      http: true
+      local: false
+    filters:
+      volume: true
+      equalizer: true
+      karaoke: true
+      timescale: true
+      tremolo: true
+      vibrato: true
+      distortion: true
+      rotation: true
+      channelMix: true
+      lowPass: true
+    nonAllocatingFrameBuffer: false
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: true
+    gc-warnings: true
+
+plugins:
+  pulselink:
+    providers:
+      - "ytsearch:\"%ISRC%\""
+      - "ytsearch:%QUERY%"
+      - "dzisrc:%ISRC%"
+      - "dzsearch:%QUERY%"
+      - "spsearch:%QUERY%"
+      - "amsearch:%QUERY%"
+      - "tdsearch:%QUERY%"
+      - "qbsearch:%QUERY%"
+      - "jssearch:%QUERY%"
+      - "gnsearch:%QUERY%"
+      - "admsearch:%QUERY%"
+      - "scsearch:%QUERY%"
+      - "vksearch:%QUERY%"
+      - "ymsearch:%QUERY%"
+      - "szsearch:%QUERY%"
+      - "pdsearch:%QUERY%"
+      - "amzsearch:%QUERY%"
+    sources:
+      spotify: true
+      applemusic: true
+      deezer: true
+      yandexmusic: true
+      vkmusic: true
+      tidal: true
+      qobuz: true
+      ytdlp: true
+      jiosaavn: true
+      audiomack: true
+      gaana: true
+      shazam: true
+      pandora: true
+      amazonmusic: true
+      flowerytts: true
+      youtube: true
+      soundcloud: true
+    lyrics-sources:
+      spotify: true
+      deezer: true
+      youtube: true
+      yandexmusic: true
+      vkmusic: true
+      lrcLib: true
+    spotify:
+      countryCode: "US"
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+    applemusic:
+      countryCode: "US"
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+    deezer:
+      formats:
+        - "FLAC"
+        - "MP3_320"
+        - "MP3_256"
+        - "MP3_128"
+        - "MP3_64"
+        - "AAC_64"
+    yandexmusic:
+      playlistLoadLimit: 1
+      albumLoadLimit: 1
+      artistLoadLimit: 1
+    vkmusic:
+      playlistLoadLimit: 1
+      artistLoadLimit: 1
+      recommendationsLoadLimit: 10
+    tidal:
+      countryCode: "US"
+      searchLimit: 6
+    qobuz:
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+    ytdlp:
+      path: "yt-dlp"
+      searchLimit: 10
+      mixPlaylistLoadLimit: 25
+      playlistLoadLimit: 1000
+    flowerytts:
+      voice: "Olivia"
+      translate: false
+      silence: 0
+      speed: 1.0
+      audioFormat: "mp3"
+    youtube:
+      countryCode: "US"
+      language: "en"
+
+metrics:
+  prometheus:
+    enabled: false
+    endpoint: /metrics
+
+sentry:
+  dsn: ""
+
+logging:
+  file:
+    path: ./logs/
+  level:
+    root: INFO
+    lavalink: INFO

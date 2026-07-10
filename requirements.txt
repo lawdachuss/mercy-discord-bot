@@ -18,3 +18,4 @@ Pillow>=10.0.0
 python-snappy>=0.6.0
 hypothesis>=6.0.0
 pytest>=7.0.0
+wavelink>=3.0.0
