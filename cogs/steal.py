@@ -169,7 +169,7 @@ class StealEmoji(commands.Cog):
         added = 0
         for i, emoji in enumerate(emojis):
             if i > 0:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(0.5)
 
             emoji_parts = emoji.strip("<>").split(":")
             emoji_id = emoji_parts[-1]
