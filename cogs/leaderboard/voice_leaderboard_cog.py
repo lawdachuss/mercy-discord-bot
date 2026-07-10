@@ -1003,8 +1003,10 @@ class VoiceLeaderboardCog(commands.Cog):
     @update_leaderboards.before_loop
     async def before_update_leaderboards(self):
         await self.bot.wait_until_ready()
-        # Initialize voice sessions after bot is ready
-        await self._initialize_voice_sessions()
+        try:
+            await self._initialize_voice_sessions()
+        except Exception as e:
+            self.logger.error(f"Voice session init failed (loop will still run): {e}", exc_info=True)
     
     @tasks.loop(minutes=5)  # Check every 5 minutes for zero chance of missing
     async def weekly_reset(self):
