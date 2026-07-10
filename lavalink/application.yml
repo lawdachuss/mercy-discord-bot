@@ -96,7 +96,7 @@ plugins:
       pandora: true
       amazonmusic: true
       flowerytts: true
-      youtube: true
+      youtube: false
       soundcloud: true
     lyrics-sources:
       spotify: true
