@@ -2,6 +2,11 @@ name: Secure RDP + Mercy Bot
 
 on:
   workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: 'Source of the trigger (workflow-watchman auto-restart)'
+        required: false
+        default: ''
   schedule:
     - cron: "30 */6 * * *"
 
