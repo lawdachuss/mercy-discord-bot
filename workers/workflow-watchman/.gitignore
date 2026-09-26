@@ -1,0 +1,14 @@
+# Secrets - NEVER commit these!
+.dev.vars
+
+# Runtime state (generated, contain no source value)
+metrics.json
+worker_data.json
+
+# Wrangler / build artifacts
+.wrangler/
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db

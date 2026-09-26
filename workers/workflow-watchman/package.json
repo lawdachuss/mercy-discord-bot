@@ -1,0 +1,13 @@
+{
+  "name": "workflow-watchman",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that monitors GitHub Actions workflows (node-1..node-18, mercy, supabase-actions) and restarts dead ones",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

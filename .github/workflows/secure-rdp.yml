@@ -12,7 +12,7 @@ on:
 
 concurrency:
   group: rdp-session
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -36,7 +36,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .venv
-          key: venv-${{ hashFiles('requirements.txt') }}
+          key: venv-${{ runner.os }}-py3.12-${{ hashFiles('requirements.txt') }}
 
       - name: Create venv & install deps
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -51,7 +51,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .venv
-          key: venv-${{ hashFiles('requirements.txt') }}
+          key: venv-${{ runner.os }}-py3.12-${{ hashFiles('requirements.txt') }}
 
       - name: Setup RDP + Tailscale
         shell: powershell
@@ -165,19 +165,28 @@ jobs:
             & "$wd\.venv\Scripts\python" -u main.py
           } -ArgumentList $wd, $env:DISCORD_TOKEN, $env:WEBHOOK_URL, $env:MONGO_URL, $env:OWNER_IDS
 
-          Start-Sleep -Seconds 15
+          $ready = $false
+          $startupDeadline = (Get-Date).AddSeconds(120)
+          while ((Get-Date) -lt $startupDeadline) {
+            $output = Receive-Job $job -ErrorAction SilentlyContinue
+            if ($output) {
+              $output | ForEach-Object { Write-Host $_ }
+              if (($output -join "`n") -match "Logged in as|Bot ready:") {
+                $ready = $true
+              }
+            }
 
-          # Show initial bot output
-          $initialOutput = Receive-Job $job -ErrorAction SilentlyContinue
-          if ($initialOutput) { Write-Host $initialOutput }
-
-          if ($job.State -eq "Failed") {
-            Write-Host "::error::Bot job failed"
-            Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-            exit 1
+            if ($job.State -eq "Failed" -or $job.State -eq "Completed" -or $job.State -eq "Stopped") {
+              Write-Host "::error::Bot exited before becoming ready"
+              Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              exit 1
+            }
+            if ($ready) { break }
+            Start-Sleep -Seconds 5
           }
-          if ($job.State -eq "Completed") {
-            Write-Host "::error::Bot exited too early"
+
+          if (-not $ready) {
+            Write-Host "::error::Bot did not become ready within 120 seconds"
             Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
             exit 1
           }
@@ -207,9 +216,10 @@ jobs:
               Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
               exit 1
             }
-            if ($job.State -eq "Completed") {
-              Write-Host "Bot exited gracefully."
-              exit 0
+            if ($job.State -eq "Completed" -or $job.State -eq "Stopped") {
+              Write-Host "::error::Bot exited unexpectedly"
+              Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              exit 1
             }
 
             Write-Host "[$ts] Bot alive (PID via job)..."

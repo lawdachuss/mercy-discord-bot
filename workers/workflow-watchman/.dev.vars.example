@@ -1,0 +1,10 @@
+# Copy this file to `.dev.vars` and fill in real values for LOCAL dev only.
+# `.dev.vars` is gitignored — never commit secrets.
+# For production use `wrangler secret put <NAME>` instead.
+
+GITHUB_TOKEN = "your-github-pat-with-repo+workflow-scopes"
+DISCORD_WEBHOOK_URL = ""
+
+# Optional: token guarding the public dashboard/metrics pages.
+# Send it as 'x-watchman-token: <value>' header or ?token=<value> query param.
+DASHBOARD_TOKEN = ""
