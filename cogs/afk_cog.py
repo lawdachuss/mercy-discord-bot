@@ -285,15 +285,27 @@ class AFK(commands.Cog):
         self.max_reason_length: int = 100
         self.mention_retention_days: int = 7
         self.tasks_started = False
+        self._db_connected = False
+        self._db_retry_task: Optional[asyncio.Task] = None
         self.afk_prefix = "[AFK] "  # Prefix to add to nicknames when AFK
 
-    async def init_db(self) -> None:
-        """Initialize MongoDB connection with retry logic."""
+    async def init_db(self) -> bool:
+        """Initialize MongoDB connection with retry logic.
+
+        Returns True once connected. Failure is deliberately non-fatal: a slow
+        MongoDB start must not permanently kill this cog, so callers schedule a
+        background retry instead of letting setup() raise.
+        """
         retries = 3
         for attempt in range(retries):
             try:
                 if not self.mongo_uri:
                     raise DatabaseError("MongoDB URI not found in environment variables")
+
+                # Drop the previous (unusable) client so repeated retries in
+                # _connect_db_later do not leak one per attempt.
+                if self.db_client is not None:
+                    self.db_client.close()
 
                 self.db_client = AsyncIOMotorClient(
                     self.mongo_uri,
@@ -309,13 +321,37 @@ class AFK(commands.Cog):
 
                 await self.afk_collection.create_index("user_id", unique=True)
                 await self.mentions_collection.create_index([("user_id", 1), ("created_at", 1)])
-                return
+                self._db_connected = True
+                return True
             except Exception as e:
                 logger.error(f"Database connection attempt {attempt + 1} failed: {e}")
                 if attempt < retries - 1:
                     await asyncio.sleep(self.connection_retry_delay)
-                else:
-                    raise DatabaseError(f"Failed to connect to MongoDB after {retries} attempts")
+        return False
+
+    def _start_db_retry(self) -> None:
+        """Kick off the background MongoDB retry loop (idempotent)."""
+        if self._db_retry_task is None or self._db_retry_task.done():
+            self._db_retry_task = asyncio.create_task(self._connect_db_later())
+
+    async def _connect_db_later(self) -> None:
+        """Keep retrying MongoDB in the background after a failed startup attempt."""
+        delay = max(self.connection_retry_delay, 5)
+        try:
+            while not self._db_connected:
+                await asyncio.sleep(delay)
+                if self.bot.is_closed():
+                    return
+                if await self.init_db():
+                    logger.info("AFK cog reached MongoDB after background retry")
+                    self.start_tasks()
+                    return
+                delay = min(delay * 2, 300)
+                logger.warning(f"AFK cog still cannot reach MongoDB; retrying in {delay}s")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"AFK database retry task stopped: {e}")
 
     def start_tasks(self) -> None:
         """Start background tasks once the database is initialized."""
@@ -693,6 +729,8 @@ class AFK(commands.Cog):
     async def cog_unload(self):
         """Clean up background tasks and close the MongoDB connection when the cog unloads."""
         try:
+            if self._db_retry_task is not None and not self._db_retry_task.done():
+                self._db_retry_task.cancel()
             if self.tasks_started:
                 self.clean_cache.cancel()
                 self.cleanup_mentions.cancel()
@@ -705,9 +743,18 @@ async def setup(bot: commands.Bot):
     """Initialize and load the AFK cog."""
     try:
         cog = AFK(bot)
-        await cog.init_db()
-        cog.start_tasks()
+        connected = await cog.init_db()
         await bot.add_cog(cog)
+        if connected:
+            cog.start_tasks()
+        else:
+            # MongoDB was not reachable: still register the cog and keep
+            # retrying in the background rather than leaving AFK disabled for
+            # the whole session.
+            logger.error(
+                "AFK cog could not reach MongoDB; loading anyway and retrying in the background"
+            )
+            cog._start_db_retry()
     except Exception as e:
         logger.error(f"Failed to load AFK cog: {e}")
         raise

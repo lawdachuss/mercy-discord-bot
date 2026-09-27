@@ -1090,6 +1090,9 @@ class DiscordBot(commands.Bot):
             'IMPROVEMENTS_SUMMARY.md'
         }
         
+        loaded: List[str] = []
+        failed: List[tuple] = []
+
         # Walk through cogs directory and subdirectories
         for root, dirs, files in os.walk(COGS_DIR):
             # Get relative path from cogs directory
@@ -1112,8 +1115,30 @@ class DiscordBot(commands.Bot):
                 try:
                     await self.load_extension(module)
                     logging.info(f"Loaded cog: {module}")
+                    loaded.append(module)
                 except Exception as e:
                     logging.error(f"Failed to load cog {module}: {e}")
+                    failed.append((module, e))
+
+        # A silently missing cog is worse than a loud one: previously this only
+        # wrote to logs/bot.log on the runner, where nobody watches it. Report
+        # one aggregated message instead so a failure is actually visible.
+        if failed:
+            lines = [
+                f"**{len(failed)} cog(s) failed to load** "
+                f"({len(loaded)}/{len(loaded) + len(failed)} loaded)",
+                "",
+            ]
+            for mod, err in failed[:15]:
+                lines.append(f"`{mod}` \u2014 `{err}`")
+            if len(failed) > 15:
+                lines.append(f"...and {len(failed) - 15} more")
+            summary = "\n".join(lines)
+            logging.error(summary)
+            try:
+                await self.send_error_report(summary[:1900])
+            except Exception as report_error:
+                logging.error(f"Failed to report cog load failures: {report_error}")
 
     async def send_error_report(self, error_message: str) -> None:
         if not self.session or self.session.closed or self.is_closed():

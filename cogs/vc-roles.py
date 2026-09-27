@@ -44,7 +44,8 @@ class VCRoles(commands.Cog):
         self.operation_lock = asyncio.Lock()
         self.processing_users: Set[int] = set()
         self._ready = False
-        
+        self._db_retry_task: Optional[asyncio.Task] = None
+
         # MongoDB setup
         self.mongo_uri: str = os.getenv("MONGO_URL", "")
         self.database_name: str = "discord_bot"
@@ -54,13 +55,22 @@ class VCRoles(commands.Cog):
         self.db: Optional[AsyncIOMotorDatabase] = None
         self.collection: Optional[AsyncIOMotorCollection] = None
 
-    async def _connect_to_database(self) -> None:
-        """Establish connection to MongoDB."""
+    async def _connect_to_database(self) -> bool:
+        """Establish connection to MongoDB.
+
+        Returns True once connected. Failure is deliberately non-fatal so a
+        slow MongoDB start cannot permanently kill this cog.
+        """
         retries = 3
         for attempt in range(retries):
             try:
                 if not self.mongo_uri:
                     raise DatabaseError("MongoDB URI not found in environment variables")
+
+                # Drop the previous (unusable) client so repeated retries in
+                # _connect_db_later do not leak one per attempt.
+                if self.db_client is not None:
+                    self.db_client.close()
 
                 self.db_client = AsyncIOMotorClient(
                     self.mongo_uri,
@@ -76,31 +86,67 @@ class VCRoles(commands.Cog):
                 self.collection = self.db[self.collection_name]
                 
                 logger.info(f"Successfully connected to MongoDB - Database: {self.database_name}, Collection: {self.collection_name}")
-                return
+                return True
             except Exception as e:
                 logger.error(f"Database connection attempt {attempt + 1} failed: {e}")
-                if attempt == retries - 1:
-                    raise DatabaseError(f"Failed to connect to MongoDB after {retries} attempts: {e}")
-                await asyncio.sleep(2 ** attempt)
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+        return False
+
+    async def _bring_up(self) -> bool:
+        """Connect, initialise indexes/config and start the loops.
+
+        Returns False when MongoDB is not reachable yet.
+        """
+        if not await self._connect_to_database():
+            return False
+        await self._setup_database()
+        await self._load_configurations()
+
+        # Start background tasks
+        if not self.check_role_validity.is_running():
+            self.check_role_validity.start()
+        if not self.periodic_role_sync.is_running():
+            self.periodic_role_sync.start()
+
+        self._ready = True
+        logger.info("VCRoles cog loaded successfully and ready")
+        return True
+
+    def _start_db_retry(self) -> None:
+        """Kick off the background MongoDB retry loop (idempotent)."""
+        if self._db_retry_task is None or self._db_retry_task.done():
+            self._db_retry_task = asyncio.create_task(self._connect_db_later())
+
+    async def _connect_db_later(self) -> None:
+        """Keep retrying MongoDB in the background after a failed startup attempt."""
+        delay = 5
+        try:
+            while not self.bot.is_closed():
+                await asyncio.sleep(delay)
+                try:
+                    if await self._bring_up():
+                        return
+                except Exception as e:
+                    logger.error(f"VCRoles background startup attempt failed: {e}")
+                delay = min(delay * 2, 300)
+                logger.warning(f"VCRoles still cannot reach MongoDB; retrying in {delay}s")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"VCRoles database retry task stopped: {e}")
 
     async def cog_load(self) -> None:
         """Initialize database and load configurations when cog is loaded."""
         try:
-            await self._connect_to_database()
-            await self._setup_database()
-            await self._load_configurations()
-            
-            # Start background tasks
-            if not self.check_role_validity.is_running():
-                self.check_role_validity.start()
-            if not self.periodic_role_sync.is_running():
-                self.periodic_role_sync.start()
-            
-            self._ready = True
-            logger.info("VCRoles cog loaded successfully and ready")
+            if await self._bring_up():
+                return
         except Exception as e:
             logger.error(f"Failed to load VCRoles cog: {e}", exc_info=True)
-            raise
+        # MongoDB was not reachable: register the cog anyway (callers guard on
+        # self._ready) and keep retrying in the background instead of dying.
+        logger.error("VCRoles cog loaded in degraded mode; retrying MongoDB in the background")
+        self._start_db_retry()
 
     async def _setup_database(self) -> None:
         """Initialize MongoDB indexes."""
@@ -142,6 +188,8 @@ class VCRoles(commands.Cog):
     async def cog_unload(self) -> None:
         """Stop background tasks and close database connection when unloading the cog."""
         self._ready = False
+        if self._db_retry_task is not None and not self._db_retry_task.done():
+            self._db_retry_task.cancel()
         if self.check_role_validity.is_running():
             self.check_role_validity.cancel()
         if self.periodic_role_sync.is_running():
