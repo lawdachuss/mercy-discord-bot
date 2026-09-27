@@ -2,6 +2,10 @@ import discord
 import aiohttp
 import logging
 import re
+import time
+from typing import Any, Dict, Optional
+
+from discord import app_commands
 from discord.ext import commands
 import io
 import asyncio
@@ -11,21 +15,188 @@ logger = logging.getLogger(__name__)
 # Embed color constant
 EMBED_COLOR = discord.Color.from_rgb(47, 49, 54)  # #2f3136
 
+CONFIG_CACHE_TTL = 30.0
+ROLE_MENTION = re.compile(r"^<@&(\d+)>$")
+
+
+def _default_config(guild_id: int) -> Dict[str, Any]:
+    return {
+        "guild_id": guild_id,
+        "steal_role_id": None,
+        "updated_at": None,
+    }
+
+
+class StealSetupError(Exception):
+    """A user-facing error. The message is shown to the invoker as-is."""
+
+
 class StealEmoji(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.session: aiohttp.ClientSession = None
-    
+        self._config_cache: Dict[int, tuple] = {}
+
     async def cog_load(self):
         """Initialize aiohttp session when cog loads."""
         if self.session and not self.session.closed:
             await self.session.close()
         self.session = aiohttp.ClientSession()
 
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
+    @property
+    def collection(self):
+        client = getattr(self.bot, "mongo_client", None)
+        if client is None:
+            return None
+        return client["discord_bot"]["steal_settings"]
+
+    async def get_config(self, guild_id: int) -> Dict[str, Any]:
+        """Guild configuration with a short TTL cache (defaults if Mongo is down)."""
+        now = time.time()
+        cached = self._config_cache.get(guild_id)
+        if cached and now - cached[0] < CONFIG_CACHE_TTL:
+            # Hand out a copy so callers cannot mutate the cached document.
+            return dict(cached[1])
+
+        config = _default_config(guild_id)
+        collection = self.collection
+        if collection is not None:
+            try:
+                doc = await collection.find_one({"guild_id": guild_id})
+                if doc:
+                    doc.pop("_id", None)
+                    config.update(doc)
+                    config["guild_id"] = guild_id
+            except Exception as e:
+                logger.warning(f"[Steal] Could not read config for {guild_id}: {e}")
+
+        self._config_cache[guild_id] = (now, config)
+        return config
+
+    async def save_config(self, config: Dict[str, Any]) -> bool:
+        collection = self.collection
+        if collection is None:
+            return False
+        config["updated_at"] = discord.utils.utcnow().isoformat()
+        try:
+            await collection.replace_one(
+                {"guild_id": config["guild_id"]}, config, upsert=True
+            )
+        except Exception as e:
+            logger.error(f"[Steal] Could not save config for {config['guild_id']}: {e}")
+            return False
+        self._config_cache[config["guild_id"]] = (time.time(), dict(config))
+        return True
+
+    # ------------------------------------------------------------------
+    # Permissions
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _holds_steal_role(member: discord.Member, config: Dict[str, Any]) -> bool:
+        role_id = config.get("steal_role_id")
+        if not role_id:
+            return False
+        return any(role.id == role_id for role in member.roles)
+
+    def _can_steal(self, member: discord.Member, config: Dict[str, Any]) -> bool:
+        """Role *grants* access - it never takes the permission away.
+
+        Administrators, members holding the configured role, and anyone with
+        Manage Emojis and Stickers may all steal.
+        """
+        if member.guild_permissions.manage_emojis_and_stickers:
+            return True
+        if member.guild_permissions.administrator:
+            return True
+        return self._holds_steal_role(member, config)
+
+    def access_denial(self, member: discord.Member, config: Dict[str, Any]) -> Optional[str]:
+        """None when the member may steal, otherwise the message to show them."""
+        if self._can_steal(member, config):
+            return None
+
+        role_id = config.get("steal_role_id")
+        role = member.guild.get_role(role_id) if role_id else None
+        if role is not None:
+            return (
+                f"You need the {role.mention} role or **Manage Emojis and Stickers** "
+                f"to steal emojis and stickers."
+            )
+        return (
+            "You need **Manage Emojis and Stickers** to steal emojis and stickers.\n"
+            "An admin can allow a specific role instead: `.stealsetup role @Role` "
+            "or `/stealsetup`."
+        )
+
+    @staticmethod
+    def _plain_text(embed: discord.Embed) -> str:
+        """Render an embed as text so it survives without Embed Links."""
+        lines = [embed.title or "", embed.description or ""]
+        lines += [f"**{field.name}:** {field.value}" for field in embed.fields]
+        return "\n".join(line for line in lines if line)
+
+    async def _send(self, destination: Any, *, embed: Optional[discord.Embed] = None,
+                    content: Optional[str] = None, ephemeral: bool = False) -> None:
+        """Send an embed, falling back to plain text if Embed Links is missing."""
+        interaction = destination if isinstance(destination, discord.Interaction) else None
+
+        async def deliver(the_embed, the_content):
+            if interaction is None:
+                await destination.send(content=the_content, embed=the_embed)
+            elif interaction.response.is_done():
+                # The first attempt failed after the response was consumed;
+                # send through the follow-up endpoint instead.
+                await interaction.followup.send(
+                    content=the_content, embed=the_embed, ephemeral=ephemeral
+                )
+            else:
+                await interaction.response.send_message(
+                    content=the_content, embed=the_embed, ephemeral=ephemeral
+                )
+
+        if embed is not None:
+            try:
+                await deliver(embed, None)
+                return
+            except discord.Forbidden:
+                content = self._plain_text(embed)
+                embed = None
+            except Exception as e:
+                logger.warning(f"[Steal] Could not send embed: {e}")
+                return
+
+        if not content:
+            return
+        try:
+            await deliver(None, content)
+        except Exception as e:
+            logger.warning(f"[Steal] Could not send message: {e}")
+
+    async def _send_transient(self, destination: Any, content: str) -> None:
+        """Send a message and clear it after 5s, matching the cog's error style."""
+        try:
+            message = await destination.send(content)
+        except Exception as e:
+            logger.warning(f"[Steal] Could not send message: {e}")
+            return
+        await asyncio.sleep(5)
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+
     @commands.command(name="steal")
-    @commands.has_permissions(manage_emojis_and_stickers=True)  # Only users with the 'Manage Emojis and Stickers' permission can use this command
+    @commands.guild_only()
     async def steal(self, ctx):
         """Handles stealing emojis and stickers from a referenced message."""
+        config = await self.get_config(ctx.guild.id)
+        denied = self.access_denial(ctx.author, config)
+        if denied:
+            return await self._send_transient(ctx, denied)
+
         if not ctx.message.reference:
             return await ctx.send("You must reply to a message containing an emoji or sticker.")
 
@@ -86,8 +257,13 @@ class StealEmoji(commands.Cog):
     async def steal_sticker(self, ctx, message, branding):
         """Handles stealing stickers with processing and success message."""
         sticker = message.stickers[0]
-        if not ctx.author.guild_permissions.manage_emojis_and_stickers or not ctx.guild.me.guild_permissions.manage_emojis_and_stickers:
-            return await ctx.send("Insufficient permissions to manage stickers.")
+        # The invoker was already vetted in .steal; re-check anyway so this
+        # helper stays safe if it is ever called from somewhere else.
+        denied = self.access_denial(ctx.author, await self.get_config(ctx.guild.id))
+        if denied:
+            return await ctx.send(denied)
+        if not ctx.guild.me.guild_permissions.manage_emojis_and_stickers:
+            return await ctx.send("I lack the necessary permissions to manage stickers.")
 
         # Ensure session is available
         if not self.session or self.session.closed:
@@ -270,21 +446,189 @@ class StealEmoji(commands.Cog):
     @steal.error
     async def steal_error(self, ctx, error):
         """Handle errors for the steal command."""
-        if isinstance(error, commands.MissingPermissions):
-            error_msg = "You do not have the required permissions to use this command."
-        elif isinstance(error, commands.MissingRole):
-            error_msg = "You do not have the required role to use this command."
+        if isinstance(error, commands.NoPrivateMessage):
+            error_msg = "This command only works in a server."
         elif isinstance(error, commands.CheckFailure):
             error_msg = "You are not authorized to use this command."
         else:
+            logger.error(f"[Steal] .steal failed: {type(error).__name__}: {error}", exc_info=error)
             error_msg = f"An unexpected error occurred: {error}"
 
-        # Send error message
-        error_message = await ctx.send(error_msg)
+        await self._send_transient(ctx, error_msg)
 
-        # Auto delete the error message after 5 seconds
-        await asyncio.sleep(5)
-        await error_message.delete()
+    # ------------------------------------------------------------------
+    # .stealsetup  (prefix)
+    # ------------------------------------------------------------------
+    @commands.command(
+        name="stealsetup",
+        aliases=["stealconfig", "stealsettings"],
+        help="Configure who may steal: .stealsetup [role <@role>|clear|show]",
+    )
+    @commands.guild_only()
+    async def stealsetup_prefix(self, ctx: commands.Context, action: str = "show", *,
+                                target: str = ""):
+        if not ctx.author.guild_permissions.administrator:
+            await self._send_transient(ctx, "❌ You need **Administrator** to set this up.")
+            return
+
+        action = action.lower()
+        target = target.strip()
+        config = await self.get_config(ctx.guild.id)
+        changed = False
+
+        try:
+            if action in {"role", "setrole"}:
+                role = self._resolve_role(ctx.guild, target)
+                if role is None:
+                    raise StealSetupError(
+                        "Give me a role: `.stealsetup role @Role` (mention, ID or exact name)."
+                    )
+                if role.is_default():
+                    raise StealSetupError(
+                        "That is `@everyone` - pick a real role so only its members can steal."
+                    )
+                config["steal_role_id"] = role.id
+                changed = True
+
+            elif action in {"clear", "unset", "remove", "off"}:
+                if not config.get("steal_role_id"):
+                    raise StealSetupError("No role is configured in this server yet.")
+                config["steal_role_id"] = None
+                changed = True
+
+            elif action in {"show", "view", "config", "help"}:
+                pass
+            else:
+                raise StealSetupError(
+                    "Unknown option. Usage: `.stealsetup [role <@role>] [clear] [show]`"
+                )
+
+            if changed and not await self.save_config(config):
+                raise StealSetupError(
+                    "I could not save that to the database (MongoDB is unavailable)."
+                )
+        except StealSetupError as e:
+            await self._send_transient(ctx, f"❌ {e}")
+            return
+
+        await self._send(ctx, embed=self.config_embed(ctx.guild, config))
+
+    @staticmethod
+    def _resolve_role(guild: discord.Guild, raw: str) -> Optional[discord.Role]:
+        raw = raw.strip()
+        if not raw:
+            return None
+        match = ROLE_MENTION.match(raw)
+        if match:
+            return guild.get_role(int(match.group(1)))
+        if raw.isdigit() and len(raw) >= 17:
+            return guild.get_role(int(raw))
+        lowered = raw.lower()
+        return next((r for r in guild.roles if r.name.lower() == lowered), None)
+
+    def config_embed(self, guild: discord.Guild, config: Dict[str, Any]) -> discord.Embed:
+        role = guild.get_role(config["steal_role_id"]) if config.get("steal_role_id") else None
+
+        bot_member = guild.me
+        can_steal = bool(
+            bot_member and bot_member.guild_permissions.manage_emojis_and_stickers
+        )
+
+        embed = discord.Embed(
+            title="⚙️ Steal setup",
+            color=discord.Color.green() if can_steal else discord.Color.orange(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="🎭 Role allowed to steal",
+            value=(role.mention if role else "❌ Not configured") + (
+                "" if role else "\nUse `.stealsetup role <@role>` or `/stealsetup role:`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🪪 Who can use `.steal`",
+            value=(
+                "Server **Administrators** always can; so does anyone with "
+                "**Manage Emojis and Stickers**"
+                + (f"; so does {role.mention}" if role else "; no role configured yet")
+                + "."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔧 My permissions",
+            value=(
+                "✅ Manage Emojis and Stickers"
+                if can_steal
+                else "❌ Missing **Manage Emojis and Stickers** - I cannot add anything."
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text=".stealsetup role <@role> · .stealsetup clear · .stealsetup show"
+        )
+        return embed
+
+    # ------------------------------------------------------------------
+    # /stealsetup  (slash)
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="stealsetup",
+        description="Configure which role may steal emojis and stickers",
+    )
+    @app_commands.describe(
+        role="Role allowed to use .steal without Manage Emojis and Stickers",
+        action="Show or clear the current configuration",
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="Show configuration", value="show"),
+        app_commands.Choice(name="Clear the configured role", value="clear_role"),
+    ])
+    @app_commands.default_permissions(administrator=True)
+    async def stealsetup_slash(self, interaction: discord.Interaction,
+                               role: Optional[discord.Role] = None,
+                               action: str = "show"):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command only works in a server.", ephemeral=True
+            )
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not (
+            interaction.user.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "❌ You need **Administrator** to set this up.", ephemeral=True
+            )
+            return
+
+        config = await self.get_config(interaction.guild.id)
+        changed = False
+
+        if action == "clear_role":
+            config["steal_role_id"] = None
+            changed = True
+
+        if role is not None:
+            if role.is_default():
+                await interaction.response.send_message(
+                    "❌ That is `@everyone` - pick a real role so only its members can steal.",
+                    ephemeral=True,
+                )
+                return
+            config["steal_role_id"] = role.id
+            changed = True
+
+        if changed and not await self.save_config(config):
+            await interaction.response.send_message(
+                "❌ I could not save that to the database (MongoDB is unavailable).",
+                ephemeral=True,
+            )
+            return
+
+        await self._send(interaction, embed=self.config_embed(interaction.guild, config))
+
 
 class BrandModal(discord.ui.Modal, title="Set Brand Prefix"):
     answer = discord.ui.TextInput(
