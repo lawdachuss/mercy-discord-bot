@@ -187,13 +187,163 @@ class AnalyticsData:
         return cls(**data)
 
 
+# ---------------------------------------------------------------------------
+# Display helpers - shared by every view / embed in this cog
+# ---------------------------------------------------------------------------
+# Custom emoji used in the log embed titles. They can be overridden in
+# messages.json ("meta" section); the fallbacks are used whenever the custom
+# emoji would render as raw text (deleted emoji, or the bot missing
+# "Use External Emojis" in the log channel).
+EMOJI_ADDED_DEFAULT = "<a:Nycto_happ:1454417933575917822>"
+EMOJI_REMOVED_DEFAULT = "<a:zz_uma_sa:1454417965184454707>"
+EMOJI_ADDED_FALLBACK = "\U0001F389"      # 🎉
+EMOJI_REMOVED_FALLBACK = "\U0001F44B"    # 👋
+EMOJI_PATTERN = re.compile(r"^<a?:([A-Za-z0-9_]+):(\d+)>$")
+# How long a CDN "does this emoji still exist?" answer is trusted before re-checking.
+EMOJI_EXISTENCE_TTL = 3600
+
+# Discord rejects (HTTP 50035) any embed whose description is longer than
+# 4096 characters, any field name longer than 256 and any field value longer
+# than 1024 - trim dynamic text before it reaches the API.
+EMBED_DESCRIPTION_LIMIT = 4096
+EMBED_FIELD_NAME_LIMIT = 256
+EMBED_FIELD_VALUE_LIMIT = 1024
+
+
+def clip(text: Optional[str], limit: int) -> str:
+    """Trim ``text`` to ``limit`` characters, appending an ellipsis when cut."""
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 0)] + "\u2026"
+
+
+async def update_panel(interaction: discord.Interaction, *, embed: discord.Embed,
+                       view: Optional[discord.ui.View]) -> None:
+    """Refresh the message a component interaction belongs to.
+
+    The interaction must already be deferred (or otherwise responded to).
+    Falls back to a brand new ephemeral message if the in-place edit fails,
+    so the admin never ends up staring at a dead panel.
+    """
+    try:
+        await interaction.edit_original_response(embed=embed, view=view)
+        return
+    except Exception as e:
+        logger.warning(
+            f"[VanityRole] Could not update the panel in place ({type(e).__name__}: {e}); "
+            f"falling back to a new message."
+        )
+    try:
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    except Exception as e:
+        logger.error(f"[VanityRole] Could not deliver panel: {type(e).__name__}: {e}")
+
+
+def build_rules_list_embed(guild: Optional[discord.Guild],
+                           config: Optional[GuildConfig]) -> discord.Embed:
+    """Build the "all rules" panel (View Rules, Back, and after a delete)."""
+    rules = list(getattr(config, "rules", None) or [])
+
+    if not rules:
+        embed = discord.Embed(
+            title="📋 Status Rules",
+            color=discord.Color.orange(),
+            description="❌ **No Rules Configured**\n\nNo status rules found for this server.",
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(
+            name="💡 Next Steps",
+            value="Use the 'Add Rule' button to create your first rule.",
+            inline=False
+        )
+        return embed
+
+    embed = discord.Embed(
+        title="📋 Status Rules",
+        color=discord.Color.blue(),
+        description=(
+            f"Found {len(rules)} rule(s) configured.\n"
+            f"Pick one from the menu below to edit, enable/disable or delete it."
+        ),
+        timestamp=discord.utils.utcnow()
+    )
+
+    for i, rule in enumerate(rules[:10], 1):
+        role = guild.get_role(rule.target_role_id) if guild is not None else None
+        status_icon = "✅" if rule.enabled else "❌"
+
+        rule_info = (
+            f"**Pattern:** `{clip(rule.trigger_pattern, 80)}`\n"
+            f"**Type:** {'Regex' if rule.is_regex else 'Text'}\n"
+            f"**Role:** {role.mention if role else '❌ Not Found'}\n"
+            f"**Priority:** {rule.priority}"
+        )
+        if rule.temporary:
+            rule_info += f"\n**Duration:** {rule.duration_hours}h"
+
+        embed.add_field(
+            name=clip(f"{status_icon} {i}. {rule.name}", EMBED_FIELD_NAME_LIMIT),
+            value=clip(rule_info, EMBED_FIELD_VALUE_LIMIT),
+            inline=True
+        )
+
+    if len(rules) > 10:
+        embed.add_field(
+            name="📊 More Rules",
+            value=f"... and {len(rules) - 10} more (pick them from the menu below)",
+            inline=False
+        )
+
+    return embed
+
+
+def build_rule_detail_embed(guild: Optional[discord.Guild], rule: StatusRule) -> discord.Embed:
+    """Build the panel that manages a single rule."""
+    role = guild.get_role(rule.target_role_id) if guild is not None else None
+    enabled = bool(rule.enabled)
+
+    embed = discord.Embed(
+        title=clip(f"{'✅' if enabled else '❌'} {rule.name}", EMBED_FIELD_NAME_LIMIT),
+        color=discord.Color.green() if enabled else discord.Color.red(),
+        timestamp=discord.utils.utcnow()
+    )
+    embed.description = clip(
+        "Use the buttons below to manage this rule.\n\n"
+        f"**Pattern:** `{clip(rule.trigger_pattern, 180)}`\n"
+        f"**Match type:** {'Regex' if rule.is_regex else 'Plain text'}\n"
+        f"**Case sensitive:** {'Yes' if rule.case_sensitive else 'No'}\n"
+        f"**Word boundary:** {'Yes' if rule.word_boundary else 'No'}\n"
+        f"**Priority:** {rule.priority}\n"
+        f"**Status:** {'✅ Enabled' if enabled else '❌ Disabled'}\n"
+        f"**Role:** {role.mention if role else f'❌ Deleted (`{rule.target_role_id}`)'}",
+        EMBED_DESCRIPTION_LIMIT
+    )
+
+    if rule.exclude_pattern:
+        embed.add_field(
+            name="🚫 Ignore when status contains",
+            value=clip(rule.exclude_pattern, EMBED_FIELD_VALUE_LIMIT),
+            inline=False
+        )
+
+    embed.set_footer(text=f"Rule ID: {rule.rule_id}")
+    return embed
+
+
 class StatusRoleSetupModal(discord.ui.Modal, title='Create Vanity Role Rule'):
     """Modal for setting up individual status rules."""
     
-    def __init__(self, cog: 'StatusRoleCog', rule: Optional[StatusRule] = None):
+    def __init__(self, cog: 'StatusRoleCog', rule: Optional[StatusRule] = None,
+                 origin_message: Optional[discord.Message] = None):
         super().__init__()
         self.cog = cog
         self.editing_rule = rule
+        # The panel the modal was opened from - refreshed on success so the
+        # admin does not end up with two, one of them stale.
+        self.origin_message = origin_message
         
         # Pre-fill if editing
         if rule:
@@ -252,13 +402,26 @@ class StatusRoleSetupModal(discord.ui.Modal, title='Create Vanity Role Rule'):
             
             # Validate log channel
             log_channel = self.cog.bot.get_channel(log_channel_id)
-            if not log_channel or log_channel.guild.id != interaction.guild.id:
+            if not log_channel or getattr(log_channel, 'guild', None) is None or log_channel.guild.id != interaction.guild.id:
                 await interaction.followup.send("❌ Log channel not found or not in this server!", ephemeral=True)
                 return
             
-            bot_member = interaction.guild.get_member(self.cog.bot.user.id)
-            if not log_channel.permissions_for(bot_member).send_messages:
-                await interaction.followup.send(f"❌ Bot lacks permission to send messages in {log_channel.mention}!", ephemeral=True)
+            bot_member = interaction.guild.get_member(self.cog.bot.user.id) or interaction.guild.me
+
+            # NOTE: checking `send_messages` alone is not enough — Discord rejects embeds
+            # with 403 when EMBED_LINKS (or VIEW_CHANNEL) is denied, and a category /
+            # voice / forum ID would pass a `send_messages` check but has no working
+            # `.send(embed=...)`. Validate the log channel fully up-front instead.
+            missing = self.cog.missing_log_permissions(log_channel)
+            if missing:
+                await interaction.followup.send(
+                    f"❌ I can't post embeds in {log_channel.mention}.\n\n"
+                    f"**Missing:** {', '.join(f'`{m}`' for m in missing)}\n\n"
+                    "Open the channel's **Permissions** (or Server Settings → Roles) and make sure "
+                    "**View Channel**, **Send Messages** and **Embed Links** are ✅ for my role — "
+                    "also check for a red ✖ overwrite on `@everyone`.",
+                    ephemeral=True
+                )
                 return
             
             # Validation
@@ -361,18 +524,37 @@ class StatusRoleSetupModal(discord.ui.Modal, title='Create Vanity Role Rule'):
                 await interaction.followup.send("❌ Failed to save configuration to database!", ephemeral=True)
                 return
             
+            # Prove the log channel actually works *now* instead of failing silently later.
+            # (This is the message you should see appear in your log channel.)
+            verify_ok, verify_error = await self.cog.send_verification_embed(
+                log_channel, role, self.rule_name.value, interaction.user
+            )
+            emoji_warnings = await self.cog.emoji_warnings(log_channel)
+
             # Success response
             embed = discord.Embed(
                 title=f"✅ Rule {action.title()}!",
-                color=discord.Color.green(),
+                color=(
+                    discord.Color.green() if verify_ok and not emoji_warnings
+                    else discord.Color.orange()
+                ),
                 timestamp=discord.utils.utcnow()
             )
             
-            embed.add_field(name="📝 Rule Name", value=f"`{self.rule_name.value}`", inline=True)
-            embed.add_field(name="🔍 Pattern", value=f"`{self.trigger_pattern.value}`", inline=True)
+            embed.add_field(name="📝 Rule Name", value=f"`{clip(self.rule_name.value, 100)}`", inline=True)
+            embed.add_field(name="🔍 Pattern", value=f"`{clip(self.trigger_pattern.value, 100)}`", inline=True)
             embed.add_field(name="📋 Type", value="Regex" if is_regex_bool else "Text Match", inline=True)
             embed.add_field(name="🎭 Role", value=f"{role.mention}", inline=True)
-            embed.add_field(name="📢 Log Channel", value=f"{log_channel.mention}", inline=True)
+            embed.add_field(
+                name="📢 Log Channel",
+                value=(
+                    f"{log_channel.mention} — ✅ test embed sent"
+                    if verify_ok else
+                    f"{log_channel.mention} — ❌ `{verify_error}`"
+                ),
+                inline=True
+            )
+            self.cog.add_emoji_warning_field(embed, emoji_warnings)
             
             embed.add_field(
                 name="💡 How it works",
@@ -380,8 +562,31 @@ class StatusRoleSetupModal(discord.ui.Modal, title='Create Vanity Role Rule'):
                 inline=False
             )
             
-            view = StatusRoleManagementView(self.cog)
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            # Land the admin back on the rule they were editing so the panel
+            # never keeps showing the pre-edit values.
+            if action == "updated" and self.editing_rule is not None:
+                updated = next(
+                    (r for r in config.rules if r.rule_id == self.editing_rule.rule_id),
+                    self.editing_rule
+                )
+                view = IndividualRuleView(self.cog, updated)
+            else:
+                view = StatusRoleManagementView(self.cog)
+
+            # Prefer refreshing the panel the modal was opened from; fall back
+            # to a new ephemeral message if that edit is not allowed.
+            delivered = False
+            if self.origin_message is not None:
+                try:
+                    await self.origin_message.edit(embed=embed, view=view)
+                    delivered = True
+                except Exception as e:
+                    logger.debug(
+                        f"[VanityRole] Could not refresh the panel behind the modal "
+                        f"({type(e).__name__}: {e}); sending a new message instead."
+                    )
+            if not delivered:
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
             
         except Exception as e:
             logger.error(f"Error in rule setup modal: {e}")
@@ -398,64 +603,21 @@ class StatusRoleManagementView(discord.ui.View):
     @discord.ui.button(label="Add Rule", style=discord.ButtonStyle.primary, emoji="➕")
     async def add_rule(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Add a new status rule."""
-        modal = StatusRoleSetupModal(self.cog)
+        modal = StatusRoleSetupModal(self.cog, origin_message=interaction.message)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="View Rules", style=discord.ButtonStyle.secondary, emoji="📋")
     async def view_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Show all configured rules."""
-        await interaction.response.defer(ephemeral=True)
-        
+        await interaction.response.defer()
+
         config = await self.cog.get_config(interaction.guild.id)
-        
-        if not config or not config.rules:
-            embed = discord.Embed(
-                title="📋 Status Rules",
-                color=discord.Color.orange(),
-                description="❌ **No Rules Configured**\n\nNo status rules found for this server."
-            )
-            embed.add_field(
-                name="💡 Next Steps",
-                value="Use the 'Add Rule' button to create your first rule.",
-                inline=False
-            )
-        else:
-            embed = discord.Embed(
-                title="📋 Status Rules",
-                color=discord.Color.blue(),
-                description=f"Found {len(config.rules)} rule(s) configured:",
-                timestamp=discord.utils.utcnow()
-            )
-            
-            for i, rule in enumerate(config.rules[:10], 1):  # Limit to 10 rules for display
-                role = interaction.guild.get_role(rule.target_role_id)
-                status_icon = "✅" if rule.enabled else "❌"
-                
-                rule_info = (
-                    f"**Pattern:** `{rule.trigger_pattern}`\n"
-                    f"**Type:** {'Regex' if rule.is_regex else 'Text'}\n"
-                    f"**Role:** {role.mention if role else '❌ Not Found'}\n"
-                    f"**Priority:** {rule.priority}"
-                )
-                
-                if rule.temporary:
-                    rule_info += f"\n**Duration:** {rule.duration_hours}h"
-                
-                embed.add_field(
-                    name=f"{status_icon} {i}. {rule.name}",
-                    value=rule_info,
-                    inline=True
-                )
-            
-            if len(config.rules) > 10:
-                embed.add_field(
-                    name="📊 More Rules",
-                    value=f"... and {len(config.rules) - 10} more rules",
-                    inline=False
-                )
-        
+        embed = build_rules_list_embed(interaction.guild, config)
         view = RuleManagementView(self.cog, config)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+        # Update the panel in place instead of stacking another message on top
+        # of it every time the button is pressed.
+        await update_panel(interaction, embed=embed, view=view)
 
     @discord.ui.button(label="Analytics", style=discord.ButtonStyle.secondary, emoji="📊")
     async def view_analytics(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -734,6 +896,45 @@ class ResetConfirmationView(discord.ui.View):
             pass
 
 
+class RuleSelect(discord.ui.Select):
+    """Dropdown that opens the management panel of the chosen rule."""
+
+    def __init__(self, cog: 'StatusRoleCog', config: GuildConfig):
+        self.cog = cog
+        options: List[discord.SelectOption] = []
+        for rule in config.rules[:25]:  # a select menu holds at most 25 options
+            options.append(discord.SelectOption(
+                label=clip(rule.name, 100),
+                value=rule.rule_id,
+                description=clip(rule.trigger_pattern, 100),
+                emoji="✅" if rule.enabled else "❌",
+            ))
+        super().__init__(
+            placeholder="Select a rule to manage...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        config = await self.cog.get_config(interaction.guild.id)
+        rules = list(getattr(config, "rules", None) or [])
+        rule = next((r for r in rules if r.rule_id == self.values[0]), None)
+
+        if rule is None:
+            # The rule was deleted (or the config was reset) since the menu
+            # was rendered - go back to a fresh list instead of erroring out.
+            embed = build_rules_list_embed(interaction.guild, config)
+            view = RuleManagementView(self.cog, config)
+        else:
+            embed = build_rule_detail_embed(interaction.guild, rule)
+            view = IndividualRuleView(self.cog, rule)
+
+        await update_panel(interaction, embed=embed, view=view)
+
+
 class RuleManagementView(discord.ui.View):
     """View for managing rules."""
     
@@ -741,6 +942,8 @@ class RuleManagementView(discord.ui.View):
         super().__init__(timeout=300)
         self.cog = cog
         self.config = config
+        if config is not None and config.rules:
+            self.add_item(RuleSelect(cog, config))
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️")
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -865,6 +1068,47 @@ class SettingsView(discord.ui.View):
         """Change the log channel."""
         await interaction.response.send_modal(ChangeLogChannelModal(self.cog, self.config))
 
+    @discord.ui.button(label="Test Log Channel", style=discord.ButtonStyle.success, emoji="🧪")
+    async def test_log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Send a real test embed to the configured log channel and report exactly what happens."""
+        await interaction.response.defer(ephemeral=True)
+        
+        config = await self.cog.get_config(interaction.guild.id) or self.config
+        
+        log_channel = await self.cog.resolve_log_channel(interaction.guild, config.log_channel_id)
+        if log_channel is None:
+            await interaction.followup.send(
+                "❌ I could not reach the configured log channel.\n"
+                "Search `logs/bot.log` for `[VanityRole]` — it says exactly why "
+                "(deleted channel, wrong type, or permission failure).",
+                ephemeral=True
+            )
+            return
+        
+        missing = self.cog.missing_log_permissions(log_channel)
+        if missing:
+            await interaction.followup.send(
+                f"❌ {log_channel.mention} is missing: "
+                f"{', '.join(f'`{m}`' for m in missing)}",
+                ephemeral=True
+            )
+            return
+        
+        rule = config.rules[0] if config.rules else None
+        role = interaction.guild.get_role(rule.target_role_id) if rule else None
+        if not rule or not role:
+            await interaction.followup.send("❌ No rule with a valid role is configured yet.", ephemeral=True)
+            return
+        
+        ok, err = await self.cog.send_verification_embed(log_channel, role, rule.name, interaction.user)
+        emoji_warnings = await self.cog.emoji_warnings(log_channel)
+        if ok:
+            lines = [f"✅ Test embed sent to {log_channel.mention} — go check the channel!"]
+            lines += [f"⚠️ {w}" for w in emoji_warnings]
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ Test embed failed: `{err}`", ephemeral=True)
+
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️")
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Go back to main menu."""
@@ -904,13 +1148,19 @@ class ChangeLogChannelModal(discord.ui.Modal, title='Change Log Channel'):
                 return
             
             log_channel = self.cog.bot.get_channel(log_channel_id)
-            if not log_channel or log_channel.guild.id != interaction.guild.id:
+            if not log_channel or getattr(log_channel, 'guild', None) is None or log_channel.guild.id != interaction.guild.id:
                 await interaction.followup.send("❌ Log channel not found or not in this server!", ephemeral=True)
                 return
             
-            bot_member = interaction.guild.get_member(self.cog.bot.user.id)
-            if not log_channel.permissions_for(bot_member).send_messages:
-                await interaction.followup.send(f"❌ Bot lacks permission to send messages in {log_channel.mention}!", ephemeral=True)
+            missing = self.cog.missing_log_permissions(log_channel)
+            if missing:
+                await interaction.followup.send(
+                    f"❌ I can't post embeds in {log_channel.mention}.\n\n"
+                    f"**Missing:** {', '.join(f'`{m}`' for m in missing)}\n\n"
+                    "Please allow **View Channel**, **Send Messages** and **Embed Links** for my role "
+                    "in that channel (check for a red ✖ overwrite on `@everyone`).",
+                    ephemeral=True
+                )
                 return
             
             self.config.log_channel_id = log_channel_id
@@ -921,12 +1171,28 @@ class ChangeLogChannelModal(discord.ui.Modal, title='Change Log Channel'):
                 await interaction.followup.send("❌ Failed to save configuration!", ephemeral=True)
                 return
             
+            # Send a real embed to the new channel so the admin sees immediately
+            # whether logging works, instead of it failing silently later.
+            verify_ok, verify_error = True, ""
+            first_rule = self.config.rules[0] if self.config.rules else None
+            first_role = interaction.guild.get_role(first_rule.target_role_id) if first_rule else None
+            if first_rule and first_role:
+                verify_ok, verify_error = await self.cog.send_verification_embed(
+                    log_channel, first_role, first_rule.name, interaction.user
+                )
+            
+            emoji_warnings = await self.cog.emoji_warnings(log_channel)
+            
             embed = discord.Embed(
-                title="✅ Log Channel Updated",
-                color=discord.Color.green(),
-                description=f"Log channel changed to {log_channel.mention}",
+                title="✅ Log Channel Updated" if verify_ok else "⚠️ Log Channel Updated (test failed)",
+                color=discord.Color.green() if verify_ok else discord.Color.orange(),
+                description=(
+                    f"Log channel changed to {log_channel.mention}"
+                    + ("" if verify_ok else f"\n\n❌ **{verify_error}**")
+                ),
                 timestamp=discord.utils.utcnow()
             )
+            self.cog.add_emoji_warning_field(embed, emoji_warnings)
             
             await interaction.followup.send(embed=embed, ephemeral=True)
             
@@ -943,43 +1209,57 @@ class DeleteRuleConfirmView(discord.ui.View):
         self.cog = cog
         self.rule = rule
 
+    async def _show_rules(self, interaction: discord.Interaction, heading: str) -> None:
+        """Replace the confirmation with a fresh rules list."""
+        config = await self.cog.get_config(interaction.guild.id)
+        embed = build_rules_list_embed(interaction.guild, config)
+        if heading:
+            embed.title = heading
+            embed.color = discord.Color.green()
+            embed.description = f"🗑️ **{clip(self.rule.name, 120)}** has been deleted.\n\n" + (embed.description or "")
+        await update_panel(interaction, embed=embed, view=RuleManagementView(self.cog, config))
+        self.stop()
+
     @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def confirm_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Confirm rule deletion."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         
         config = await self.cog.get_config(interaction.guild.id)
         if not config:
             await interaction.followup.send("❌ Configuration not found.", ephemeral=True)
+            self.stop()
             return
         
+        remaining = [r for r in config.rules if r.rule_id != self.rule.rule_id]
+        if len(remaining) == len(config.rules):
+            # Already gone (deleted from another panel) - just refresh the list.
+            await self._show_rules(interaction, "🗑️ Rule already removed")
+            return
+
         # Remove rule
-        config.rules = [r for r in config.rules if r.rule_id != self.rule.rule_id]
+        config.rules = remaining
         config.updated_at = datetime.utcnow()
         
         success = await self.cog.save_config(config)
         if success:
+            await self._show_rules(interaction, "✅ Rule Deleted")
+        else:
             embed = discord.Embed(
-                title="✅ Rule Deleted",
-                color=discord.Color.green(),
-                description=f"Rule '{self.rule.name}' has been deleted.",
+                title="❌ Delete Failed",
+                color=discord.Color.red(),
+                description=f"Could not delete **{clip(self.rule.name, 120)}** - the configuration could not be saved. The rule is still active.",
                 timestamp=discord.utils.utcnow()
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        else:
-            await interaction.followup.send("❌ Failed to delete rule.", ephemeral=True)
+            await update_panel(interaction, embed=embed, view=RuleManagementView(self.cog, config))
+            self.stop()
         
-        self.stop()
-
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="❌")
     async def cancel_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Cancel rule deletion."""
-        embed = discord.Embed(
-            title="❌ Deletion Cancelled",
-            color=discord.Color.green(),
-            description="Rule deletion has been cancelled."
-        )
-        await interaction.response.edit_message(embed=embed, view=None)
+        """Cancel rule deletion - go back to the rule's panel."""
+        embed = build_rule_detail_embed(interaction.guild, self.rule)
+        view = IndividualRuleView(self.cog, self.rule)
+        await interaction.response.edit_message(embed=embed, view=view)
         self.stop()
 
 
@@ -994,13 +1274,13 @@ class IndividualRuleView(discord.ui.View):
     @discord.ui.button(label="Edit", style=discord.ButtonStyle.primary, emoji="✏️")
     async def edit_rule(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Edit the rule."""
-        modal = StatusRoleSetupModal(self.cog, self.rule)
+        modal = StatusRoleSetupModal(self.cog, self.rule, origin_message=interaction.message)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Toggle", style=discord.ButtonStyle.secondary, emoji="🔄")
     async def toggle_rule(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Toggle rule enabled/disabled."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         
         config = await self.cog.get_config(interaction.guild.id)
         if not config:
@@ -1016,14 +1296,22 @@ class IndividualRuleView(discord.ui.View):
                 updated_enabled = rule.enabled
                 break
         
+        if updated_enabled is None:
+            await interaction.followup.send(
+                "⚠️ This rule no longer exists - it may have been deleted. "
+                "Use the rules list to refresh.",
+                ephemeral=True
+            )
+            return
+
         config.updated_at = datetime.utcnow()
         success = await self.cog.save_config(config)
         
         if success:
-            if updated_enabled is not None:
-                self.rule.enabled = updated_enabled
-            status = "enabled" if self.rule.enabled else "disabled"
-            await interaction.followup.send(f"✅ Rule '{self.rule.name}' {status}.", ephemeral=True)
+            self.rule.enabled = updated_enabled
+            self.rule.updated_at = datetime.utcnow()
+            embed = build_rule_detail_embed(interaction.guild, self.rule)
+            await update_panel(interaction, embed=embed, view=self)
         else:
             await interaction.followup.send("❌ Failed to update rule.", ephemeral=True)
 
@@ -1033,11 +1321,21 @@ class IndividualRuleView(discord.ui.View):
         embed = discord.Embed(
             title="⚠️ Confirm Rule Deletion",
             color=discord.Color.red(),
-            description=f"Are you sure you want to delete the rule **{self.rule.name}**?\n\nThis action cannot be undone."
+            description=f"Are you sure you want to delete the rule **{clip(self.rule.name, 200)}**?\n\nThis action cannot be undone.",
+            timestamp=discord.utils.utcnow()
         )
         
         view = DeleteRuleConfirmView(self.cog, self.rule)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️")
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to the rules list."""
+        await interaction.response.defer()
+        config = await self.cog.get_config(interaction.guild.id)
+        embed = build_rules_list_embed(interaction.guild, config)
+        view = RuleManagementView(self.cog, config)
+        await update_panel(interaction, embed=embed, view=view)
 
 
 class StatusRoleCog(commands.Cog):
@@ -1052,6 +1350,13 @@ class StatusRoleCog(commands.Cog):
         self._cache: Dict[Tuple[int, int], str] = {}  # (guild_id, user_id) -> status_hash for debouncing
         self._cache_timestamps: Dict[Tuple[int, int], float] = {}  # (guild_id, user_id) -> timestamp
         self._config_cache: Dict[int, tuple[float, Any]] = {}  # guild_id -> (timestamp, GuildConfig) for 30s TTL
+        self._log_failure_cache: Dict[Tuple[int, str], float] = {}  # throttles repeated log-channel errors
+        self._log_fetch_failures: Dict[int, float] = {}  # avoids re-hitting the API for dead channels
+        # emoji id -> (exists?, checked_at); refreshed on a TTL so a deleted
+        # emoji is noticed without hammering the CDN.
+        self._emoji_exists_cache: Dict[int, Tuple[bool, float]] = {}
+        self._emoji_refresh_task: Optional[asyncio.Task] = None
+        self._emoji_refresh_last: float = 0.0
         self.messages = self._load_messages()
         
         # Color management for random colors without repetition
@@ -1187,6 +1492,10 @@ class StatusRoleCog(commands.Cog):
         """Setup hook called when the cog is loaded."""
         try:
             logger.info("StatusRoleCog setup starting...")
+
+            # Verify the log-embed emoji early (independent of the database):
+            # if one was deleted the embeds silently switch to the fallback.
+            self.schedule_emoji_refresh()
             
             # Connect to MongoDB
             mongo_url = os.getenv('MONGO_URL')
@@ -1559,30 +1868,339 @@ class StatusRoleCog(commands.Cog):
                 if should_have_role and not has_role:
                     try:
                         await after.add_roles(target_role, reason="Status Vanity Role - Custom status match")
-                        await self.log_role_change(after, target_role, custom_status, config.log_channel_id, True)
                     except discord.Forbidden:
                         logger.warning(f"No permission to add role {target_role.name} to {after.display_name}")
                     except Exception as e:
                         logger.error(f"Error adding role: {e}")
+                    else:
+                        # Logged *outside* the role try-block so a logging failure can
+                        # never be misreported as "no permission to add role".
+                        await self.log_role_change(after, target_role, custom_status, config.log_channel_id, True)
 
                 elif not should_have_role and has_role:
                     try:
                         await after.remove_roles(target_role, reason="Status Vanity Role - Custom status no longer matches")
-                        await self.log_role_change(after, target_role, custom_status, config.log_channel_id, False)
                     except discord.Forbidden:
                         logger.warning(f"No permission to remove role {target_role.name} from {after.display_name}")
                     except Exception as e:
                         logger.error(f"Error removing role: {e}")
+                    else:
+                        await self.log_role_change(after, target_role, custom_status, config.log_channel_id, False)
                     
         except Exception as e:
             logger.error(f"Error in presence update handler: {e}")
+
+    # ------------------------------------------------------------------
+    # Log channel helpers
+    # ------------------------------------------------------------------
+    def missing_log_permissions(self, channel: Any) -> List[str]:
+        """Return the permissions the bot is missing to post embeds in ``channel``.
+
+        A bare ``send_messages`` check is not enough: Discord answers embed
+        requests with 403 when EMBED_LINKS (or VIEW_CHANNEL) is denied, and a
+        category / forum / voice id can pass a ``send_messages`` check while
+        still having no usable ``.send(embed=...)``.
+        """
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return [f"unsupported channel type ({type(channel).__name__}) - use a normal text channel"]
+
+        bot_member = channel.guild.me
+        if bot_member is None:
+            return ["bot member entry unavailable (try again in a moment)"]
+
+        perms = channel.permissions_for(bot_member)
+        missing: List[str] = []
+
+        if not perms.view_channel:
+            missing.append("View Channel")
+
+        can_send = perms.send_messages
+        if isinstance(channel, discord.Thread) and not can_send:
+            can_send = perms.send_messages_in_threads
+        if not can_send:
+            missing.append("Send Messages")
+
+        if not perms.embed_links:
+            missing.append("Embed Links")
+
+        return missing
+
+    # ------------------------------------------------------------------
+    # Emoji helpers (the animated emoji in the log embed titles)
+    # ------------------------------------------------------------------
+    def configured_emoji(self, kind: str) -> str:
+        """Title emoji for ``'added'``/``'removed'`` (messages.json, else default)."""
+        meta = (self.messages or {}).get("meta") or {}
+        key = "role_added_emoji" if kind == "added" else "role_removed_emoji"
+        default = EMOJI_ADDED_DEFAULT if kind == "added" else EMOJI_REMOVED_DEFAULT
+        try:
+            return str(meta.get(key) or default)
+        except AttributeError:
+            return default
+
+    def emoji_fallback(self, kind: str) -> str:
+        """Unicode replacement used when the custom emoji would not display."""
+        meta = (self.messages or {}).get("meta") or {}
+        key = "role_added_emoji_fallback" if kind == "added" else "role_removed_emoji_fallback"
+        default = EMOJI_ADDED_FALLBACK if kind == "added" else EMOJI_REMOVED_FALLBACK
+        try:
+            return str(meta.get(key) or default)
+        except AttributeError:
+            return default
+
+    @staticmethod
+    def custom_emoji_id(raw: Any) -> Optional[int]:
+        """Snowflake id of a ``<a:name:id>`` string, or ``None`` if it is not one."""
+        if not isinstance(raw, str):
+            return None
+        match = EMOJI_PATTERN.match(raw.strip())
+        return int(match.group(2)) if match else None
+
+    def emoji_wont_render(self, channel: Any, raw: Any) -> Optional[str]:
+        """Return why ``raw`` would show up as literal text in ``channel``.
+
+        Two independent reasons:
+          * the emoji markup is malformed / the emoji was deleted (checked
+            against Discord's CDN, result cached with a TTL);
+          * Discord only draws a custom emoji from another server when the
+            *author* (this bot) has **Use External Emojis** in that exact
+            channel - a channel overwrite can deny it even if the
+            server-wide setting allows it.
+        """
+        if not isinstance(raw, str) or not raw.strip():
+            return "no emoji is configured"
+        raw = raw.strip()
+
+        if raw.startswith("<") and not EMOJI_PATTERN.match(raw):
+            return "the emoji markup in messages.json is malformed"
+
+        emoji_id = self.custom_emoji_id(raw)
+        if emoji_id is None:
+            return None  # plain unicode / text always renders
+
+        cached = self._emoji_exists_cache.get(emoji_id)
+        if cached is not None and not cached[0] and time.time() - cached[1] < EMOJI_EXISTENCE_TTL:
+            return "the emoji does not exist any more (CDN lookup said 404)"
+
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return None
+
+        # An emoji that lives in this same guild is not "external".
+        emoji = self.bot.get_emoji(emoji_id)
+        if emoji is not None and getattr(emoji, "guild", None) is guild:
+            return None
+
+        bot_member = getattr(guild, "me", None)
+        try:
+            perms = channel.permissions_for(bot_member) if bot_member is not None else None
+        except Exception:
+            perms = None
+        if perms is None:
+            return None  # cannot verify - do not block the log embed over this
+
+        if not perms.use_external_emojis:
+            return "missing **Use External Emojis** for the bot in this channel"
+
+        return None
+
+    def render_title_emoji(self, channel: Any, kind: str) -> str:
+        """Emoji to put in a log embed title, with a unicode fallback if it won't render."""
+        raw = self.configured_emoji(kind)
+        if self.emoji_wont_render(channel, raw):
+            return self.emoji_fallback(kind)
+        return raw
+
+    def schedule_emoji_refresh(self) -> None:
+        """Probe the CDN in the background so a deleted emoji is noticed later too."""
+        task = getattr(self, "_emoji_refresh_task", None)
+        if task is not None and not task.done():
+            return
+        if time.time() - getattr(self, "_emoji_refresh_last", 0.0) < 60:
+            return  # avoid re-probing on every single log send when the CDN is down
+        self._emoji_refresh_last = time.time()
+        try:
+            self._emoji_refresh_task = asyncio.create_task(self.refresh_emoji_status())
+        except RuntimeError:
+            pass  # no running loop (e.g. during tests) - not critical
+
+    async def refresh_emoji_status(self, force: bool = False) -> None:
+        """Re-check both configured title emoji against Discord's CDN (TTL-based)."""
+        now = time.time()
+        stale: Set[int] = set()
+        for kind in ("added", "removed"):
+            emoji_id = self.custom_emoji_id(self.configured_emoji(kind))
+            if emoji_id is None:
+                continue
+            cached = self._emoji_exists_cache.get(emoji_id)
+            if force or cached is None or now - cached[1] > EMOJI_EXISTENCE_TTL:
+                stale.add(emoji_id)
+
+        for emoji_id in stale:
+            exists = await self._check_emoji_exists(emoji_id)
+            if exists is None:
+                # Network/CDN trouble: don't cache anything so we retry soon
+                # instead of trusting (or rejecting) an unverified answer.
+                continue
+            self._emoji_exists_cache[emoji_id] = (exists, time.time())
+            if not exists:
+                logger.warning(
+                    f"[VanityRole] Custom emoji {emoji_id} no longer exists - "
+                    f"the log embeds will use the unicode fallback until it is restored."
+                )
+
+    async def emoji_warnings(self, channel: Any) -> List[str]:
+        """Check both configured title emoji and report anything that would break them."""
+        await self.refresh_emoji_status()
+
+        warnings: List[str] = []
+        for kind in ("added", "removed"):
+            raw = self.configured_emoji(kind)
+            reason = self.emoji_wont_render(channel, raw)
+            if reason:
+                warnings.append(
+                    f"`{clip(raw, 60)}` - {reason} (the log will show {self.emoji_fallback(kind)} instead)"
+                )
+        return warnings
+
+    async def _check_emoji_exists(self, emoji_id: int) -> Optional[bool]:
+        """Ask Discord's CDN whether the emoji is alive.
+
+        Returns ``True``/``False`` on a definitive answer and ``None`` when the
+        request itself failed (offline, rate limited, ...), so a flaky network
+        never makes us drop an emoji that is perfectly fine.
+        """
+        url = f"https://cdn.discordapp.com/emojis/{emoji_id}.webp?size=32"
+        try:
+            session = self.bot.http.session
+            async def probe() -> bool:
+                async with session.get(url) as resp:
+                    return resp.status == 200
+            return await asyncio.wait_for(probe(), timeout=5)
+        except Exception as e:
+            logger.debug(f"[VanityRole] emoji existence check failed for {emoji_id}: {e}")
+            return None
+
+    def add_emoji_warning_field(self, embed: discord.Embed, warnings: List[str]) -> None:
+        """Attach the emoji check result to a setup/test response embed."""
+        if not warnings:
+            return
+        embed.add_field(
+            name="🎨 Emoji check",
+            value="\n".join(f"⚠️ {w}" for w in warnings[:5]),
+            inline=False
+        )
+
+    def _report_log_failure(self, guild_id: Optional[int], key: str, message: str) -> None:
+        """Log a log-channel failure (throttled so a broken channel can't spam the console)."""
+        now = time.time()
+        cache_key = (guild_id or 0, key)
+        last = self._log_failure_cache.get(cache_key)
+        if last and now - last < 600:  # at most once per 10 minutes per failure
+            return
+        self._log_failure_cache[cache_key] = now
+
+        if len(self._log_failure_cache) > 500:
+            for k, ts in list(self._log_failure_cache.items()):
+                if now - ts > 600:
+                    self._log_failure_cache.pop(k, None)
+
+        logger.error(f"[VanityRole] {message}")
+
+    async def resolve_log_channel(self, guild: Optional[discord.Guild],
+                                  log_channel_id: Optional[int]) -> Any:
+        """Resolve the configured log channel, or ``None`` — always logging the reason."""
+        if not log_channel_id:
+            self._report_log_failure(
+                guild.id if guild else 0, "no-channel",
+                "No log channel is configured for this server - status role changes will not be logged."
+            )
+            return None
+
+        channel = guild.get_channel(log_channel_id) if guild is not None else None
+        if channel is None:
+            channel = self.bot.get_channel(log_channel_id)
+
+        if channel is None:
+            now = time.time()
+            if now - self._log_fetch_failures.get(log_channel_id, 0) < 300:
+                # Already tried (and failed) to fetch this channel in the last 5 minutes.
+                return None
+            try:
+                channel = await self.bot.fetch_channel(log_channel_id)
+            except discord.NotFound:
+                self._log_fetch_failures[log_channel_id] = now
+                self._report_log_failure(
+                    guild.id if guild else 0, f"deleted:{log_channel_id}",
+                    f"Log channel {log_channel_id} no longer exists (guild {guild.id if guild else '?'}). "
+                    f"Run /vanity-role and set a new log channel."
+                )
+                return None
+            except Exception as e:
+                self._log_fetch_failures[log_channel_id] = now
+                self._report_log_failure(
+                    guild.id if guild else 0, f"unresolved:{log_channel_id}",
+                    f"Could not resolve log channel {log_channel_id}: {type(e).__name__}: {e}"
+                )
+                return None
+            else:
+                self._log_fetch_failures.pop(log_channel_id, None)
+
+        if not hasattr(channel, "send"):
+            self._report_log_failure(
+                guild.id if guild else 0, f"type:{log_channel_id}",
+                f"Log channel {log_channel_id} is a {type(channel).__name__}, which cannot receive "
+                f"messages - set a normal text channel instead."
+            )
+            return None
+
+        return channel
+
+    async def send_verification_embed(self, channel: Any, role: discord.Role,
+                                      rule_name: str, user: discord.abc.User) -> Tuple[bool, str]:
+        """Post a real embed in the log channel so setup fails loudly if it can't work.
+
+        The embed deliberately shows the same titles as a real log entry so the
+        admin can see right away whether the custom emoji actually render.
+        """
+        try:
+            embed = discord.Embed(
+                title="⚙️ Vanity Role logging enabled",
+                description=(
+                    f"I will post an embed in this channel whenever the {role.mention} role "
+                    f"is added or removed based on someone's status.\n\n"
+                    f"**Rule:** `{rule_name}`\n**Enabled by:** {user.mention}"
+                ),
+                color=self._get_random_color(),
+                timestamp=discord.utils.utcnow()
+            )
+            embed.add_field(
+                name="🎨 Log embed titles",
+                value=(
+                    f"## Role Added {self.render_title_emoji(channel, 'added')}\n"
+                    f"## Role Removed {self.render_title_emoji(channel, 'removed')}"
+                ),
+                inline=False
+            )
+            embed.set_footer(text=f"{self.bot.user.name}", icon_url=self.bot.user.display_avatar.url)
+            await channel.send(embed=embed)
+            return True, ""
+        except discord.Forbidden:
+            return False, "403 - missing View Channel / Send Messages / Embed Links"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {str(e)[:150]}"
 
     async def log_role_change(self, member: discord.Member, role: discord.Role, 
                             custom_status: Optional[str], log_channel_id: int, added: bool) -> None:
         """Log role changes to the configured channel."""
         try:
-            log_channel = self.bot.get_channel(log_channel_id)
-            if not log_channel:
+            guild = member.guild
+            # Fire-and-forget: keeps the "does this emoji still exist?" answer
+            # fresh so a deleted emoji switches the embeds to the fallback.
+            self.schedule_emoji_refresh()
+            log_channel = await self.resolve_log_channel(guild, log_channel_id)
+            if log_channel is None:
+                # resolve_log_channel() already reported exactly why (throttled)
                 return
             
             import random
@@ -1594,10 +2212,10 @@ class StatusRoleCog(commands.Cog):
                 fallback_messages = self.messages.get("fallback", {}) if self.messages else {}
                 if added:
                     template = fallback_messages.get("added", "{user} received the {role} role")
-                    title_text = "## Role Added <a:Nycto_happ:1454417933575917822>"
+                    title_text = f"## Role Added {self.render_title_emoji(log_channel, 'added')}"
                 else:
                     template = fallback_messages.get("removed", "{user} lost the {role} role")
-                    title_text = "## Role Removed <a:zz_uma_sa:1454417965184454707>"
+                    title_text = f"## Role Removed {self.render_title_emoji(log_channel, 'removed')}"
                 description = f"{title_text}\n\n{template.format(user=member.mention, role=role.mention)}"
             elif added:
                 # Get messages for role added
@@ -1611,7 +2229,7 @@ class StatusRoleCog(commands.Cog):
                     # Fallback if no messages in JSON
                     message_text = f"{member.mention} received the {role.mention} role"
                 
-                title_text = "## Role Added <a:Nycto_happ:1454417933575917822>"
+                title_text = f"## Role Added {self.render_title_emoji(log_channel, 'added')}"
                 description = f"{title_text}\n\n{message_text}"
             else:
                 # Get messages for role removed
@@ -1625,12 +2243,11 @@ class StatusRoleCog(commands.Cog):
                     # Fallback if no messages in JSON
                     message_text = f"{member.mention} lost the {role.mention} role"
                 
-                title_text = "## Role Removed <a:zz_uma_sa:1454417965184454707>"
+                title_text = f"## Role Removed {self.render_title_emoji(log_channel, 'removed')}"
                 description = f"{title_text}\n\n{message_text}"
             
             embed = discord.Embed(
-                title=None,
-                description=description,
+                description=clip(description, EMBED_DESCRIPTION_LIMIT),
                 color=self._get_random_color(),
                 timestamp=discord.utils.utcnow()
             )
@@ -1644,10 +2261,24 @@ class StatusRoleCog(commands.Cog):
                 icon_url=self.bot.user.display_avatar.url
             )
             
-            await log_channel.send(embed=embed)
+            try:
+                await log_channel.send(embed=embed)
+            except discord.Forbidden:
+                self._report_log_failure(
+                    guild.id, f"forbidden:{log_channel.id}",
+                    f"Cannot post the vanity-role embed in #{getattr(log_channel, 'name', log_channel.id)} "
+                    f"(guild {guild.id}): 403 Missing Permissions. Allow VIEW_CHANNEL, SEND_MESSAGES and "
+                    f"EMBED_LINKS for the bot role in that channel (check @everyone overwrites)."
+                )
+            except discord.HTTPException as e:
+                self._report_log_failure(
+                    guild.id, f"http:{log_channel.id}",
+                    f"Cannot post the vanity-role embed in channel {log_channel.id} "
+                    f"(guild {guild.id}): HTTP {e.status} - {e.text}"
+                )
             
         except Exception as e:
-            logger.error(f"Error logging role change: {e}")
+            logger.error(f"[VanityRole] Error logging role change: {type(e).__name__}: {e}", exc_info=True)
 
     @app_commands.command(name="vanity-role", description="Setup and manage status-based vanity role system")
     async def status_role(self, interaction: discord.Interaction) -> None:
@@ -1695,6 +2326,9 @@ class StatusRoleCog(commands.Cog):
             
             self._reconnect_tasks.clear()
             self._startup_scan_completed.clear()
+
+            if self._emoji_refresh_task is not None and not self._emoji_refresh_task.done():
+                self._emoji_refresh_task.cancel()
             
             if self.mongo_client:
                 self.mongo_client.close()

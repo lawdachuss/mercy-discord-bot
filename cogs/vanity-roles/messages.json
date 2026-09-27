@@ -221,5 +221,12 @@
   "fallback": {
     "added": "{user} received the {role} role",
     "removed": "{user} lost the {role} role"
+  },
+  "meta": {
+    "_comment": "Emoji used as the heading of the log embeds. Replace with any <a:name:id> or plain unicode emoji. If a custom emoji cannot be rendered (deleted, or the bot lacks Use External Emojis in the log channel) the fallback is used instead.",
+    "role_added_emoji": "<a:Nycto_happ:1454417933575917822>",
+    "role_removed_emoji": "<a:zz_uma_sa:1454417965184454707>",
+    "role_added_emoji_fallback": "🎉",
+    "role_removed_emoji_fallback": "👋"
   }
 }
