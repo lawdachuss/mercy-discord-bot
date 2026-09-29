@@ -676,6 +676,11 @@ class StickyCog(commands.Cog):
                 if not channel_id:
                     continue
                     
+                # Only this cog's stickies: the .stick cog stores its docs in
+                # the same collection without a guild_id.
+                if not sticky.get("guild_id"):
+                    continue
+                    
                 channel = self.bot.get_channel(channel_id)
                 if not channel:
                     # Channel no longer exists or bot doesn't have access
@@ -691,11 +696,25 @@ class StickyCog(commands.Cog):
                         last_msg = msg
                         break
                     
-                    # Only repost if:
-                    # 1. There's a message in the channel
-                    # 2. Last message is not from the bot OR
-                    # 3. Last message is from bot but not the tracked sticky
-                    if last_msg and (last_msg.author != self.bot.user or last_msg.id != self.last_sticky_messages.get(channel.id)):
+                    # The sticky is at the bottom when the last message is the
+                    # tracked sticky we sent.
+                    at_bottom = (
+                        last_msg is not None
+                        and last_msg.author == self.bot.user
+                        and last_msg.id == self.last_sticky_messages.get(channel.id)
+                    )
+                    
+                    # Also force a repost every 5 minutes even when the sticky
+                    # is still at the bottom: delete the old one, send a new one.
+                    last_repost = sticky.get("last_repost")
+                    stale = True
+                    if isinstance(last_repost, datetime):
+                        lr = last_repost
+                        if lr.tzinfo is None:
+                            lr = lr.replace(tzinfo=timezone.utc)
+                        stale = datetime.now(timezone.utc) - lr >= timedelta(minutes=5)
+                    
+                    if last_msg and (stale or not at_bottom):
                         await self.repost_sticky(channel, force=False)  # Use non-forced to respect rate limits
                         processed_count += 1
                         await asyncio.sleep(0.5)

@@ -47,7 +47,7 @@ class StickyMessages(commands.Cog):
         
         # Configuration
         self.repost_cooldown = 2.5  # seconds between reposts in same channel
-        self.auto_refresh_interval = 30  # minutes - auto delete and resend stickies
+        self.auto_refresh_interval = 5  # minutes - auto delete and resend stickies
         self.max_content_length = 2000  # Discord limit
 
     # ==================== Lifecycle ====================
@@ -187,11 +187,23 @@ class StickyMessages(commands.Cog):
         Returns True if successful or message didn't exist.
         """
         sticky_info = self.last_sticky_messages.get(channel_id)
-        if not sticky_info:
-            log.debug(f"No sticky info found for channel {channel_id}")
-            return True
-        
         last_msg_id = sticky_info.get("message_id") if isinstance(sticky_info, dict) else sticky_info
+
+        if not last_msg_id:
+            # Memory can be empty after a restart or cleanup while the sticky
+            # is still live - fall back to the persisted id so an old copy can
+            # never survive a repost.
+            try:
+                doc = None
+                if self.stickies is not None:
+                    doc = await self.stickies.find_one(
+                        {"channel_id": channel_id, "text": {"$exists": False}}
+                    )
+                last_msg_id = doc.get("last_message_id") if doc else None
+            except Exception as e:
+                log.warning(f"Could not read persisted sticky state for channel {channel_id}: {e}")
+                return False
+
         if not last_msg_id:
             log.debug(f"No message ID in sticky info for channel {channel_id}")
             return True
@@ -270,7 +282,12 @@ class StickyMessages(commands.Cog):
                     log.debug(f"Deleting old sticky for channel {channel.id} (force_new={force_new})")
                     deleted = await self._delete_old_sticky(channel.id, channel)
                     if not deleted:
-                        log.warning(f"Failed to delete old sticky in {channel.id}, continuing anyway")
+                        # Never send a new copy while the old one is still
+                        # there - that is how duplicates pile up.
+                        log.warning(
+                            f"Failed to delete old sticky in {channel.id}; aborting repost to avoid duplicates"
+                        )
+                        return None
                     # Small delay to avoid rate limit issues
                     await asyncio.sleep(0.3)
                 else:
@@ -301,7 +318,7 @@ class StickyMessages(commands.Cog):
                 if self.stickies is not None:
                     try:
                         await self.stickies.update_one(
-                            {"channel_id": channel.id},
+                            {"channel_id": channel.id, "text": {"$exists": False}},
                             {
                                 "$set": {
                                     "last_message_id": sent.id,
@@ -339,7 +356,7 @@ class StickyMessages(commands.Cog):
             restored = 0
             cleaned = 0
             
-            async for sticky in self.stickies.find({}):
+            async for sticky in self.stickies.find({"text": {"$exists": False}}):
                 channel_id = sticky.get("channel_id")
                 if not channel_id:
                     continue
@@ -364,7 +381,7 @@ class StickyMessages(commands.Cog):
                         except discord.NotFound:
                             # Message deleted, clean up DB
                             await self.stickies.update_one(
-                                {"channel_id": channel_id},
+                                {"_id": sticky["_id"]},
                                 {"$unset": {"last_message_id": "", "last_updated": ""}}
                             )
                             cleaned += 1
@@ -379,7 +396,7 @@ class StickyMessages(commands.Cog):
             log.exception(f"Error during state restoration: {e}")
 
     async def _auto_refresh_loop(self):
-        """Automatically refresh stickies every 10 minutes."""
+        """Automatically refresh stickies every 5 minutes (delete old, send new)."""
         if self.stickies is None:
             return
         
@@ -394,7 +411,8 @@ class StickyMessages(commands.Cog):
                 log.warning("MongoDB client is closed, skipping auto-refresh")
                 return
             
-            async for sticky in self.stickies.find({}):
+            # Only our own stickies (sticky-button docs share this collection)
+            async for sticky in self.stickies.find({"text": {"$exists": False}}):
                 try:
                     channel_id = sticky.get("channel_id")
                     if not channel_id:
@@ -405,27 +423,32 @@ class StickyMessages(commands.Cog):
                         skipped += 1
                         continue
                     
-                    # Check if enough time has passed
-                    sticky_info = self.last_sticky_messages.get(channel_id)
-                    if sticky_info and isinstance(sticky_info, dict):
-                        last_timestamp = sticky_info.get("timestamp")
-                        if last_timestamp:
-                            time_diff = datetime.utcnow() - last_timestamp
-                            # Only refresh if at least 29.5 minutes have passed
-                            if time_diff < timedelta(minutes=29, seconds=30):
-                                skipped += 1
-                                continue
-                    
                     # Get content
                     content = sticky.get("content") or ""
                     embed_data = sticky.get("embed")
                     embed = None
+                    
+                    if not content and not embed_data:
+                        skipped += 1
+                        continue
                     
                     if embed_data:
                         try:
                             embed = discord.Embed.from_dict(embed_data)
                         except Exception as e:
                             log.error(f"Failed to parse embed for channel {channel_id}: {e}")
+                    
+                    # Check if enough time has passed
+                    sticky_info = self.last_sticky_messages.get(channel_id)
+                    if sticky_info and isinstance(sticky_info, dict):
+                        last_timestamp = sticky_info.get("timestamp")
+                        if last_timestamp:
+                            time_diff = datetime.utcnow() - last_timestamp
+                            # Only refresh if at least 4.5 minutes have passed
+                            # since the last repost (any trigger)
+                            if time_diff < timedelta(minutes=4, seconds=30):
+                                skipped += 1
+                                continue
                     
                     # Refresh the sticky
                     result = await self._send_sticky_message(
@@ -466,7 +489,7 @@ class StickyMessages(commands.Cog):
                 log.warning("MongoDB client is closed, skipping cleanup")
                 return
             
-            async for sticky in self.stickies.find({}):
+            async for sticky in self.stickies.find({"text": {"$exists": False}}):
                 chan_id = sticky.get("channel_id")
                 
                 # Delete entries with no channel ID
@@ -576,8 +599,11 @@ class StickyMessages(commands.Cog):
                 log.debug(f"Rate limited repost in channel {channel_id}")
                 return
             
-            # Check if channel has a sticky
-            sticky_doc = await self.stickies.find_one({"channel_id": channel_id})
+            # Check if channel has a sticky (own docs only - sticky-button
+            # docs share this collection)
+            sticky_doc = await self.stickies.find_one(
+                {"channel_id": channel_id, "text": {"$exists": False}}
+            )
             if not sticky_doc:
                 return
             
@@ -647,7 +673,7 @@ class StickyMessages(commands.Cog):
             }
             
             await self.stickies.update_one(
-                {"channel_id": channel_id}, 
+                {"channel_id": channel_id, "text": {"$exists": False}}, 
                 {"$set": doc}, 
                 upsert=True
             )
@@ -693,8 +719,11 @@ class StickyMessages(commands.Cog):
             
             channel_id = ctx.channel.id
             
-            # Delete from database
-            result = await self.stickies.delete_one({"channel_id": channel_id})
+            # Delete from database (own docs only - sticky-button docs share
+            # this collection and have a "text" field)
+            result = await self.stickies.delete_one(
+                {"channel_id": channel_id, "text": {"$exists": False}}
+            )
             
             if result.deleted_count == 0:
                 await ctx.send("ℹ️ No sticky message is set for this channel.")
@@ -734,7 +763,9 @@ class StickyMessages(commands.Cog):
                 await ctx.send("❌ Database not available.")
                 return
             
-            doc = await self.stickies.find_one({"channel_id": ctx.channel.id})
+            doc = await self.stickies.find_one(
+                {"channel_id": ctx.channel.id, "text": {"$exists": False}}
+            )
             if not doc:
                 await ctx.send("ℹ️ No sticky message is set for this channel.")
                 return
@@ -777,7 +808,9 @@ class StickyMessages(commands.Cog):
                 await ctx.send("❌ Database not available.")
                 return
             
-            sticky_doc = await self.stickies.find_one({"channel_id": ctx.channel.id})
+            sticky_doc = await self.stickies.find_one(
+                {"channel_id": ctx.channel.id, "text": {"$exists": False}}
+            )
             if not sticky_doc:
                 await ctx.send("ℹ️ No sticky message is set for this channel.")
                 return
@@ -831,7 +864,9 @@ class StickyMessages(commands.Cog):
             
             # Find stickies for this guild
             stickies_list = []
-            async for sticky in self.stickies.find({"channel_id": {"$in": guild_channels}}):
+            async for sticky in self.stickies.find(
+                {"channel_id": {"$in": guild_channels}, "text": {"$exists": False}}
+            ):
                 channel_id = sticky.get("channel_id")
                 channel = ctx.guild.get_channel(channel_id)
                 if channel:
