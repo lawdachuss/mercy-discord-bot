@@ -13,6 +13,29 @@ import random
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
+
+def mongo_client_closed(client) -> bool:
+    """Return True only when we can positively tell the Mongo client is closed.
+
+    Motor's ``AsyncIOMotorClient`` raises AttributeError for any attribute
+    starting with ``_`` (its ``__getattr__`` rejects them), so
+    ``hasattr(client, '_topology')`` is *always* False - a guard built on it
+    would treat every healthy client as closed and skip the work. The
+    topology actually lives on the pymongo delegate: ``client.delegate``.
+    """
+    if client is None:
+        return True
+    try:
+        delegate = getattr(client, "delegate", None)
+        if delegate is None:
+            delegate = client
+        topology = getattr(delegate, "_topology", None)
+        if topology is None:
+            return False  # Can't tell - assume usable, DB errors are handled below
+        return bool(getattr(topology, "_closed", False))
+    except Exception:
+        return False  # Fail open rather than silently skipping work
+
 # Load environment variables
 load_dotenv()
 
@@ -379,8 +402,7 @@ class AFK(commands.Cog):
             afk_users = set()
             if self.afk_collection is not None:
                 # Check if MongoDB client is still open
-                mongo_client = getattr(self.afk_collection.database.client, '_topology', None)
-                if mongo_client is None or mongo_client._closed:
+                if mongo_client_closed(self.afk_collection.database.client):
                     logger.warning("MongoDB client is closed, skipping AFK nickname cleanup")
                     return
                 
@@ -434,8 +456,7 @@ class AFK(commands.Cog):
             if self.mentions_collection is None:
                 return
             # Check if MongoDB client is still open
-            mongo_client = getattr(self.mentions_collection.database.client, '_topology', None)
-            if mongo_client is None or mongo_client._closed:
+            if mongo_client_closed(self.mentions_collection.database.client):
                 logger.warning("MongoDB client is closed, skipping mention cleanup")
                 return
             cutoff = datetime.now(timezone.utc) - timedelta(days=self.mention_retention_days)

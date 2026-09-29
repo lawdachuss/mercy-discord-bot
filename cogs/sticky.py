@@ -13,6 +13,30 @@ from discord.ext import commands, tasks
 log = logging.getLogger("sticky")
 
 
+def mongo_client_closed(client) -> bool:
+    """Return True only when we can positively tell the Mongo client is closed.
+
+    Motor's ``AsyncIOMotorClient`` raises AttributeError for any attribute
+    starting with ``_`` (its ``__getattr__`` rejects them), so
+    ``hasattr(client, '_topology')`` is *always* False. Checking it therefore
+    made every "is the client closed?" guard conclude "closed" and silently
+    skip the work - which is why stickies were never auto-refreshed. The
+    topology actually lives on the pymongo delegate: ``client.delegate``.
+    """
+    if client is None:
+        return True
+    try:
+        delegate = getattr(client, "delegate", None)
+        if delegate is None:
+            delegate = client
+        topology = getattr(delegate, "_topology", None)
+        if topology is None:
+            return False  # Can't tell - assume usable, DB errors are handled below
+        return bool(getattr(topology, "_closed", False))
+    except Exception:
+        return False  # Fail open rather than silently skipping work
+
+
 class StickyMessages(commands.Cog):
     """Manages sticky messages that stay at the bottom of channels."""
     
@@ -407,7 +431,7 @@ class StickyMessages(commands.Cog):
             failed = 0
             
             # Check if MongoDB client is still open
-            if self.mongo_client is None or not hasattr(self.mongo_client, '_topology') or self.mongo_client._topology._closed:
+            if mongo_client_closed(self.mongo_client):
                 log.warning("MongoDB client is closed, skipping auto-refresh")
                 return
             
@@ -485,7 +509,7 @@ class StickyMessages(commands.Cog):
             deleted = 0
             
             # Check if MongoDB client is still open
-            if self.mongo_client is None or not hasattr(self.mongo_client, '_topology') or self.mongo_client._topology._closed:
+            if mongo_client_closed(self.mongo_client):
                 log.warning("MongoDB client is closed, skipping cleanup")
                 return
             
@@ -535,7 +559,7 @@ class StickyMessages(commands.Cog):
         
         try:
             # Check if MongoDB client is still open
-            if self.mongo_client is None or not hasattr(self.mongo_client, '_topology') or self.mongo_client._topology._closed:
+            if mongo_client_closed(self.mongo_client):
                 log.warning("MongoDB client is closed, skipping memory cleanup")
                 return
             

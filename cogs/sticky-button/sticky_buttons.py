@@ -16,6 +16,30 @@ MONGO_URL = os.getenv("MONGO_URL")
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL not found in environment")
 
+
+def mongo_client_closed(client) -> bool:
+    """Return True only when we can positively tell the Mongo client is closed.
+
+    Motor's ``AsyncIOMotorClient`` raises AttributeError for any attribute
+    starting with ``_`` (its ``__getattr__`` rejects them), so
+    ``hasattr(client, '_topology')`` is *always* False. Checking it therefore
+    made every "is the client closed?" guard conclude "closed" and silently
+    skip the work - which is why stickies were never auto-refreshed. The
+    topology actually lives on the pymongo delegate: ``client.delegate``.
+    """
+    if client is None:
+        return True
+    try:
+        delegate = getattr(client, "delegate", None)
+        if delegate is None:
+            delegate = client
+        topology = getattr(delegate, "_topology", None)
+        if topology is None:
+            return False  # Can't tell - assume usable, DB errors are handled below
+        return bool(getattr(topology, "_closed", False))
+    except Exception:
+        return False  # Fail open rather than silently skipping work
+
 # ----- Helpers -----
 
 
@@ -656,7 +680,7 @@ class StickyCog(commands.Cog):
             # Check database connection health
             try:
                 # Check if MongoDB client is still open
-                if self.mongo_client is None or not hasattr(self.mongo_client, '_topology') or self.mongo_client._topology._closed:
+                if mongo_client_closed(self.mongo_client):
                     logging.warning("MongoDB client is closed, skipping periodic repost")
                     return
                 await self.mongo_client.admin.command('ping')
@@ -733,7 +757,7 @@ class StickyCog(commands.Cog):
         await self.bot.wait_until_ready()
         try:
             # Check if MongoDB client is still open
-            if self.mongo_client is None or not hasattr(self.mongo_client, '_topology') or self.mongo_client._topology._closed:
+            if mongo_client_closed(self.mongo_client):
                 logging.warning("MongoDB client is closed, skipping recovery task")
                 return
             
@@ -758,7 +782,7 @@ class StickyCog(commands.Cog):
             # Check MongoDB connection
             try:
                 # Check if MongoDB client is still open
-                if self.mongo_client is None or not hasattr(self.mongo_client, '_topology') or self.mongo_client._topology._closed:
+                if mongo_client_closed(self.mongo_client):
                     logging.warning("MongoDB client is closed, skipping health check")
                     return
                 await self.mongo_client.admin.command('ping')
@@ -787,7 +811,7 @@ class StickyCog(commands.Cog):
         await self.bot.wait_until_ready()
         try:
             # Check if MongoDB client is still open
-            if self.mongo_client is None or not hasattr(self.mongo_client, '_topology') or self.mongo_client._topology._closed:
+            if mongo_client_closed(self.mongo_client):
                 logging.warning("MongoDB client is closed, skipping view re-add")
                 return
             

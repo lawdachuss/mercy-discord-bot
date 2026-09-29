@@ -33,6 +33,29 @@ if not MONGO_URL:
     raise RuntimeError("MONGO_URL not found in .env")
 
 
+def mongo_client_closed(client) -> bool:
+    """Return True only when we can positively tell the Mongo client is closed.
+
+    Motor's ``AsyncIOMotorClient`` raises AttributeError for any attribute
+    starting with ``_`` (its ``__getattr__`` rejects them), so
+    ``hasattr(client, '_topology')`` is *always* False - a guard built on it
+    would treat every healthy client as closed and skip the work. The
+    topology actually lives on the pymongo delegate: ``client.delegate``.
+    """
+    if client is None:
+        return True
+    try:
+        delegate = getattr(client, "delegate", None)
+        if delegate is None:
+            delegate = client
+        topology = getattr(delegate, "_topology", None)
+        if topology is None:
+            return False  # Can't tell - assume usable, DB errors are handled below
+        return bool(getattr(topology, "_closed", False))
+    except Exception:
+        return False  # Fail open rather than silently skipping work
+
+
 # --- Configurable defaults ---
 DEFAULT_EMOJI_CUSTOM = "<:ogs_tick:1427918161327558736>"  # Success tick emoji
 CROSS_EMOJI_CUSTOM = "<:ogs_cross:1427918018196930642>"  # Error cross emoji
@@ -211,7 +234,7 @@ class CountingCog(commands.Cog):
         docs = []
         try:
             # Check if MongoDB client is still open
-            if self.mongo is None or not hasattr(self.mongo, '_topology') or self.mongo._topology._closed:
+            if mongo_client_closed(self.mongo):
                 logging.warning("MongoDB client is closed, skipping backup")
                 return
             
