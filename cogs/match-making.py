@@ -1,6 +1,7 @@
 ﻿import os
 import time
 import random
+import logging
 import json
 import io
 import asyncio
@@ -16,6 +17,8 @@ EMBED_COLOR = 0x2F3136
 SKIP_BLOCK_MINUTES = 1440  # 24 hours
 MAX_DB_CANDIDATES = 2000
 SCAN_WINDOW = 200
+
+logger = logging.getLogger(__name__)
 
 # ----- Safe Reply -----
 
@@ -77,7 +80,7 @@ class NotificationManager:
                 if self.dm_messages_col is not None:
                     await self.dm_messages_col.update_one(
                         {"message_id": int(msg.id)},
-                        {"": {"message_id": int(msg.id), "channel_id": int(msg.channel.id), "user_id": int(user.id), "delete_after": delete_after}},
+                        {"$set": {"message_id": int(msg.id), "channel_id": int(msg.channel.id), "user_id": int(user.id), "delete_after": delete_after}},
                         upsert=True
                     )
             except Exception:
@@ -228,6 +231,17 @@ class ThreadControls(discord.ui.View):
                 pass
 
             await self.cog.block_pair(self.guild_id, interaction.user.id, other_id)
+            try:
+                # Record the skip so the dequeue priority bonus and the
+                # "recently skipped" filters actually have data to read.
+                await self.cog.match_skips_col.insert_one({
+                    "guild_id": int(self.guild_id),
+                    "user_id": int(interaction.user.id),
+                    "thread_id": int(self.thread_id),
+                    "skipped_at": int(time.time()),
+                })
+            except Exception:
+                pass
             await self.cog.enqueue(self.guild_id, interaction.user.id)
 
             await notif_manager.send(
@@ -318,7 +332,7 @@ class ThreadControls(discord.ui.View):
             try:
                 await self.cog.pending_deletions_col.update_one(
                     {"thread_id": self.thread_id},
-                    {"": {"thread_id": self.thread_id, "guild_id": self.guild_id, "delete_after": int(time.time()) + 120}},
+                    {"$set": {"thread_id": self.thread_id, "guild_id": self.guild_id, "delete_after": int(time.time()) + 120}},
                     upsert=True
                 )
             except Exception:
@@ -465,6 +479,11 @@ class Matchmaker(commands.Cog):
         self._cleanup_lock = asyncio.Lock()
         self._roles_cache = MemberRoleCache(max_size=10000, ttl_seconds=300)
         self._on_ready_done = False
+        # guild_id -> unix ts until which match attempts are backed off (thread
+        # creation failures) so one broken guild cannot livelock its queue.
+        self._match_backoff: dict[int, int] = {}
+        # thread_id -> unix ts of the last last_activity write (throttle).
+        self._activity_write_ts: dict[int, int] = {}
 
         db = self.bot.mongo_client['discord_bot']
         self.guild_config_col = db['matchmaker_guild_config']
@@ -528,7 +547,7 @@ class Matchmaker(commands.Cog):
         try:
             await self.matches_col.update_one(
                 {"thread_id": thread_id},
-                {"": {"closed_at": int(time.time()), "status": "closed"}}
+                {"$set": {"closed_at": int(time.time()), "status": "closed"}}
             )
         except Exception:
             pass
@@ -549,10 +568,20 @@ class Matchmaker(commands.Cog):
 
             self.bot.add_view(MatchPanel(self))
             try:
-                open_rows = await self.matches_col.find({"status": "open"}, {"thread_id": 1, "guild_id": 1}).to_list(length=None)
+                open_rows = await self.matches_col.find(
+                    {"status": "open"},
+                    {"thread_id": 1, "guild_id": 1, "user1_id": 1, "user2_id": 1, "created_at": 1}
+                ).to_list(length=None)
                 for r in open_rows or []:
                     tid = int(r["thread_id"])
                     gid = int(r["guild_id"])
+                    # Rebuild in-memory match state so skip/report/leave controls
+                    # keep working for matches created before a restart.
+                    if r.get("user1_id") is not None and r.get("user2_id") is not None:
+                        self.match_meta.setdefault(tid, {
+                            "pairs": [int(r["user1_id"]), int(r["user2_id"])],
+                            "created_at": int(r.get("created_at", 0)),
+                        })
                     guild = self.bot.get_guild(gid)
                     if guild:
                         th = await self._safe_get_thread(guild, tid)
@@ -567,6 +596,28 @@ class Matchmaker(commands.Cog):
             self._on_ready_done = True
         except Exception:
             raise
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Keep `last_activity` fresh for open match threads (inactivity cleanup)."""
+        if message.author.bot or not isinstance(message.channel, discord.Thread):
+            return
+        thread_id = message.channel.id
+        if thread_id not in self.match_meta:
+            self._activity_write_ts.pop(thread_id, None)
+            return
+        now = int(time.time())
+        if now - self._activity_write_ts.get(thread_id, 0) < 60:
+            return
+        self._activity_write_ts[thread_id] = now
+        try:
+            if self.matches_col is not None:
+                await self.matches_col.update_one(
+                    {"thread_id": thread_id},
+                    {"$set": {"last_activity": now}}
+                )
+        except Exception:
+            pass
 
     # ----- Queue Helpers -----
 
@@ -609,7 +660,7 @@ class Matchmaker(commands.Cog):
                 score = wait // 60
                 await self.waiting_queue_col.update_one(
                     {"guild_id": guild_id, "user_id": user_id},
-                    {"": {
+                    {"$set": {
                         "guild_id": guild_id,
                         "user_id": user_id,
                         "enqueued_at": ts,
@@ -650,7 +701,7 @@ class Matchmaker(commands.Cog):
         score = await self.calculate_priority(guild_id, user_id)
         await self.waiting_queue_col.update_one(
             {"guild_id": guild_id, "user_id": user_id},
-            {"": {"priority_score": score}}
+            {"$set": {"priority_score": score}}
         )
 
     async def dequeue_pair(self, guild: discord.Guild):
@@ -668,13 +719,13 @@ class Matchmaker(commands.Cog):
                 cands: List[Dict[str, Any]] = [dict(r) for r in candidates]
                 now_ts = int(time.time())
                 pipeline = [
-                    {"": {"guild_id": guild.id, "skipped_at": {"": now_ts - 300}}},
-                    {"": {"_id": "", "last_skip": {"": ""}}}
+                    {"$match": {"guild_id": guild.id, "skipped_at": {"$gte": now_ts - 300}}},
+                    {"$group": {"_id": "$user_id", "last_skip": {"$max": "$skipped_at"}}}
                 ]
                 skip_cursor = self.match_skips_col.aggregate(pipeline)
                 skips = await skip_cursor.to_list(length=None)
                 
-                recent_skips = {int(r["_id"]): int(r["last_skip"]) for r in skips}
+                recent_skips = {int(r["_id"]): int(r["last_skip"]) for r in skips if r.get("_id") is not None}
                 
                 for c in cands:
                     user_id = int(c["user_id"])
@@ -690,22 +741,23 @@ class Matchmaker(commands.Cog):
                 cands.sort(key=lambda x: (-x["priority_score"], x["enqueued_at"]))
 
                 now = int(time.time())
-                await self.recent_blocks_col.delete_many({"guild_id": guild.id, "blocked_until": {"": now}})
+                # Purge expired blocks, then read back only the ones still active.
+                await self.recent_blocks_col.delete_many({"guild_id": guild.id, "blocked_until": {"$lte": now}})
                 blk_cursor = self.recent_blocks_col.find(
-                    {"guild_id": guild.id, "blocked_until": {"": now}},
+                    {"guild_id": guild.id, "blocked_until": {"$gt": now}},
                     {"user1_id": 1, "user2_id": 1}
                 )
                 blk = await blk_cursor.to_list(length=None)
                 blocks = {(int(r["user1_id"]), int(r["user2_id"])) for r in blk}
                 
                 day_ago = now - (24 * 60 * 60)
-                skip_threads = await self.match_skips_col.distinct("thread_id", {"guild_id": guild.id, "skipped_at": {"": day_ago}})
+                skip_threads = await self.match_skips_col.distinct("thread_id", {"guild_id": guild.id, "skipped_at": {"$gte": day_ago}})
                 matched_cursor = self.matches_col.find(
                     {
                         "guild_id": guild.id,
-                        "created_at": {"": day_ago},
+                        "created_at": {"$gte": day_ago},
                         "status": "open",
-                        "thread_id": {"": skip_threads}
+                        "thread_id": {"$nin": skip_threads}
                     },
                     {"user1_id": 1, "user2_id": 1}
                 )
@@ -782,7 +834,7 @@ class Matchmaker(commands.Cog):
             try:
                 await self.recent_blocks_col.update_one(
                     {"guild_id": guild_id, "user1_id": u1, "user2_id": u2},
-                    {"": {"guild_id": guild_id, "user1_id": u1, "user2_id": u2, "blocked_until": until}},
+                    {"$set": {"guild_id": guild_id, "user1_id": u1, "user2_id": u2, "blocked_until": until}},
                     upsert=True
                 )
                 return
@@ -851,6 +903,8 @@ class Matchmaker(commands.Cog):
 
     async def _attempt_match(self, guild: discord.Guild):
         try:
+            if int(time.time()) < self._match_backoff.get(guild.id, 0):
+                return
             async with self._locks[guild.id]:
                 pair = await self.dequeue_pair(guild)
                 if pair is None:
@@ -859,20 +913,46 @@ class Matchmaker(commands.Cog):
                 u1_id = int(u1_doc["user_id"])
                 u2_id = int(u2_doc["user_id"])
 
+                # Resolve both members BEFORE removing anyone from the queue so a
+                # failed match never silently drops the other participant.
+                m1 = guild.get_member(u1_id)
+                if m1 is None:
+                    try:
+                        m1 = await guild.fetch_member(u1_id)
+                    except discord.NotFound:
+                        # User left the guild: drop only their row and retry later.
+                        await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u1_id})
+                        return
+                m2 = guild.get_member(u2_id)
+                if m2 is None:
+                    try:
+                        m2 = await guild.fetch_member(u2_id)
+                    except discord.NotFound:
+                        await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u2_id})
+                        return
+
+                thread = await self._create_match_thread(guild, u1_id, u2_id)
+                if not thread:
+                    # Keep both users queued (a transient failure must not eat their
+                    # place); back off so a persistent failure cannot livelock the
+                    # queue by retrying the same pair every tick.
+                    self._match_backoff[guild.id] = int(time.time()) + 60
+                    logger.warning(
+                        "Matchmaking: could not create match thread in guild %s for %s/%s; users left in queue",
+                        guild.id, u1_id, u2_id,
+                    )
+                    return
+
                 await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u1_id})
                 await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u2_id})
 
-                thread = await self._create_match_thread(guild, u1_id, u2_id)
-                if thread:
-                    try:
-                        m1 = guild.get_member(u1_id) or await guild.fetch_member(u1_id)
-                        m2 = guild.get_member(u2_id) or await guild.fetch_member(u2_id)
-                        if m1:
-                            await notif_manager.send(m1, f"Match found! Join your private thread: {thread.mention}", "match")
-                        if m2:
-                            await notif_manager.send(m2, f"Match found! Join your private thread: {thread.mention}", "match")
-                    except Exception:
-                        pass
+                try:
+                    if m1:
+                        await notif_manager.send(m1, f"Match found! Join your private thread: {thread.mention}", "match")
+                    if m2:
+                        await notif_manager.send(m2, f"Match found! Join your private thread: {thread.mention}", "match")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -901,9 +981,10 @@ class Matchmaker(commands.Cog):
                 try:
                     pending_thread_ids = await self.pending_deletions_col.distinct("thread_id")
                     cursor = self.matches_col.find({
+                        "guild_id": guild.id,
                         "status": "open",
-                        "last_activity": {"": inactive_threshold, "": inactive_threshold - 60},
-                        "thread_id": {"": pending_thread_ids}
+                        "last_activity": {"$lte": inactive_threshold},
+                        "thread_id": {"$nin": pending_thread_ids}
                     })
                     rows = await cursor.to_list(length=None)
                     
@@ -912,6 +993,18 @@ class Matchmaker(commands.Cog):
                         try:
                             thread = await self._safe_get_thread(guild, thread_id)
                             if thread:
+                                # Cross-check against Discord's own last message
+                                # timestamp so a live thread is never closed just
+                                # because our DB write was missed or throttled.
+                                if thread.last_message_id:
+                                    last_msg_ts = ((int(thread.last_message_id) >> 22) + 1420070400000) // 1000
+                                    if now - last_msg_ts < 30 * 60:
+                                        if self.matches_col is not None:
+                                            await self.matches_col.update_one(
+                                                {"thread_id": thread_id},
+                                                {"$set": {"last_activity": last_msg_ts}}
+                                            )
+                                        continue
                                 try:
                                     warning_embed = discord.Embed(
                                         title="Thread Closed - Inactivity",
@@ -938,7 +1031,7 @@ class Matchmaker(commands.Cog):
                             
                             await self.matches_col.update_one(
                                 {"thread_id": thread_id},
-                                {"": {"status": "closed", "closed_at": now, "close_reason": "inactivity"}}
+                                {"$set": {"status": "closed", "closed_at": now, "close_reason": "inactivity"}}
                             )
                             
                             if thread_id in self.match_meta:

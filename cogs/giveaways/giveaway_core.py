@@ -532,6 +532,13 @@ class DatabaseManager:
 
     async def init(self):
         try:
+            # Close any previous (unusable) client so repeated retries do not
+            # leak one client per attempt.
+            if self.client is not None:
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
             # Optimized for very large servers (10k+ members)
             self.client = AsyncIOMotorClient(
                 self.mongo_url,
@@ -637,6 +644,7 @@ class GiveawayCog(commands.Cog):
 
         self.db = DatabaseManager(mongo_url)
         self._ready = asyncio.Event()
+        self._db_retry_task: Optional[asyncio.Task] = None
         self._checking_lock = asyncio.Lock()
         self.timezone = os.getenv('BOT_TIMEZONE', 'UTC')
         self.active_fake_reaction_tasks: Dict[str, asyncio.Task] = {}
@@ -687,12 +695,42 @@ class GiveawayCog(commands.Cog):
 
     async def cog_load(self):
         await self.db.init()
-        self.check_giveaways.start()
+        if self.db.connected:
+            self._start_db_dependent()
+        else:
+            # Non-fatal: a slow MongoDB start must not permanently disable
+            # giveaways for the session - retry in the background instead.
+            self.logger.warning("[WARN] GiveawayCog could not reach MongoDB at startup; retrying in the background")
+            self._db_retry_task = asyncio.create_task(self._connect_db_later())
+
+    def _start_db_dependent(self) -> None:
+        """Start DB-dependent pieces exactly once after a successful connect."""
+        if not self.check_giveaways.is_running():
+            self.check_giveaways.start()
         self._ready.set()
         asyncio.create_task(self.register_persistent_views())
-        
         # The command group is automatically registered when the cog loads
         self.logger.info("[OK] GiveawayCog loaded with reaction-based giveaway system")
+
+    async def _connect_db_later(self) -> None:
+        """Keep retrying MongoDB in the background after a failed startup attempt."""
+        delay = 5.0
+        try:
+            while not self.db.connected:
+                await asyncio.sleep(delay)
+                if self.bot.is_closed():
+                    return
+                await self.db.init()
+                if self.db.connected:
+                    self.logger.info("[OK] GiveawayCog reached MongoDB after background retry")
+                    self._start_db_dependent()
+                    return
+                delay = min(delay * 2, 300.0)
+                self.logger.warning(f"[WARN] GiveawayCog still cannot reach MongoDB; retrying in {delay:.0f}s")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger.error(f"GiveawayCog DB retry task stopped: {e}")
 
     async def register_persistent_views(self):
         """Register persistent views for ended giveaways on bot restart."""
@@ -716,6 +754,8 @@ class GiveawayCog(commands.Cog):
 
     def cog_unload(self):
         self.check_giveaways.cancel()
+        if self._db_retry_task is not None and not self._db_retry_task.done():
+            self._db_retry_task.cancel()
         # Cancel all active fake reaction tasks
         for task in self.active_fake_reaction_tasks.values():
             if not task.done():

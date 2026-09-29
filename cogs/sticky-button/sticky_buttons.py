@@ -502,6 +502,7 @@ class StickyCog(commands.Cog):
         self.repost_queue = asyncio.Queue(maxsize=1000)
         self.repost_task = None
         self.processing_channels = set()
+        self._manage_messages_warned = set()  # channel_ids already warned about missing Manage Messages
 
         # start tasks (periodic_repost set to 1 minute per requirement)
         try:
@@ -841,8 +842,10 @@ class StickyCog(commands.Cog):
     async def add_rate_limit(self, channel_id):
         self.rate_limits[channel_id].append(datetime.now(timezone.utc))
 
-    async def _delete_existing_bot_stickies(self, channel: discord.TextChannel, sticky_text: str):
+    async def _delete_existing_bot_stickies(self, channel: discord.TextChannel, sticky_text: str) -> bool:
         # Deletes any bot messages in the last N messages in the channel that match the sticky text.
+        # Returns True when cleanup succeeded (or there was nothing to delete),
+        # False when old stickies could not be removed (e.g. missing permissions).
         try:
             to_delete = []
             async for m in channel.history(limit=50):
@@ -866,13 +869,17 @@ class StickyCog(commands.Cog):
                         del self.last_sticky_messages[channel.id]
                 except discord.Forbidden:
                     logging.warning("Missing permissions to delete message in channel %s", channel.id)
-                    break
+                    return False
                 except discord.HTTPException as e:
                     logging.warning("Failed to delete message in channel %s: %s", channel.id, e)
+                    return False
+            return True
         except discord.Forbidden:
             logging.warning("Missing permissions to read history in channel %s", channel.id)
+            return False
         except Exception:
             logging.exception("Failed scanning/deleting old bot sticky messages in channel %s", channel.id)
+            return False
 
     async def _repost_sticky_internal(self, channel: discord.TextChannel, force=False):
         if not force and await self.is_rate_limited(channel.id):
@@ -898,11 +905,18 @@ class StickyCog(commands.Cog):
                 logging.warning("Sticky for channel %s has no text and no buttons, skipping repost", channel.id)
                 return False
 
-            # Delete any previous bot stickies matching this content (avoid duplicates)
-            try:
-                await self._delete_existing_bot_stickies(channel, text)
-            except Exception:
-                logging.exception("Error trying to cleanup old sticky messages")
+            # Manage Messages is required to remove the previous sticky; without it
+            # every repost would pile up duplicates in the channel.
+            if not channel.permissions_for(channel.guild.me).manage_messages:
+                if channel.id not in self._manage_messages_warned:
+                    self._manage_messages_warned.add(channel.id)
+                    logging.warning("Missing Manage Messages in channel %s; skipping sticky repost to avoid duplicates", channel.id)
+                return False
+
+            # Delete any previous bot stickies matching this content (avoid duplicates).
+            # If cleanup failed, abort instead of stacking a new copy on the old one.
+            if not await self._delete_existing_bot_stickies(channel, text):
+                return False
 
             # Create view only if there are buttons
             view = None
@@ -917,8 +931,8 @@ class StickyCog(commands.Cog):
                 except Exception as e:
                     logging.exception("Failed to persist view: %s", e)
 
-            # Send the sticky message
-            msg = await channel.send(content=text or "\u200b", view=view)
+            # Send the sticky message (never re-ping @everyone/roles on repost)
+            msg = await channel.send(content=text or "\u200b", view=view, allowed_mentions=discord.AllowedMentions.none())
             self.last_sticky_messages[channel.id] = msg.id
             logging.debug("Successfully reposted sticky for channel %s", channel.id)
 

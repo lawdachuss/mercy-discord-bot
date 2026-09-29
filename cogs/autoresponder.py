@@ -181,6 +181,7 @@ class AutoResponder(commands.Cog):
     )
     
     @autoresponder_group.command(name="add")
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     async def autoresponder_add(self, interaction: discord.Interaction):
         """Add a new autoresponder trigger and response using a popup form."""
@@ -230,6 +231,8 @@ class AutoResponder(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
     
     @autoresponder_group.command(name="remove")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(trigger="The trigger text to remove")
     async def autoresponder_remove(self, interaction: discord.Interaction, trigger: str):
         """Remove an autoresponse trigger."""
@@ -250,6 +253,8 @@ class AutoResponder(commands.Cog):
             )
     
     @autoresponder_group.command(name="list")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_guild=True)
     async def autoresponder_list(self, interaction: discord.Interaction):
         """List all autoresponse triggers and responses for this server."""
         guild_id = str(interaction.guild.id)
@@ -414,6 +419,7 @@ class AutoResponder(commands.Cog):
                 await ctx.send(f"\u274c {message}")
     
     @commands.command(name="list_responses")
+    @commands.has_permissions(manage_guild=True)
     async def list_responses(self, ctx):
         """List all autoresponse triggers and responses for this server.
         

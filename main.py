@@ -798,6 +798,10 @@ class DiscordBot(commands.Bot):
             return
         
         try:
+            # Keep a reference to the outgoing client so we can find every
+            # handle derived from it after the swap (see rebind pass below).
+            old_client = self.mongo_client
+
             # Close old connection if it exists and wasn't already closed
             if self.mongo_client is not None and not self._mongo_explicitly_closed:
                 try:
@@ -832,32 +836,51 @@ class DiscordBot(commands.Bot):
             
             logging.info("✅ MongoDB reconnected successfully")
             
-            # Update all cogs that use MongoDB (only if cogs are loaded)
-            # Don't call _ensure_mongo_connections here to avoid recursion
-            if self.cogs:
+            # Rebind every Mongo handle derived from the OLD client: cogs stash
+            # raw clients, Database and Collection objects as plain instance
+            # attributes, and any left pointing at the closed client is dead
+            # until a manual cog reload (drops/snipe hit exactly this). Only
+            # values that are the old client or derive from it are touched -
+            # cogs that own their own connection keep it untouched.
+            if self.cogs and old_client is not None:
+                from motor.motor_asyncio import (
+                    AsyncIOMotorCollection,
+                    AsyncIOMotorDatabase,
+                )
+
+                def rebind_holder(holder) -> int:
+                    count = 0
+                    for attr, value in list(vars(holder).items()):
+                        if value is old_client:
+                            setattr(holder, attr, self.mongo_client)
+                            count += 1
+                        elif isinstance(value, AsyncIOMotorDatabase) and value.client is old_client:
+                            setattr(holder, attr, self.mongo_client[value.name])
+                            count += 1
+                        elif isinstance(value, AsyncIOMotorCollection) and value.database.client is old_client:
+                            setattr(
+                                holder, attr,
+                                self.mongo_client[value.database.name][value.name],
+                            )
+                            count += 1
+                    return count
+
                 for cog_name, cog in self.cogs.items():
-                    if hasattr(cog, 'mongo') or hasattr(cog, 'mongo_client'):
-                        try:
-                            # Update counting cog
-                            if hasattr(cog, 'mongo') and not getattr(cog, '_owns_connection', True):
-                                cog.mongo = self.mongo_client
-                                cog.db = self.mongo_client["counting_bot"]
-                                logging.info(f"Reconnected MongoDB for {cog_name}")
-                            
-                            # Update leaderboard cogs
-                            if hasattr(cog, 'mongo_client') and cog.mongo_client is not None:
-                                cog.mongo_client = self.mongo_client
-                                if hasattr(cog, 'db'):
-                                    cog.db = self.mongo_client['poison_bot']
-                                # Also update state_manager if it exists
-                                if hasattr(cog, 'state_manager') and hasattr(cog.state_manager, 'db'):
-                                    cog.state_manager.db = self.mongo_client['poison_bot']
-                                # Update recovery_manager if it exists
-                                if hasattr(cog, 'recovery_manager') and hasattr(cog.recovery_manager, 'db'):
-                                    cog.recovery_manager.db = self.mongo_client['poison_bot']
-                                logging.info(f"Reconnected MongoDB for {cog_name}")
-                        except Exception as e:
-                            logging.error(f"Failed to update MongoDB for {cog_name}: {e}")
+                    try:
+                        rebound = rebind_holder(cog)
+                        # Known nested holders that instance-attr scanning
+                        # cannot reach.
+                        for nested_attr in ('state_manager', 'recovery_manager'):
+                            nested = getattr(cog, nested_attr, None)
+                            if nested is not None and hasattr(nested, 'db'):
+                                db = nested.db
+                                if isinstance(db, AsyncIOMotorDatabase) and db.client is old_client:
+                                    nested.db = self.mongo_client[db.name]
+                                    rebound += 1
+                        if rebound:
+                            logging.info(f"Reconnected MongoDB for {cog_name} ({rebound} handles)")
+                    except Exception as e:
+                        logging.error(f"Failed to update MongoDB for {cog_name}: {e}")
             
         except Exception as e:
             logging.error(f"Failed to reconnect to MongoDB: {e}")
@@ -902,30 +925,11 @@ class DiscordBot(commands.Bot):
             self._mongo_explicitly_closed = False  # Reset flag before reconnecting
             await self._reconnect_mongodb()
         
-        # Now update all cogs
-        for cog_name, cog in self.cogs.items():
-            if hasattr(cog, 'mongo') or hasattr(cog, 'mongo_client'):
-                try:
-                    # Update counting cog
-                    if hasattr(cog, 'mongo') and not getattr(cog, '_owns_connection', True):
-                        cog.mongo = self.mongo_client
-                        cog.db = self.mongo_client["counting_bot"]
-                        logging.debug(f"Updated MongoDB connection for {cog_name}")
-                    
-                    # Update leaderboard cogs
-                    if hasattr(cog, 'mongo_client') and cog.mongo_client is not None:
-                        cog.mongo_client = self.mongo_client
-                        if hasattr(cog, 'db'):
-                            cog.db = self.mongo_client['poison_bot']
-                        # Also update state_manager if it exists
-                        if hasattr(cog, 'state_manager') and hasattr(cog.state_manager, 'db'):
-                            cog.state_manager.db = self.mongo_client['poison_bot']
-                        # Update recovery_manager if it exists
-                        if hasattr(cog, 'recovery_manager') and hasattr(cog.recovery_manager, 'db'):
-                            cog.recovery_manager.db = self.mongo_client['poison_bot']
-                        logging.debug(f"Updated MongoDB connection for {cog_name}")
-                except Exception as e:
-                    logging.error(f"Failed to update MongoDB connection for {cog_name}: {e}")
+        # NOTE: the old code force-assigned `cog.mongo`/`cog.db`/`cog.mongo_client`
+        # on every call - even when nothing had reconnected - which could silently
+        # point a cog's `db` at the wrong database. Handle rebinding now happens
+        # (identity-based, only for handles derived from the closed client) inside
+        # `_reconnect_mongodb`, which is invoked above exactly when needed.
     
     async def _periodic_cleanup(self) -> None:
         """Clean up resources periodically"""
@@ -1192,9 +1196,23 @@ async def main():
                         await bot.close()
                         break
                     await asyncio.sleep(1)
-            
+
+            async def run_start():
+                # A failed login/gateway error must close the bot: otherwise
+                # `shutdown_checker` polls `is_closed()` forever and the old
+                # gather never returned, hanging the process with no log and
+                # no exit code (the supervisor would wait forever too).
+                try:
+                    await bot.start(DISCORD_TOKEN)
+                except BaseException:
+                    try:
+                        await bot.close()
+                    except Exception:
+                        pass
+                    raise
+
             results = await asyncio.gather(
-                bot.start(DISCORD_TOKEN),
+                run_start(),
                 shutdown_checker(),
                 return_exceptions=True
             )

@@ -222,6 +222,9 @@ class Skullboard(commands.Cog):
         self._blacklist_cache: Dict[int, Dict[str, List[int]]] = {}
         # last action timestamps to prevent spam toggles: (guild, user, message) -> ts
         self._recent_actions: Dict[Tuple[int, int, int], float] = {}
+        # Deferred reaction re-checks scheduled after the guild rate-limit window:
+        # (guild_id, message_id) -> task (at most one pending per message)
+        self._pending_reaction_checks: Dict[Tuple[int, int], asyncio.Task] = {}
         # Maximum items in caches
         self.MAX_CACHE_ITEMS = 1000
         # Cache TTL in seconds (5 minutes)
@@ -527,16 +530,49 @@ class Skullboard(commands.Cog):
         return embed
 
     # ----------------- Core reaction + message handlers -----------------
+    def _defer_reaction_check(self, payload: discord.RawReactionActionEvent, delay: float) -> None:
+        """Re-run a rate-limited reaction event once the cooldown window expires.
+
+        Keeps at most one pending check per (guild, message) so bursts stay bounded.
+        """
+        key = (payload.guild_id, payload.message_id)
+        pending = self._pending_reaction_checks.get(key)
+        if pending is not None and not pending.done():
+            return
+        task = asyncio.create_task(self._run_deferred_reaction_check(payload, max(delay, 0.05)))
+        self._pending_reaction_checks[key] = task
+        task.add_done_callback(
+            lambda t, k=key: self._pending_reaction_checks.pop(k, None)
+            if self._pending_reaction_checks.get(k) is t else None
+        )
+
+    async def _run_deferred_reaction_check(self, payload: discord.RawReactionActionEvent, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            await self.process_reaction_change(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            print("Deferred skullboard reaction re-check failed", exc_info=True)
+
+    def cog_unload(self):
+        """Cancel pending deferred reaction checks."""
+        for task in list(self._pending_reaction_checks.values()):
+            task.cancel()
+        self._pending_reaction_checks.clear()
+
     async def process_reaction_change(self, payload:discord.RawReactionActionEvent):
         """
         Called for both add/remove via raw events. Decide whether to create/update/delete.
         Includes rate limit and error handling.
         """
-        # Add basic rate limiting per guild
+        # Basic rate limiting per guild - events inside the window are NOT
+        # dropped; they are rescheduled so no reaction event is ever lost.
         guild_id = payload.guild_id
         rate_key = f"rate_limit_{guild_id}"
         now = time.time()
         if hasattr(self, rate_key) and now - getattr(self, rate_key) < 1.0:  # 1 second cooldown per guild
+            self._defer_reaction_check(payload, 1.0 - (now - getattr(self, rate_key)))
             return
         setattr(self, rate_key, now)
         guild = self.bot.get_guild(payload.guild_id)

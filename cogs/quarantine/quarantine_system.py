@@ -1391,6 +1391,7 @@ class ImprovedMuteCog(commands.Cog):
             await ctx.send(embed=make_embed(docs[i:i+10]))
 
     @commands.command(name="clearmutes")
+    @commands.guild_only()
     @commands.has_permissions(administrator=True)
     async def clearmutes(self, ctx: commands.Context, days: Optional[int] = 30):
         # Validate days parameter
@@ -1401,7 +1402,13 @@ class ImprovedMuteCog(commands.Cog):
         
         cutoff = utc_now() - timedelta(days=days)
         try:
-            res = mutes_col.delete_many({"active": False, "muted_at": {"$lt": cutoff}})
+            # Scoped to THIS guild: without guild_id this command deleted
+            # inactive mute records from every server the bot is in.
+            res = mutes_col.delete_many({
+                "guild_id": ctx.guild.id,
+                "active": False,
+                "muted_at": {"$lt": cutoff},
+            })
         except PyMongoError as e:
             if self.logger:
                 self.logger.error(f"Failed to delete mute records: {e}")

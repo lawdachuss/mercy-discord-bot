@@ -224,20 +224,23 @@ class AFKChoiceView(discord.ui.View):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("This is not for you.", ephemeral=True)
             return
+        # set_afk_status does a Mongo write plus nickname edits across every
+        # guild - acknowledge first or the 3s interaction deadline is missed.
+        await interaction.response.defer()
         success = await self.afk_cog.set_afk_status(interaction.user.id, self.afk_reason, scope="global", server_id=None)
         if success:
             embed = discord.Embed(
                 description=f"<a:white_tick:1426439810733572136> | Successfully set your AFK status for reason: {self.afk_reason}",
                 color=random.randint(0, 0xFFFFFF)
             )
-            await interaction.response.send_message(embed=embed)
+            await interaction.followup.send(embed=embed)
             # Delete the original message with the buttons.
             try:
                 await interaction.message.delete()
             except discord.errors.NotFound:
                 pass  # Message already deleted
         else:
-            await interaction.response.send_message("Failed to set AFK status.", ephemeral=True)
+            await interaction.followup.send("Failed to set AFK status.", ephemeral=True)
         self.stop()
 
     @discord.ui.button(label="Server Only", style=discord.ButtonStyle.secondary)
@@ -249,20 +252,22 @@ class AFKChoiceView(discord.ui.View):
         if server_id is None:
             await interaction.response.send_message("Server information is not available.", ephemeral=True)
             return
+        # Same deadline as the Global button: defer before the DB/nick work.
+        await interaction.response.defer()
         success = await self.afk_cog.set_afk_status(interaction.user.id, self.afk_reason, scope="server", server_id=server_id)
         if success:
             embed = discord.Embed(
                 description=f"<a:white_tick:1426439810733572136> | Successfully set your AFK status for reason: {self.afk_reason}",
                 color=random.randint(0, 0xFFFFFF)
             )
-            await interaction.response.send_message(embed=embed)
+            await interaction.followup.send(embed=embed)
             # Delete the original message with the buttons.
             try:
                 await interaction.message.delete()
             except discord.errors.NotFound:
                 pass  # Message already deleted
         else:
-            await interaction.response.send_message("Failed to set AFK status.", ephemeral=True)
+            await interaction.followup.send("Failed to set AFK status.", ephemeral=True)
         self.stop()
 
 class AFK(commands.Cog):
@@ -287,6 +292,9 @@ class AFK(commands.Cog):
         self.tasks_started = False
         self._db_connected = False
         self._db_retry_task: Optional[asyncio.Task] = None
+        self._startup_cleanup_task: Optional[asyncio.Task] = None
+        # Throttles repeated "AFK status fetch failed" logs while Mongo is down.
+        self._last_db_error_log: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self.afk_prefix = "[AFK] "  # Prefix to add to nicknames when AFK
 
     async def init_db(self) -> bool:
@@ -359,8 +367,8 @@ class AFK(commands.Cog):
             self.clean_cache.start()
             self.cleanup_mentions.start()
             self.tasks_started = True
-            # Run nickname cleanup on startup
-            asyncio.create_task(self.cleanup_afk_nicknames_on_startup())
+            # Run nickname cleanup on startup (keep the reference so unload can cancel it)
+            self._startup_cleanup_task = asyncio.create_task(self.cleanup_afk_nicknames_on_startup())
 
     async def cleanup_afk_nicknames_on_startup(self):
         """Remove [AFK] prefix from members who are no longer AFK after bot restart."""
@@ -440,12 +448,18 @@ class AFK(commands.Cog):
             logger.error(f"Error in cleanup_mentions: {e}")
 
     async def get_afk_status(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Retrieve a user's AFK status, checking cache first."""
+        """Retrieve a user's AFK status, checking cache first.
+
+        Misses are cached too (until the normal expiry) so hot paths don't hit
+        MongoDB on every message, and database errors are log-throttled.
+        """
         try:
             if user_id in self._cache:
                 record = self._cache[user_id]
                 if datetime.now(timezone.utc) - record["timestamp"] <= self.cache_expiry_duration:
-                    return record
+                    if record.get("afk", True):
+                        return record
+                    return None
                 del self._cache[user_id]
 
             result = await self.afk_collection.find_one({"user_id": user_id})
@@ -462,13 +476,23 @@ class AFK(commands.Cog):
                 }
                 self._cache[user_id] = record
                 return record
+            # Negative cache: "not AFK" for the TTL, so every message in a busy
+            # server doesn't re-query the same miss.
+            self._cache[user_id] = {"afk": False, "timestamp": datetime.now(timezone.utc)}
             return None
         except Exception as e:
-            logger.error(f"Error fetching AFK status for {user_id}: {e}")
+            now = datetime.now(timezone.utc)
+            if now - self._last_db_error_log >= timedelta(seconds=60):
+                self._last_db_error_log = now
+                logger.error(f"Error fetching AFK status for {user_id}: {e}")
             return None
 
     async def set_afk_status(self, user_id: int, reason: str, scope: str = "global", server_id: Optional[int] = None) -> bool:
         """Set or update a user's AFK status with a scope (global or server)."""
+        # Nicknames edited before the DB write; if the write fails they must be
+        # rolled back or the [AFK] prefix stays forever with no status to
+        # trigger its removal. (member, nickname-before-edit)
+        edited_members: List[tuple] = []
         try:
             reason = discord.utils.escape_markdown(reason.strip())[:self.max_reason_length]
             now = datetime.now(timezone.utc)
@@ -488,8 +512,10 @@ class AFK(commands.Cog):
                             if bot_member.top_role > member.top_role:
                                 original_nick = member.display_name
                                 if not member.display_name.startswith(self.afk_prefix):
-                                    new_nick = f"{self.afk_prefix}{member.display_name}"[:32]
+                                    before = member.display_name
+                                    new_nick = f"{self.afk_prefix}{before}"[:32]
                                     await member.edit(nick=new_nick)
+                                    edited_members.append((member, before))
                             else:
                                 pass
                         else:
@@ -502,8 +528,10 @@ class AFK(commands.Cog):
                             if bot_member.top_role > member.top_role:
                                 original_nick = original_nick or member.display_name
                                 if not member.display_name.startswith(self.afk_prefix):
-                                    new_nick = f"{self.afk_prefix}{member.display_name}"[:32]
+                                    before = member.display_name
+                                    new_nick = f"{self.afk_prefix}{before}"[:32]
                                     await member.edit(nick=new_nick)
+                                    edited_members.append((member, before))
                             else:
                                 pass
             except discord.Forbidden as e:
@@ -538,6 +566,11 @@ class AFK(commands.Cog):
             return True
         except Exception as e:
             logger.error(f"Error setting AFK status for {user_id}: {e}")
+            for member, before in edited_members:
+                try:
+                    await member.edit(nick=before)
+                except Exception:
+                    pass
             return False
 
     async def remove_afk_status(self, user_id: int) -> bool:
@@ -616,7 +649,10 @@ class AFK(commands.Cog):
             return
 
         ctx = await self.bot.get_context(message)
-        if ctx.valid:
+        # Only the AFK command itself is exempted (its own flow must not
+        # trigger the AFK-return handling); other command messages still
+        # notify about and return AFK users like any normal message.
+        if ctx.valid and ctx.command is not None and ctx.command.qualified_name == "afk":
             return
 
         try:
@@ -625,6 +661,20 @@ class AFK(commands.Cog):
             await self._handle_afk_return(message)
         except Exception as e:
             logger.error(f"Error in on_message: {e}")
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        """Drop stale AFK status when someone leaves the server.
+
+        The member's own message is what normally triggers their AFK return,
+        so an orphaned status would otherwise never be cleaned up.
+        """
+        try:
+            if member.bot:
+                return
+            await self.remove_afk_status(member.id)
+        except Exception as e:
+            logger.error(f"Error clearing AFK status for departing member {member.id}: {e}")
 
     async def _handle_mentions(self, message: discord.Message):
         """Record a mention if the mentioned user is AFK."""
@@ -654,13 +704,26 @@ class AFK(commands.Cog):
     async def _handle_afk_return(self, message: discord.Message):
         """If a user who is AFK sends a message, remove their status and send a mention summary."""
         afk_status = await self.get_afk_status(message.author.id)
-        if afk_status:
-            if afk_status["scope"] == "server":
-                if not message.guild or message.guild.id != afk_status["server_id"]:
-                    return  # Do not remove AFK status if the message is not in the specified server
+        if not afk_status:
+            return
+        if afk_status["scope"] == "server":
+            if not message.guild or message.guild.id != afk_status["server_id"]:
+                return  # Do not remove AFK status if the message is not in the specified server
+        # Remove the status FIRST: if a notification below fails (e.g. the
+        # bot lost send perms), keeping the status would retry the same failing
+        # send on every future message and the user would stay AFK forever.
+        if not await self.remove_afk_status(message.author.id):
+            return  # a concurrent message already handled this return
+        try:
             await self._send_return_message(message, afk_status["timestamp"])
-            await self._send_mention_summary(message, afk_status["timestamp"], afk_status["scope"], afk_status.get("server_id"))
-            await self.remove_afk_status(message.author.id)
+        except Exception as e:
+            logger.warning(f"[AFK] Could not send return message for {message.author.id}: {e}")
+        try:
+            await self._send_mention_summary(
+                message, afk_status["timestamp"], afk_status["scope"], afk_status.get("server_id")
+            )
+        except Exception as e:
+            logger.warning(f"[AFK] Could not send mention summary for {message.author.id}: {e}")
 
     async def _record_mention(self, mentioned_user: discord.Member, message: discord.Message):
         """Record a mention of an AFK user in the database."""
@@ -669,7 +732,7 @@ class AFK(commands.Cog):
                 "user_id": mentioned_user.id,
                 "message_id": message.id,
                 "channel_id": message.channel.id,
-                "guild_id": message.guild.id,
+                "guild_id": message.guild.id if message.guild else None,
                 "mentioned_by": message.author.id,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "message_content": message.content[:200]
@@ -734,6 +797,8 @@ class AFK(commands.Cog):
             if self.tasks_started:
                 self.clean_cache.cancel()
                 self.cleanup_mentions.cancel()
+            if self._startup_cleanup_task is not None and not self._startup_cleanup_task.done():
+                self._startup_cleanup_task.cancel()
             if self.db_client is not None:
                 self.db_client.close()
         except Exception as e:

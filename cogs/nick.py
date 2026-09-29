@@ -16,7 +16,7 @@ nickname - which is all this cog manages.
 import logging
 import re
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import discord
 from discord import app_commands
@@ -76,6 +76,7 @@ class NickCog(commands.Cog):
 
         config = _default_config(guild_id)
         collection = self.collection
+        read_ok = collection is None
         if collection is not None:
             try:
                 doc = await collection.find_one({"guild_id": guild_id})
@@ -84,20 +85,41 @@ class NickCog(commands.Cog):
                     config.update(doc)
                     config["guild_id"] = guild_id
             except Exception as e:
+                # Do NOT cache a failed read: a transient Mongo error would
+                # otherwise pin "all defaults" for the whole TTL and a save
+                # right after could overwrite the real settings.
+                read_ok = False
                 logger.warning(f"[Nick] Could not read config for {guild_id}: {e}")
 
-        self._config_cache[guild_id] = (now, config)
+        if read_ok:
+            self._config_cache[guild_id] = (now, config)
         return config
 
-    async def save_config(self, config: Dict[str, Any]) -> bool:
+    async def save_config(self, config: Dict[str, Any],
+                          changed_keys: Optional[List[str]] = None) -> bool:
+        """Persist config.
+
+        When ``changed_keys`` is given only those fields are written with
+        ``$set`` - a stale or defaulted read can then never wipe the other
+        stored settings, and two admins saving concurrently cannot clobber
+        each other's changes. Without keys the full document is replaced
+        (kept for compatibility with any caller that means to rewrite all).
+        """
         collection = self.collection
         if collection is None:
             return False
         config["updated_at"] = discord.utils.utcnow().isoformat()
         try:
-            await collection.replace_one(
-                {"guild_id": config["guild_id"]}, config, upsert=True
-            )
+            if changed_keys:
+                update = {k: config[k] for k in dict.fromkeys([*changed_keys, "updated_at"])
+                          if k in config}
+                await collection.update_one(
+                    {"guild_id": config["guild_id"]}, {"$set": update}, upsert=True
+                )
+            else:
+                await collection.replace_one(
+                    {"guild_id": config["guild_id"]}, config, upsert=True
+                )
         except Exception as e:
             logger.error(f"[Nick] Could not save config for {config['guild_id']}: {e}")
             return False
@@ -176,7 +198,7 @@ class NickCog(commands.Cog):
 
         old_nick = target.display_name
         try:
-            await target.edit(
+            updated = await target.edit(
                 nick=nickname,
                 reason=f"Nickname changed by {invoker} ({invoker.id})",
             )
@@ -188,7 +210,9 @@ class NickCog(commands.Cog):
         except discord.HTTPException as e:
             raise NickError(f"Discord rejected the change: HTTP {e.status} - {e.text}")
 
-        new_nick = target.display_name
+        # Member.edit() returns a NEW Member and never mutates `target`, so the
+        # returned object is the only reliable source for the new display name.
+        new_nick = (updated or target).display_name
         reset = nickname is None
         embed = discord.Embed(
             title="✅ Nickname changed" if not reset else "🔁 Nickname reset",
@@ -250,26 +274,46 @@ class NickCog(commands.Cog):
     # ------------------------------------------------------------------
     async def _send(self, destination: Any, *, embed: Optional[discord.Embed] = None,
                     content: Optional[str] = None, ephemeral: bool = False) -> None:
-        """Send an embed, falling back to plain text if Embed Links is missing."""
+        """Send an embed, falling back to plain text if Embed Links is missing.
+
+        For interactions this is defer-aware: once a response has been issued
+        (e.g. via ``defer``) everything goes out through ``followup.send``, so
+        commands can do their Mongo/API work before acknowledging.
+        """
+        # Error text can contain role mentions - never let them ping.
+        mentions = discord.AllowedMentions(roles=False, users=True, everyone=False)
+
+        def _is_interaction() -> bool:
+            return isinstance(destination, discord.Interaction)
+
+        def _responded() -> bool:
+            return _is_interaction() and destination.response.is_done()
+
         if embed is not None:
             try:
-                if isinstance(destination, discord.Interaction):
+                if _responded():
+                    await destination.followup.send(embed=embed, ephemeral=ephemeral)
+                elif _is_interaction():
                     await destination.response.send_message(embed=embed, ephemeral=ephemeral)
                 else:
                     await destination.send(embed=embed)
                 return
             except discord.Forbidden:
-                content = f"{embed.title}\n{embed.description or ''}"
+                parts = [embed.title or "", embed.description or ""]
+                parts += [f"**{f.name}**: {f.value}" for f in embed.fields]
+                content = "\n".join(p for p in parts if p)
                 embed = None
             except Exception as e:
                 logger.warning(f"[Nick] Could not send embed: {e}")
                 return
 
         text = content or ""
-        if isinstance(destination, discord.Interaction):
-            await destination.response.send_message(text, ephemeral=ephemeral)
+        if _responded():
+            await destination.followup.send(text, ephemeral=ephemeral, allowed_mentions=mentions)
+        elif _is_interaction():
+            await destination.response.send_message(text, ephemeral=ephemeral, allowed_mentions=mentions)
         else:
-            await destination.send(text)
+            await destination.send(text, allowed_mentions=mentions)
 
     @staticmethod
     def usage_embed() -> discord.Embed:
@@ -376,7 +420,10 @@ class NickCog(commands.Cog):
 
         try:
             raw_id = self._split_target(text)
-            if raw_id is not None:
+            # ".nick 2026" (a bare number and nothing after it) is a nickname,
+            # not a member id. Numbers are only treated as member ids when the
+            # target + nickname form is used: ".nick <@id>/<id> <nickname>".
+            if raw_id is not None and not text.isdigit():
                 _, _, nickname = text.partition(" ")
                 target = await self._resolve_member(ctx.guild, raw_id)
                 if not nickname.strip():
@@ -435,6 +482,13 @@ class NickCog(commands.Cog):
             )
             return
 
+        # change_nickname does a Mongo config read (and possibly a log send)
+        # before we can reply - defer so the 3s interaction deadline cannot be
+        # missed. The final answer goes out as a followup via _send.
+        await interaction.response.defer(
+            ephemeral=(target.id == interaction.user.id)
+        )
+
         try:
             embed = await self.change_nickname(
                 interaction.guild, interaction.user, target, self._parse_nickname(nickname)
@@ -470,6 +524,7 @@ class NickCog(commands.Cog):
         target = target.strip()
         config = await self.get_config(ctx.guild.id)
         changed = False
+        changed_keys: List[str] = []
 
         try:
             if action in {"role", "setrole"}:
@@ -483,6 +538,7 @@ class NickCog(commands.Cog):
                         "That is `@everyone` - pick a real role so only its members can rename people."
                     )
                 config["nick_role_id"] = role.id
+                changed_keys.append("nick_role_id")
                 changed = True
 
             elif action in {"log", "channel", "logchannel"}:
@@ -496,6 +552,7 @@ class NickCog(commands.Cog):
                             "(or `.nicksetup log off` to disable)."
                         )
                     config["log_channel_id"] = channel.id
+                changed_keys.append("log_channel_id")
                 changed = True
 
             elif action in {"clear", "unset"}:
@@ -504,8 +561,10 @@ class NickCog(commands.Cog):
                     raise NickError("Usage: `.nicksetup clear <role|log|all>`")
                 if what in {"role", "all"}:
                     config["nick_role_id"] = None
+                    changed_keys.append("nick_role_id")
                 if what in {"log", "channel", "logchannel", "all"}:
                     config["log_channel_id"] = None
+                    changed_keys.append("log_channel_id")
                 changed = True
 
             elif action in {"show", "view", "config", "help"}:
@@ -516,7 +575,7 @@ class NickCog(commands.Cog):
                     "[clear <role|log|all>] [show]`"
                 )
 
-            if changed and not await self.save_config(config):
+            if changed and not await self.save_config(config, changed_keys):
                 raise NickError(
                     "I could not save that to the database (MongoDB is unavailable)."
                 )
@@ -594,37 +653,61 @@ class NickCog(commands.Cog):
             )
             return
 
+        # Mongo read/write happen before the reply - defer first so the 3s
+        # interaction deadline cannot be missed; responses go via followup.
+        await interaction.response.defer(ephemeral=True)
+
         config = await self.get_config(interaction.guild.id)
         changed = False
+        changed_keys: List[str] = []
 
         if action in {"clear_role", "clear_all"}:
             config["nick_role_id"] = None
+            changed_keys.append("nick_role_id")
             changed = True
         if action in {"clear_log", "clear_all"}:
             config["log_channel_id"] = None
+            changed_keys.append("log_channel_id")
             changed = True
 
         if role is not None:
             if role.is_default():
-                await interaction.response.send_message(
-                    "❌ That is `@everyone` - pick a real role so only its members can rename people.",
+                await self._send(
+                    interaction,
+                    content="❌ That is `@everyone` - pick a real role so only its members can rename people.",
                     ephemeral=True,
                 )
                 return
             config["nick_role_id"] = role.id
+            changed_keys.append("nick_role_id")
             changed = True
         if log_channel is not None:
             config["log_channel_id"] = log_channel.id
+            changed_keys.append("log_channel_id")
             changed = True
 
-        if changed and not await self.save_config(config):
-            await interaction.response.send_message(
-                "❌ I could not save that to the database (MongoDB is unavailable).",
+        if changed and not await self.save_config(config, changed_keys):
+            await self._send(
+                interaction,
+                content="❌ I could not save that to the database (MongoDB is unavailable).",
                 ephemeral=True,
             )
             return
 
         await self._send(interaction, embed=self.config_embed(interaction.guild, config))
+
+    # ------------------------------------------------------------------
+    # Local error handlers - guild_only raises NoPrivateMessage in DMs, which
+    # the global handler ignores silently, leaving the user with no reply.
+    # ------------------------------------------------------------------
+    @nick_prefix.error
+    @nicksetup_prefix.error
+    async def _nick_prefix_error(self, ctx: commands.Context, error: commands.CommandError):
+        if isinstance(error, commands.NoPrivateMessage):
+            try:
+                await ctx.send("❌ Nickname commands only work in a server.")
+            except discord.HTTPException:
+                pass
 
 
 async def setup(bot: commands.Bot) -> None:

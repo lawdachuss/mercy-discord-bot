@@ -13,7 +13,7 @@ import time
 import unicodedata
 import json
 from typing import Optional, Dict, Any, List, Set, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 import uuid
@@ -26,6 +26,14 @@ from pymongo.errors import ConnectionFailure, OperationFailure
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+class ConfigUnavailableError(RuntimeError):
+    """Raised when the guild config could not be read.
+
+    Callers must NOT treat this as 'no config exists' - doing so leads to
+    saving a freshly-built default document and wiping every stored rule.
+    """
 
 
 class ConflictResolution(Enum):
@@ -1163,10 +1171,17 @@ class ChangeLogChannelModal(discord.ui.Modal, title='Change Log Channel'):
                 )
                 return
             
-            self.config.log_channel_id = log_channel_id
-            self.config.updated_at = datetime.utcnow()
+            # Re-read the config before writing: `self.config` is the copy the
+            # panel was built from and may be stale (rules added/removed via
+            # other panels in the meantime). Writing it back would clobber them.
+            fresh = await self.cog.get_config(interaction.guild.id)
+            if fresh is None:
+                # Nothing newer exists - fall back to the panel's copy.
+                fresh = self.config
+            fresh.log_channel_id = log_channel_id
+            fresh.updated_at = datetime.utcnow()
             
-            success = await self.cog.save_config(self.config)
+            success = await self.cog.save_config(fresh)
             if not success:
                 await interaction.followup.send("❌ Failed to save configuration!", ephemeral=True)
                 return
@@ -1174,7 +1189,7 @@ class ChangeLogChannelModal(discord.ui.Modal, title='Change Log Channel'):
             # Send a real embed to the new channel so the admin sees immediately
             # whether logging works, instead of it failing silently later.
             verify_ok, verify_error = True, ""
-            first_rule = self.config.rules[0] if self.config.rules else None
+            first_rule = fresh.rules[0] if fresh.rules else None
             first_role = interaction.guild.get_role(first_rule.target_role_id) if first_rule else None
             if first_rule and first_role:
                 verify_ok, verify_error = await self.cog.send_verification_embed(
@@ -1346,6 +1361,7 @@ class StatusRoleCog(commands.Cog):
         self.mongo_client: Optional[AsyncIOMotorClient] = None
         self.database = None
         self.collection = None
+        self.analytics_col = None
         self._ready = False
         self._cache: Dict[Tuple[int, int], str] = {}  # (guild_id, user_id) -> status_hash for debouncing
         self._cache_timestamps: Dict[Tuple[int, int], float] = {}  # (guild_id, user_id) -> timestamp
@@ -1508,9 +1524,13 @@ class StatusRoleCog(commands.Cog):
             
             self.database = self.mongo_client.poison_bot
             self.collection = self.database.status_vanity_roles
+            self.analytics_col = self.database.status_vanity_analytics
             
             # Create index
             await self.collection.create_index("guild_id", unique=True)
+            # Analytics: windowed aggregation per guild + TTL cleanup after 90 days.
+            await self.analytics_col.create_index([("guild_id", 1), ("ts", -1)])
+            await self.analytics_col.create_index("ts", expireAfterSeconds=90 * 86400)
             
             self._ready = True
             logger.info("StatusRoleCog setup completed successfully")
@@ -1558,7 +1578,10 @@ class StatusRoleCog(commands.Cog):
             return None
         except Exception as e:
             logger.error(f"Error getting config: {e}")
-            return None
+            # Never return None here: callers interpret None as "guild has no
+            # config yet" and would replace_one(upsert) a default document,
+            # permanently deleting every stored rule on a transient read error.
+            raise ConfigUnavailableError(f"Could not read guild config: {e}") from e
 
     @tasks.loop(hours=1)
     async def periodic_maintenance(self):
@@ -1689,6 +1712,14 @@ class StatusRoleCog(commands.Cog):
                             try:
                                 await member.add_roles(target_role, reason="Bulk scan - Status match")
                                 updated += 1
+                                matched_rule = next(
+                                    (r for r in enabled_rules if r.target_role_id == role_id), None
+                                )
+                                if matched_rule:
+                                    await self.record_role_match(
+                                        guild.id, matched_rule.rule_id,
+                                        matched_rule.trigger_pattern, member.id,
+                                    )
                             except discord.Forbidden:
                                 logger.warning(f"No permission to add role {target_role.name} to {member.display_name}")
                             except Exception as e:
@@ -1714,15 +1745,83 @@ class StatusRoleCog(commands.Cog):
             logger.error(f"Error during bulk scan: {e}")
             return processed, updated
 
-    async def get_analytics_summary(self, guild_id: int) -> List[AnalyticsData]:
-        """Get analytics summary for a guild."""
-        # This is a placeholder implementation since the full analytics system
-        # would require additional database collections and complex tracking
-        # For now, return empty list to prevent errors
+    async def record_role_match(self, guild_id: int, rule_id: str, pattern: str, user_id: int) -> None:
+        """Record one successful rule match for the analytics dashboard (best effort).
+
+        Analytics must never affect the role-assignment path, so every failure
+        is swallowed after a debug log.
+        """
+        if not self._ready or self.analytics_col is None:
+            return
         try:
-            # In a full implementation, this would query analytics data from the database
-            # and return actual usage statistics
+            await self.analytics_col.insert_one({
+                "guild_id": guild_id,
+                "rule_id": rule_id,
+                "pattern": pattern,
+                "user_id": user_id,
+                "event": "grant",
+                "ts": datetime.now(timezone.utc),
+            })
+        except Exception as e:
+            logger.debug(f"Analytics record failed for guild {guild_id}: {e}")
+
+    async def get_analytics_summary(self, guild_id: int) -> List[AnalyticsData]:
+        """Aggregate recent rule-match events for the analytics dashboard."""
+        if not self._ready or self.analytics_col is None:
             return []
+        try:
+            now = datetime.now(timezone.utc)
+            day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            week_start = now - timedelta(days=7)
+            month_start = now - timedelta(days=30)
+
+            async def window_summary(start: datetime) -> Dict[str, Dict[str, Any]]:
+                cursor = self.analytics_col.aggregate([
+                    {"$match": {"guild_id": guild_id, "event": "grant", "ts": {"$gte": start}}},
+                    {"$group": {
+                        "_id": "$rule_id",
+                        "count": {"$sum": 1},
+                        "users": {"$addToSet": "$user_id"},
+                        "last": {"$max": "$ts"},
+                    }},
+                ])
+                rows = await cursor.to_list(length=None)
+                return {r["_id"]: r for r in rows}
+
+            today = await window_summary(day_start)
+            week = await window_summary(week_start)
+            month = await window_summary(month_start)
+            if not month:
+                return []
+
+            # Human-readable patterns come from the live rule config.
+            patterns: Dict[str, str] = {}
+            try:
+                config = await self.get_config(guild_id)
+                if config:
+                    patterns = {r.rule_id: r.trigger_pattern for r in config.rules}
+            except ConfigUnavailableError:
+                pass
+
+            summary: List[AnalyticsData] = []
+            for rule_id, m in month.items():
+                d = today.get(rule_id)
+                w = week.get(rule_id)
+                summary.append(AnalyticsData(
+                    guild_id=guild_id,
+                    rule_id=rule_id,
+                    pattern=patterns.get(rule_id, rule_id),
+                    matches_today=d["count"] if d else 0,
+                    matches_week=w["count"] if w else 0,
+                    matches_month=m["count"],
+                    unique_users_today=set(d["users"]) if d else set(),
+                    unique_users_week=set(w["users"]) if w else set(),
+                    unique_users_month=set(m["users"]),
+                    last_match=m["last"],
+                    created_at=now,
+                    updated_at=now,
+                ))
+            return summary
         except Exception as e:
             logger.error(f"Error getting analytics summary: {e}")
             return []
@@ -1876,6 +1975,14 @@ class StatusRoleCog(commands.Cog):
                         # Logged *outside* the role try-block so a logging failure can
                         # never be misreported as "no permission to add role".
                         await self.log_role_change(after, target_role, custom_status, config.log_channel_id, True)
+                        matched_rule = next(
+                            (r for r in enabled_rules if r.target_role_id == role_id), None
+                        )
+                        if matched_rule:
+                            await self.record_role_match(
+                                after.guild.id, matched_rule.rule_id,
+                                matched_rule.trigger_pattern, after.id,
+                            )
 
                 elif not should_have_role and has_role:
                     try:

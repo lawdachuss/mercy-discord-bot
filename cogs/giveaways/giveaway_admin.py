@@ -41,6 +41,19 @@ class GiveawayAdminCog(commands.Cog):
         for task in self.active_fake_reaction_tasks.values():
             task.cancel()
 
+    @staticmethod
+    def _giveaway_filter(interaction: discord.Interaction, message_id: str, active_only: bool = True) -> Dict:
+        """Giveaway query filter scoped to the interaction's guild.
+
+        Falls back to a global message_id lookup when invoked from a DM.
+        """
+        flt: Dict = {"message_id": message_id}
+        if active_only:
+            flt["status"] = "active"
+        if interaction.guild:
+            flt["guild_id"] = interaction.guild.id
+        return flt
+
     @tasks.loop(minutes=1)
     async def process_fake_reactions(self) -> None:
         """Process and resume any active fake reaction plans."""
@@ -100,7 +113,7 @@ class GiveawayAdminCog(commands.Cog):
                 end_time = plan["end_time"]
                 if remaining > 0 and end_time > get_current_utc_timestamp():
                     task = asyncio.create_task(
-                        self.add_fake_reactions(mid, members, plan["total_reactions"], end_time)
+                        self.add_fake_reactions(mid, members, remaining, end_time)
                     )
                     self.active_fake_reaction_tasks[mid] = task
 
@@ -152,10 +165,9 @@ class GiveawayAdminCog(commands.Cog):
                     "Giveaway system not available.", ephemeral=True
                 )
 
-            gw = await giveaway_cog.db.giveaways.find_one({
-                "message_id": message_id,
-                "status": "active"
-            })
+            gw = await giveaway_cog.db.giveaways.find_one(
+                self._giveaway_filter(interaction, message_id)
+            )
             if not gw:
                 return await interaction.followup.send(
                     "Not an active giveaway.", ephemeral=True
@@ -421,10 +433,9 @@ class GiveawayAdminCog(commands.Cog):
                     "Please mention users or provide valid IDs.", ephemeral=True
                 )
 
-            gw = await giveaway_cog.db.giveaways.find_one({
-                "message_id": message_id,
-                "status": "active"
-            })
+            gw = await giveaway_cog.db.giveaways.find_one(
+                self._giveaway_filter(interaction, message_id)
+            )
             if not gw:
                 return await interaction.followup.send(
                     "Not an active giveaway.", ephemeral=True
@@ -532,10 +543,9 @@ class GiveawayAdminCog(commands.Cog):
                     "Giveaway system not available.", ephemeral=True
                 )
 
-            gw = await giveaway_cog.db.giveaways.find_one({
-                "message_id": message_id,
-                "status": "active"
-            })
+            gw = await giveaway_cog.db.giveaways.find_one(
+                self._giveaway_filter(interaction, message_id)
+            )
             if not gw:
                 return await interaction.followup.send(
                     "Not an active giveaway.", ephemeral=True
@@ -656,10 +666,9 @@ class GiveawayAdminCog(commands.Cog):
                     "Giveaway system not available.", ephemeral=True
                 )
 
-            gw = await giveaway_cog.db.giveaways.find_one({
-                "message_id": message_id,
-                "status": "active"
-            })
+            gw = await giveaway_cog.db.giveaways.find_one(
+                self._giveaway_filter(interaction, message_id)
+            )
             if not gw:
                 return await interaction.followup.send(
                     "Not an active giveaway.", ephemeral=True

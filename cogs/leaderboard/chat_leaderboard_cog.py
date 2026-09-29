@@ -336,9 +336,11 @@ class ChatLeaderboardCog(commands.Cog):
                 except Exception as e:
                     self.logger.warning(f"Could not delete tracked msg {msg_id} from {channel.name}: {e}")
         
-        # Step 2: Try to purge all remaining messages (needs manage_messages)
+        # Step 2: Try to purge remaining BOT messages (needs manage_messages).
+        # The check is essential: without it purge() deletes up to 200 arbitrary
+        # user messages from this channel on every restart.
         try:
-            deleted = await channel.purge(limit=200)
+            deleted = await channel.purge(limit=200, check=lambda m: m.author == self.bot.user)
             if deleted:
                 self.logger.info(f"Purged {len(deleted)} messages from {channel.name}")
         except discord.Forbidden as e:

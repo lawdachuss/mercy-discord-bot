@@ -43,6 +43,7 @@ class StickyMessages(commands.Cog):
         self._auto_refresh_task = None
         self._memory_cleanup_task = None
         self._tasks_started = False
+        self._init_task: Optional[asyncio.Task] = None
         
         # Configuration
         self.repost_cooldown = 2.5  # seconds between reposts in same channel
@@ -54,12 +55,29 @@ class StickyMessages(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         """Initialize background tasks when bot is ready."""
+        await self._init_when_ready()
+
+    async def cog_load(self):
+        """Kick off initialization on load.
+
+        on_ready only fires on (re)connect, not when this cog is reloaded
+        while the bot stays connected, so start the same guarded init here.
+        """
+        if self._init_task is None or self._init_task.done():
+            self._init_task = asyncio.create_task(self._init_when_ready())
+
+    async def _init_when_ready(self):
+        """Restore state and start background tasks exactly once."""
         if self._tasks_started:
             log.debug("Sticky tasks already started, skipping")
             return
             
         self._tasks_started = True
         log.info("Initializing sticky background tasks...")
+
+        # cog_load may run before the bot has connected
+        if not self.bot.is_ready():
+            await self.bot.wait_until_ready()
         
         # Wait a moment for bot to fully initialize
         await asyncio.sleep(2)
@@ -88,6 +106,9 @@ class StickyMessages(commands.Cog):
     def cog_unload(self):
         """Clean shutdown of all background tasks."""
         log.info("Shutting down sticky system...")
+        
+        if self._init_task is not None and not self._init_task.done():
+            self._init_task.cancel()
         
         tasks_to_cancel = [
             ('cleanup', self._cleanup_task),

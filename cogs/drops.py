@@ -9,6 +9,7 @@ from discord.ext import commands
 from discord import app_commands, ui
 from datetime import datetime, timezone, timedelta
 from collections import deque, Counter
+from uuid import uuid4
 import pytz
 
 # ─── UTILITY FUNCTIONS ─────────────────────────────────────────────────────────
@@ -136,15 +137,35 @@ class DropButton(ui.View):
 
 # ─── COG ───────────────────────────────────────────────────────────────────────
 class DropSystem(commands.Cog):
+    # Collection handles are properties so they always bind to the bot's
+    # CURRENT Mongo client. main.py swaps in a new client after a reconnect
+    # (which closes the old one); statically-bound handles would keep pointing
+    # at the closed client and every operation would fail until a manual reload.
+    @property
+    def _mongo_db(self):
+        client = getattr(self.bot, 'mongo_client', None)
+        if client is None:
+            raise RuntimeError("MongoDB is not connected")
+        return client['discord_bot']
+
+    @property
+    def drops_col(self):
+        return self._mongo_db['drops']
+
+    @property
+    def cooldowns_col(self):
+        return self._mongo_db['drop_cooldowns']
+
+    @property
+    def claim_logs_col(self):
+        return self._mongo_db['drop_claim_logs']
+
     def __init__(self, bot):
         self.bot = bot
-        self.drops_col = self.bot.mongo_client['discord_bot']['drops']
-        self.cooldowns_col = self.bot.mongo_client['discord_bot']['drop_cooldowns']
-        self.claim_logs_col = self.bot.mongo_client['discord_bot']['drop_claim_logs']
         self.recent_claims = deque(maxlen=500)
         self.claim_locks = {}
         self.lock = asyncio.Lock()
-        self.bot.loop.create_task(self._restore_views())
+        self._restore_task = self.bot.loop.create_task(self._restore_views())
 
     async def _restore_views(self):
         """Restore persistent views after bot restart"""
@@ -159,12 +180,14 @@ class DropSystem(commands.Cog):
             logger.exception(f"Error restoring views: {e}")
 
     @app_commands.command(name='drop', description='Create a new drop (Admin only)')
+    @app_commands.guild_only()
     async def drop(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             return await interaction.response.send_message("Admin only.", ephemeral=True)
         await interaction.response.send_modal(DropModal())
 
     @app_commands.command(name='reset_cooldown', description='Reset cooldown for a user or entire server (Admin only)')
+    @app_commands.guild_only()
     @app_commands.describe(
         user='User to reset cooldown for (leave empty to reset entire server)',
         reset_server='Reset entire server cooldown'
@@ -205,7 +228,11 @@ class DropSystem(commands.Cog):
     async def create_drop(self, interaction: discord.Interaction, prize_name: str, 
                          winner_count: int, custom_emoji: Optional[str], footer_text: Optional[str]):
         """Create a new drop"""
-        drop_id = f"{interaction.guild.id}_{interaction.channel.id}_{int(discord.utils.utcnow().timestamp())}"
+        # Second-granularity ids collided when two drops were created in the
+        # same channel within the same second (DuplicateKeyError AFTER the
+        # public message was already posted, so its Claim button pointed at
+        # the wrong drop). The uuid suffix makes the id unique.
+        drop_id = f"{interaction.guild.id}_{interaction.channel.id}_{int(discord.utils.utcnow().timestamp())}_{uuid4().hex[:8]}"
         now = discord.utils.utcnow()
 
         try:
@@ -248,6 +275,14 @@ class DropSystem(commands.Cog):
 
         except Exception as e:
             logger.exception(f"Error creating drop {drop_id}: {e}")
+            # The public message may already be posted; without its DB row the
+            # Claim button would resolve nothing, so remove it rather than
+            # leaving a dead button behind.
+            if 'msg' in locals():
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
             try:
                 await interaction.followup.send("Failed to create drop.", ephemeral=True)
             except:
@@ -500,6 +535,9 @@ class DropSystem(commands.Cog):
     def cog_unload(self):
         """Clean up when cog is unloaded"""
         self.claim_locks.clear()
+        task = getattr(self, '_restore_task', None)
+        if task is not None and not task.done():
+            task.cancel()
 
 # ─── SETUP ─────────────────────────────────────────────────────────────────────
 async def setup(bot):

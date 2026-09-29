@@ -37,6 +37,27 @@ dragme_db = client['dragmebot']
 skull_db = client['skullboard_db']
 role_db = client['role_manager']
 
+def replace_collection(mongo_db, collection_name, docs):
+    """Swap `docs` into `collection_name` without ever leaving it half-empty.
+
+    Stages everything in a temporary collection first and only drops the
+    target once the full insert has succeeded, so a migration failure can
+    never destroy the existing configuration.
+    """
+    tmp_name = f"{collection_name}__migrating_tmp"
+    tmp = mongo_db[tmp_name]
+    tmp.drop()
+    tmp.insert_many(docs, ordered=False)
+    target = mongo_db[collection_name]
+    target.drop()
+    try:
+        tmp.rename(collection_name, dropTarget=True)
+    except Exception:
+        # Target is gone but the staged data is intact in the temp
+        # collection; surface it loudly so it can be recovered/retried.
+        print(f"  [RECOVER] Data staged in {mongo_db.name}.{tmp_name} - re-run migration to finish the swap")
+        raise
+
 def migrate_sqlite(db_path, mongo_db, collection_name, table_name=None):
     if not os.path.exists(db_path):
         print(f"  [SKIP] {db_path} not found")
@@ -59,10 +80,9 @@ def migrate_sqlite(db_path, mongo_db, collection_name, table_name=None):
                 rows = [dict(row) for row in cursor.fetchall()]
                 if rows:
                     collection = mongo_db[collection_name or table]
-                    collection.delete_many({})
-                    result = collection.insert_many(rows)
-                    total += len(result.inserted_ids)
-                    print(f"  Migrated {len(result.inserted_ids)} rows -> {mongo_db.name}.{collection.name}")
+                    replace_collection(mongo_db, collection_name or table, rows)
+                    total += len(rows)
+                    print(f"  Migrated {len(rows)} rows -> {mongo_db.name}.{collection.name}")
                 else:
                     print(f"  [EMPTY] Table '{table}' has no data")
             except sqlite3.OperationalError as e:
@@ -90,20 +110,17 @@ def migrate_json(json_path, mongo_db, collection_name):
         if isinstance(data, dict):
             docs = [{"key": k, "value": v} for k, v in data.items()]
             collection = mongo_db[collection_name]
-            collection.delete_many({})
-            result = collection.insert_many(docs)
-            print(f"  Migrated {len(result.inserted_ids)} keys -> {mongo_db.name}.{collection.name}")
-            return len(result.inserted_ids)
+            replace_collection(mongo_db, collection_name, docs)
+            print(f"  Migrated {len(docs)} keys -> {mongo_db.name}.{collection.name}")
+            return len(docs)
         elif isinstance(data, list):
             collection = mongo_db[collection_name]
-            collection.delete_many({})
-            result = collection.insert_many(data)
-            print(f"  Migrated {len(result.inserted_ids)} docs -> {mongo_db.name}.{collection.name}")
-            return len(result.inserted_ids)
+            replace_collection(mongo_db, collection_name, data)
+            print(f"  Migrated {len(data)} docs -> {mongo_db.name}.{collection.name}")
+            return len(data)
         else:
             collection = mongo_db[collection_name]
-            collection.delete_many({})
-            collection.insert_one({"data": data})
+            replace_collection(mongo_db, collection_name, [{"data": data}])
             print(f"  Migrated 1 doc -> {mongo_db.name}.{collection.name}")
             return 1
     except Exception as e:
