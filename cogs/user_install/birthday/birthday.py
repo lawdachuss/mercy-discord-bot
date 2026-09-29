@@ -52,6 +52,7 @@ class DaySelectView(discord.ui.View):
         self.selected_month = month
         self.selected_day = None
         self.selected_year = None
+        self.message = None
         
         # Add day select menus (split into 2 groups due to 25 option limit)
         self.add_item(DaySelect1())
@@ -74,7 +75,7 @@ class DaySelectView(discord.ui.View):
                 )
             return
         
-        year_view = discord.ui.View(timeout=300)  # 5 minutes
+        year_view = YearSelectView()
         
         current_year = datetime.now(DEFAULT_TZ).year
         # Show recent years as buttons
@@ -89,6 +90,7 @@ class DaySelectView(discord.ui.View):
         year_view.add_item(YearButton("Skip (no year)", None))
         
         # Store references
+        year_view.message = self.message
         year_view.selected_month = self.selected_month
         year_view.selected_day = self.selected_day
         year_view.save_birthday = self.save_birthday
@@ -114,8 +116,12 @@ class DaySelectView(discord.ui.View):
                 view=year_view,
                 ephemeral=True
             )
+            
+        # The year view replaced this view on the message, so stop this view:
+        # otherwise its timeout fires later and clears the year view.
+        self.stop()
     
-    async def save_birthday(self, interaction: discord.Interaction):
+    async def save_birthday(self, interaction: discord.Interaction, year: Optional[int] = None):
         # Defer to prevent timeout on slow DB operations
         try:
             await interaction.response.defer(ephemeral=True)
@@ -124,7 +130,6 @@ class DaySelectView(discord.ui.View):
         
         month = self.selected_month
         day = self.selected_day
-        year = self.selected_year
         
         # Validate
         error = self.cog._validate_date(month, day, year)
@@ -198,6 +203,11 @@ class DaySelectView(discord.ui.View):
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except (discord.NotFound, discord.HTTPException):
+                pass
     
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.error(f"DaySelectView error: {error}")
@@ -267,13 +277,26 @@ class YearButton(discord.ui.Button):
     
     async def callback(self, interaction: discord.Interaction):
         try:
-            self.view.selected_year = self.year_value
-            await self.view.save_birthday(interaction)
+            await self.view.save_birthday(interaction, self.year_value)
         except Exception as e:
             logger.error(f"Error in YearButton callback: {e}")
             try:
                 await interaction.response.send_message("❌ An error occurred. Please try again.", ephemeral=True)
             except:
+                pass
+
+
+class YearSelectView(discord.ui.View):
+    """Year selection view that clears the message when it times out."""
+    def __init__(self):
+        super().__init__(timeout=300)  # 5 minutes
+        self.message = None
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except (discord.NotFound, discord.HTTPException):
                 pass
 
 
@@ -285,11 +308,13 @@ class MonthSelectView(discord.ui.View):
         self.selected_month = None
         self.selected_day = None
         self.selected_year = None
+        self.message = None
         
         self.add_item(MonthSelect())
     
     async def show_day_selection(self, interaction: discord.Interaction):
         day_view = DaySelectView(self.cog, self.friend, self.selected_month)
+        day_view.message = self.message
         
         month_name = calendar.month_name[self.selected_month]
         try:
@@ -303,10 +328,19 @@ class MonthSelectView(discord.ui.View):
                 view=day_view,
                 ephemeral=True
             )
+            
+        # The day view replaced this view on the message, so stop this view:
+        # otherwise its timeout fires later and clears the day view.
+        self.stop()
     
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except (discord.NotFound, discord.HTTPException):
+                pass
     
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.error(f"View error: {error}")
@@ -412,7 +446,13 @@ class BirthdayUserInstall(Cog):
             return False
         return True
 
+    # NOTE: discord.py only serializes allowed_installs/allowed_contexts for
+    # top-level commands (Group.to_dict skips it when parent is not None), so
+    # these must be declared on the group itself — the subcommand declarations
+    # below are ignored during sync.
     birthday_group = app_commands.Group(name="birthday", description="Manage friends' birthdays")
+    birthday_group = app_commands.allowed_installs(users=True)(birthday_group)
+    birthday_group = app_commands.allowed_contexts(dms=True, private_channels=True, guilds=True)(birthday_group)
 
     @birthday_group.command(name="set", description="Set a friend's birthday")
     @app_commands.describe(friend="The friend whose birthday to save")
@@ -447,6 +487,7 @@ class BirthdayUserInstall(Cog):
             view=view,
             ephemeral=True
         )
+        view.message = await interaction.original_response()
 
     @birthday_group.command(name="view", description="View saved birthdays")
     @app_commands.allowed_installs(users=True)
@@ -668,7 +709,7 @@ class BirthdayUserInstall(Cog):
                                 bday_this_year = self._make_birthday_date(now.year, month, day, tz)
                             except ValueError:
                                 bday_this_year = datetime(now.year, 2, 28, tzinfo=tz)
-                            if today <= bday_this_year:
+                            if today < bday_this_year:
                                 age -= 1
                             if age >= 0:
                                 age_str = f" They're turning **{age}**! 🎈"

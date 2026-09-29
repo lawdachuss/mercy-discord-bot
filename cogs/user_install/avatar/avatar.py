@@ -69,7 +69,7 @@ class AvatarUserInstall(Cog):
             # Show banner if available
             if banner_url:
                 view = BannerView(target_user, banner_url)
-                await interaction.followup.send(embed=avatar_embed, view=view)
+                view.message = await interaction.followup.send(embed=avatar_embed, view=view)
             else:
                 avatar_embed.set_footer(text="No banner available.")
                 await interaction.followup.send(embed=avatar_embed)
@@ -152,7 +152,7 @@ class AvatarUserInstall(Cog):
             except asyncio.TimeoutError:
                 logging.warning(f"Timeout fetching banner for user {user.id}")
                 banner_url = ""
-                self._cache_data(user.id, "banner", banner_url, current_time)
+                # Transient failure: return without caching so we retry later.
             except discord.NotFound:
                 logging.warning(f"User {user.id} not found when fetching banner")
                 banner_url = ""
@@ -160,7 +160,7 @@ class AvatarUserInstall(Cog):
             except Exception as e:
                 logging.error(f"Error fetching banner for {user} ({user.id}): {e}")
                 banner_url = ""
-                self._cache_data(user.id, "banner", banner_url, current_time)
+                # Transient failure: return without caching so we retry later.
 
         # Return None instead of empty string for banner_url
         return avatar_url, banner_url if banner_url else None
@@ -219,6 +219,7 @@ class BannerView(discord.ui.View):
         super().__init__(timeout=180)
         self.user = user
         self.banner_url = banner_url
+        self.message = None
 
     @discord.ui.button(label="Show Banner", style=discord.ButtonStyle.secondary)
     async def show_banner(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -276,6 +277,14 @@ class BannerView(discord.ui.View):
                         ephemeral=True
                     )
             except:
+                pass
+
+    async def on_timeout(self):
+        # Remove the "Show Banner" button once the view expires.
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except (discord.NotFound, discord.HTTPException):
                 pass
 
 

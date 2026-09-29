@@ -378,6 +378,10 @@ class RematchButton(discord.ui.Button):
             embed = build_turn_embed(new_view),
             view  = new_view,
         )
+        # The new view now owns this message: stop the finished game's view so
+        # its timeout task is cancelled and can never edit the message again
+        # (which would clobber the live rematch board).
+        view.stop()
         new_view.message = await interaction.original_response()
 
 
@@ -676,10 +680,16 @@ class TicTacToeUserInstall(Cog):
         active_challenges[key] = True
         view = ChallengeView(interaction.user.id, opponent.id)
 
-        await interaction.response.send_message(
-            embed = build_challenge_embed(interaction.user.id, opponent.id),
-            view  = view,
-        )
+        try:
+            await interaction.response.send_message(
+                embed = build_challenge_embed(interaction.user.id, opponent.id),
+                view  = view,
+            )
+        except Exception:
+            # The view was never stored, so its timeout can't clear this key —
+            # release it or the pair stays permanently blocked.
+            active_challenges.pop(key, None)
+            raise
         view.message = await interaction.original_response()
 
 
