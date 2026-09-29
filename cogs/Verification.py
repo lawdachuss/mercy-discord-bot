@@ -108,6 +108,10 @@ class VerificationTicketSystem(commands.Cog):
         
         guild_id = interaction.guild.id
         
+        # Acknowledge immediately: the Mongo writes and the channel send below
+        # can exceed the 3-second interaction deadline.
+        await interaction.response.defer(ephemeral=True)
+        
         # Save configuration
         await self.set_server_config(guild_id, 'embed_channel_id', embed_channel.id)
         await self.set_server_config(guild_id, 'ticket_category_id', ticket_category.id)
@@ -177,8 +181,8 @@ class VerificationTicketSystem(commands.Cog):
             # Send without attachment if file doesn't exist
             await embed_channel.send(embeds=[banner_embed, main_embed], view=view)
         
-        # Confirmation message
-        await interaction.response.send_message(
+        # Confirmation message (interaction already deferred above)
+        await interaction.followup.send(
             f"<a:sukoon_whitetick:1323992464058482729> **Verification System Setup Complete!**\n\n"
             f"<:sukoon_hom:1333443376946745493> **Embed Channel:** {embed_channel.mention}\n"
             f"<:GlacierTicketSupportEmojiForBo:1424440770232057906> **Ticket Category:** {ticket_category.mention}\n"
@@ -253,6 +257,10 @@ class VerifyButton(discord.ui.View):
         # Get staff role
         staff_role_id = config.get('staff_role_id')
         staff_role = guild.get_role(staff_role_id) if staff_role_id else None
+        
+        # Cheap validations above are done - acknowledge before the channel
+        # creation / message sends below, which can exceed the 3s deadline.
+        await interaction.response.defer(ephemeral=True)
         
         try:
             # Copy category overwrites to inherit permissions
@@ -354,21 +362,23 @@ class VerifyButton(discord.ui.View):
                 )
                 await log_channel.send(embed=opened_log_embed)
             
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"<a:sukoon_whitetick:1323992464058482729> Verification ticket created! Go to {ticket_channel.mention}",
                 ephemeral=True
             )
             
         except discord.Forbidden:
-            await interaction.response.send_message(
-                "<a:sukoon_crossss:1323992622955626557> I don't have permission to create channels!",
-                ephemeral=True
-            )
+            msg = "<a:sukoon_crossss:1323992622955626557> I don't have permission to create channels!"
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(
-                f"<a:sukoon_crossss:1323992622955626557> Error: {str(e)}",
-                ephemeral=True
-            )
+            msg = f"<a:sukoon_crossss:1323992622955626557> Error: {str(e)}"
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
 
 class DeclineModal(discord.ui.Modal, title="Decline Verification"):
     """Modal for staff to provide decline reason"""
@@ -391,6 +401,9 @@ class DeclineModal(discord.ui.Modal, title="Decline Verification"):
         """Handle modal submission"""
         guild = interaction.guild
         config = self.cog.get_server_config(guild.id)
+        
+        # Acknowledge immediately - sending the decline DM below can be slow.
+        await interaction.response.defer()
         
         # Send decline message in DM as EMBED with banner
         decline_message = config.get('decline_message', 'Your verification has been declined.')
@@ -417,7 +430,7 @@ class DeclineModal(discord.ui.Modal, title="Decline Verification"):
             color=discord.Color.red()
         )
         
-        await interaction.response.send_message(embed=ticket_decline_embed)
+        await interaction.followup.send(embed=ticket_decline_embed)
         
         # Send SEPARATE log for decline to log channel
         log_channel_id = config.get('log_channel_id')
@@ -544,6 +557,10 @@ class TicketControls(discord.ui.View):
             )
             return
         
+        # Cheap validations above are done - acknowledge before the role
+        # assignment, DM and log sends below, which can exceed the 3s deadline.
+        await interaction.response.defer(ephemeral=True)
+        
         try:
             await member.add_roles(verified_role, reason=f"Approved by {interaction.user}")
             
@@ -554,7 +571,7 @@ class TicketControls(discord.ui.View):
                 color=discord.Color.green()
             )
             
-            await interaction.response.send_message(embed=success_embed)
+            await interaction.followup.send(embed=success_embed)
             
             # Send success DM as EMBED with banner
             try:
@@ -610,10 +627,11 @@ class TicketControls(discord.ui.View):
             await interaction.channel.send(view=view)
             
         except Exception as e:
-            await interaction.response.send_message(
-                f"<a:sukoon_crossss:1323992622955626557> Error: {str(e)}",
-                ephemeral=True
-            )
+            msg = f"<a:sukoon_crossss:1323992622955626557> Error: {str(e)}"
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
     
     @discord.ui.button(
         label="Decline",

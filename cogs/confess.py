@@ -143,6 +143,10 @@ class ConfessionView(discord.ui.View):
             await interaction.response.send_message("No confession content available to report.", ephemeral=True)
             return
 
+        # Acknowledge immediately - the guild settings read, log send and
+        # report write below can exceed the 3-second interaction deadline.
+        await interaction.response.defer(ephemeral=True)
+
         guild_id = str(interaction.guild.id)
         guild_settings = await CONFIG_MANAGER.get_guild_settings(guild_id)
         log_channel_id = guild_settings.get('log_channel')
@@ -173,7 +177,7 @@ class ConfessionView(discord.ui.View):
             str(interaction.user.id)
         )
         if duplicate:
-            await interaction.response.send_message("You have already reported this confession.", ephemeral=True)
+            await interaction.followup.send("You have already reported this confession.", ephemeral=True)
             return
 
         if report_count >= 3:
@@ -193,9 +197,9 @@ class ConfessionView(discord.ui.View):
                 timestamp=discord.utils.utcnow()
             )
             await interaction.message.edit(embed=removed_embed, view=None)
-            await interaction.response.send_message("Report submitted. The confession has been removed.", ephemeral=True)
+            await interaction.followup.send("Report submitted. The confession has been removed.", ephemeral=True)
         else:
-            await interaction.response.send_message("Report submitted to moderators.", ephemeral=True)
+            await interaction.followup.send("Report submitted to moderators.", ephemeral=True)
 
 class ConfessionModal(discord.ui.Modal):
     """
@@ -406,6 +410,9 @@ class Confessions(commands.Cog):
         embed_color: Optional[str] = None
     ) -> None:
         guild_id = str(interaction.guild.id)
+        # Acknowledge immediately - the settings read/write below are Mongo I/O
+        # and can exceed the 3-second interaction deadline.
+        await interaction.response.defer(ephemeral=True)
         current_settings = await self.config.get_guild_settings(guild_id)
         new_settings = current_settings.copy()
 
@@ -421,11 +428,11 @@ class Confessions(commands.Cog):
                 discord.Color.from_str(embed_color)
                 new_settings['embed_color'] = embed_color
             except ValueError:
-                await interaction.response.send_message("Invalid color format. Use hex code like #FF0000.", ephemeral=True)
+                await interaction.followup.send("Invalid color format. Use hex code like #FF0000.", ephemeral=True)
                 return
 
         await self.config.update_guild_settings(guild_id, new_settings)
-        await interaction.response.send_message("Confession configurations updated successfully.", ephemeral=True)
+        await interaction.followup.send("Confession configurations updated successfully.", ephemeral=True)
 
     @app_commands.command(name="confess-ban", description="Ban or unban a user from submitting confessions.")
     @app_commands.default_permissions(administrator=True)
@@ -440,6 +447,9 @@ class Confessions(commands.Cog):
         action: str
     ) -> None:
         guild_id = str(interaction.guild.id)
+        # Acknowledge immediately - the settings read/write below are Mongo I/O
+        # and can exceed the 3-second interaction deadline.
+        await interaction.response.defer(ephemeral=True)
         current_settings = await self.config.get_guild_settings(guild_id)
         banned_users = current_settings.get('banned_users', [])
         user_id = str(user.id)
@@ -453,12 +463,12 @@ class Confessions(commands.Cog):
                 banned_users.remove(user_id)
             message = f"{user} has been unbanned from submitting confessions."
         else:
-            await interaction.response.send_message("Invalid action. Use 'ban' or 'unban'.", ephemeral=True)
+            await interaction.followup.send("Invalid action. Use 'ban' or 'unban'.", ephemeral=True)
             return
 
         current_settings['banned_users'] = banned_users
         await self.config.update_guild_settings(guild_id, current_settings)
-        await interaction.response.send_message(message, ephemeral=True)
+        await interaction.followup.send(message, ephemeral=True)
 
 async def setup(bot: commands.Bot) -> None:
     """Called when loading this cog."""

@@ -417,6 +417,10 @@ class CountingCog(commands.Cog):
             )
             return
         
+        # Cheap validation above is done - acknowledge before the Mongo reads,
+        # writes and log sends below, which can exceed the 3s deadline.
+        await interaction.response.defer(ephemeral=True)
+        
         doc = await self._get_or_create(interaction.guild.id)
         updates = {}
         messages = []
@@ -425,7 +429,7 @@ class CountingCog(commands.Cog):
         if counting_channel:
             perms = counting_channel.permissions_for(interaction.guild.me)
             if not (perms.read_messages and perms.send_messages and perms.manage_messages):
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"⚠ Missing permissions in {counting_channel.mention}. I need: Read Messages, Send Messages, Manage Messages.",
                     ephemeral=True
                 )
@@ -438,7 +442,7 @@ class CountingCog(commands.Cog):
         if log_channel:
             perms = log_channel.permissions_for(interaction.guild.me)
             if not (perms.read_messages and perms.send_messages):
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"⚠ Missing permissions in {log_channel.mention}. I need: Read Messages, Send Messages.",
                     ephemeral=True
                 )
@@ -450,7 +454,7 @@ class CountingCog(commands.Cog):
         # Handle emoji
         if emoji:
             if not await self.validate_emoji(emoji.strip(), interaction.guild):
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "⚠️ Invalid emoji or I don't have access to it. Use a standard emoji or a custom emoji from this server.",
                     ephemeral=True
                 )
@@ -469,10 +473,10 @@ class CountingCog(commands.Cog):
         # Handle set number
         if set_number is not None:
             if set_number <= 0:
-                await interaction.response.send_message("Number must be positive (1 or greater).", ephemeral=True)
+                await interaction.followup.send("Number must be positive (1 or greater).", ephemeral=True)
                 return
             if set_number > 1_000_000_000:
-                await interaction.response.send_message("Number is too large (max: 1 billion).", ephemeral=True)
+                await interaction.followup.send("Number is too large (max: 1 billion).", ephemeral=True)
                 return
             updates["current"] = set_number - 1
             updates["last_user"] = None
@@ -505,7 +509,7 @@ class CountingCog(commands.Cog):
             description="\n".join(messages),
             color=EMBED_COLOR
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
     
     @count_group.command(name="banned", description="View list of banned users")
     @app_commands.checks.has_permissions(administrator=True)
@@ -647,9 +651,13 @@ class CountingCog(commands.Cog):
         # Pure integer only (no text, no decimals, no special chars)
         content_stripped = message.content.strip()
         
-        # Remove ALL whitespace and invisible characters
-        # This handles: spaces, tabs, zero-width spaces, BOM, RTL marks, etc.
-        content_cleaned = ''.join(c for c in content_stripped if c.isdigit())
+        # Remove ONLY whitespace and invisible/non-printable characters
+        # (zero-width spaces, BOM, RTL marks, etc.). Visible characters such as
+        # letters and decimal points must survive so inputs like "12abc" or
+        # "5.0" are rejected below instead of silently coerced to 12 / 50.
+        content_cleaned = ''.join(
+            c for c in content_stripped if not c.isspace() and c.isprintable()
+        )
         
         if not PURE_INT_RE.match(content_cleaned):
             self.queue_deletion(message, "invalid_format")

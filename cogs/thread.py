@@ -222,12 +222,6 @@ class ThreadCreatorCog(commands.Cog):
             await self.bot.process_commands(message)
             return
 
-        # ESSENTIAL: Check channel-wide rate limit first (prevents API spam)
-        if not self.check_channel_rate_limit(channel_id):
-            # Silently skip - don't spam users with messages
-            await self.bot.process_commands(message)
-            return
-
         # Check per-user cooldown
         cooldown = config.get("cooldown", 30)
         on_cd, remaining = await self.is_on_cooldown(guild_id, user_id, cooldown)
@@ -252,6 +246,14 @@ class ThreadCreatorCog(commands.Cog):
         
         # Get archive duration from config
         archive_duration = config.get("archive_duration", 1440)
+
+        # ESSENTIAL: Check channel-wide rate limit (prevents API spam) right
+        # before the actual thread creation so skipped messages (cooldown,
+        # missing config, etc.) do not consume the rate-limit budget.
+        if not self.check_channel_rate_limit(channel_id):
+            # Silently skip - don't spam users with messages
+            await self.bot.process_commands(message)
+            return
 
         # ESSENTIAL: Retry logic with exponential backoff
         max_retries = 3
@@ -393,6 +395,10 @@ class ThreadCreatorCog(commands.Cog):
         guild_id = str(interaction.guild_id)
         channel_id = str(channel.id)
 
+        # Cheap validation above is done - acknowledge before the Mongo
+        # reads/writes below, which can exceed the 3s interaction deadline.
+        await interaction.response.defer(ephemeral=True)
+
         # Check if already configured
         existing = await self.guild_configs.find_one(
             {"guild_id": guild_id, "channel_id": channel_id}
@@ -404,13 +410,13 @@ class ThreadCreatorCog(commands.Cog):
                 await self.guild_configs.delete_one(
                     {"guild_id": guild_id, "channel_id": channel_id}
                 )
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     f"🗑️ Thread creation **disabled** in {channel.mention}.",
                     ephemeral=True
                 )
             except Exception as e:
                 logger.error(f"Error removing channel config: {e}", exc_info=True)
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     "❌ An error occurred while removing the configuration.",
                     ephemeral=True
                 )
@@ -419,19 +425,19 @@ class ThreadCreatorCog(commands.Cog):
         perms = channel.permissions_for(interaction.guild.me)
         
         if not perms.create_public_threads:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ I need **Create Public Threads** permission in {channel.mention} first.",
                 ephemeral=True
             )
         
         if not perms.send_messages_in_threads:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ I need **Send Messages in Threads** permission in {channel.mention} first.",
                 ephemeral=True
             )
         
         if not perms.view_channel:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ I need **View Channel** permission in {channel.mention} first.",
                 ephemeral=True
             )
@@ -455,7 +461,7 @@ class ThreadCreatorCog(commands.Cog):
                 10080: "7 days"
             }.get(archive_duration, f"{archive_duration} minutes")
             
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"✅ Thread creation **enabled** in {channel.mention}\n"
                 f"⏱️ Cooldown: **{cooldown}s** per user\n"
                 f"📦 Auto-archive: **{duration_text}** of inactivity\n"
@@ -465,7 +471,7 @@ class ThreadCreatorCog(commands.Cog):
             
         except Exception as e:
             logger.error(f"Error adding channel config: {e}", exc_info=True)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ An error occurred while saving the configuration.",
                 ephemeral=True
             )
@@ -479,17 +485,21 @@ class ThreadCreatorCog(commands.Cog):
         """Display thread configuration status for the server."""
         guild_id = str(interaction.guild_id)
         
+        # Acknowledge before the Mongo reads below, which can exceed the 3s
+        # interaction deadline.
+        await interaction.response.defer(ephemeral=True)
+        
         try:
             configs = await self.guild_configs.find({"guild_id": guild_id}).to_list(length=None)
         except Exception as e:
             logger.error(f"Error fetching configs: {e}", exc_info=True)
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ An error occurred while fetching configurations.",
                 ephemeral=True
             )
 
         if not configs:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ No channels configured for automatic thread creation.\n"
                 "💡 Use `/thread_channel` to configure a channel.",
                 ephemeral=True
@@ -532,14 +542,14 @@ class ThreadCreatorCog(commands.Cog):
                     logger.error(f"Error cleaning up config: {e}", exc_info=True)
 
         if valid_configs == 0:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ All configured channels have been deleted.\n"
                 "💡 Use `/thread_channel` to configure a new channel.",
                 ephemeral=True
             )
 
         embed.set_footer(text=f"Total: {valid_configs} channel(s)")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(
         name="thread_stats",
@@ -549,6 +559,10 @@ class ThreadCreatorCog(commands.Cog):
     async def thread_stats(self, interaction: Interaction):
         """Display thread creation statistics."""
         guild_id = str(interaction.guild_id)
+        
+        # Acknowledge before the Mongo reads below, which can exceed the 3s
+        # interaction deadline.
+        await interaction.response.defer(ephemeral=True)
         
         try:
             # Get today's stats
@@ -609,11 +623,11 @@ class ThreadCreatorCog(commands.Cog):
                     )
             
             embed.set_footer(text="Statistics are recorded daily")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             
         except Exception as e:
             logger.error(f"Error fetching stats: {e}", exc_info=True)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ An error occurred while fetching statistics.",
                 ephemeral=True
             )
@@ -628,7 +642,12 @@ class ThreadCreatorCog(commands.Cog):
             )
         else:
             logger.error(f"Error in configure_channel: {error}", exc_info=True)
-            if not interaction.response.is_done():
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ An unexpected error occurred.",
+                    ephemeral=True
+                )
+            else:
                 await interaction.response.send_message(
                     "❌ An unexpected error occurred.",
                     ephemeral=True
@@ -644,7 +663,12 @@ class ThreadCreatorCog(commands.Cog):
             )
         else:
             logger.error(f"Error in thread_status: {error}", exc_info=True)
-            if not interaction.response.is_done():
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ An unexpected error occurred.",
+                    ephemeral=True
+                )
+            else:
                 await interaction.response.send_message(
                     "❌ An unexpected error occurred.",
                     ephemeral=True
@@ -660,7 +684,12 @@ class ThreadCreatorCog(commands.Cog):
             )
         else:
             logger.error(f"Error in thread_stats: {error}", exc_info=True)
-            if not interaction.response.is_done():
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ An unexpected error occurred.",
+                    ephemeral=True
+                )
+            else:
                 await interaction.response.send_message(
                     "❌ An unexpected error occurred.",
                     ephemeral=True
