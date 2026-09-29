@@ -34,7 +34,7 @@ class VoiceManager(commands.Cog):
     • pull users in
     • push users out
     • kick everyone
-    • mute everyone
+    • mute anyone (single user or everyone)
     • lock voice channel
     • summon users via DM
     with exact rate-limit handling.
@@ -150,12 +150,75 @@ class VoiceManager(commands.Cog):
         processed = len(members) - len(errors)
         return processed, errors
 
+    async def resolve_vc_members(
+        self, ctx: commands.Context, vc: discord.abc.GuildChannel, tokens
+    ) -> Optional[List[discord.Member]]:
+        """Resolve mention/ID/name tokens into members that are inside `vc`."""
+        conv = commands.MemberConverter()
+        members: List[discord.Member] = []
+        seen: Set[int] = set()
+        for t in tokens:
+            try:
+                m = await conv.convert(ctx, t)
+            except commands.BadArgument:
+                m = None
+            if not m or m.bot:
+                await ctx.send(f"<a:sukoon_reddot:1322894157794119732> Couldn't find that member: `{t}`")
+                return None
+            if not (m.voice and m.voice.channel and m.voice.channel.id == vc.id):
+                await ctx.send(f"<a:sukoon_reddot:1322894157794119732> {m.mention} is not in your voice channel.")
+                return None
+            if m.id not in seen:
+                seen.add(m.id)
+                members.append(m)
+        return members
+
+    async def run_mute(
+        self, ctx: commands.Context, members: List[discord.Member], mute: bool
+    ) -> None:
+        """Lock, mute/unmute the given members and report the result."""
+        lock = self.get_user_lock(ctx.author.id)
+        if lock.locked():
+            return await ctx.send("<a:heartspar:1335854160322498653> Hold on, operation in progress.")
+
+        verb = "Muting" if mute else "Unmuting"
+        done = "Muted" if mute else "Unmuted"
+        fail = "mute" if mute else "unmute"
+        target_label = (
+            f"`{members[0].display_name}`" if len(members) == 1 else f"`{len(members)}` user(s)"
+        )
+
+        async with lock:
+            msg = await ctx.send(f"<a:heartspar:1335854160322498653> {verb} {target_label}…")
+
+            processed, errs = await self._process_mute_batch(members, mute)
+
+            if len(members) == 1:
+                result = f"<a:sukoon_whitetick:1323992464058482729> Successfully {done} `{members[0].display_name}`!" if processed \
+                    else f"<a:sukoon_reddot:1322894157794119732> Failed to {fail} `{members[0].display_name}`."
+            else:
+                result = f"<a:sukoon_whitetick:1323992464058482729> Successfully {done} `{processed}/{len(members)}` users!"
+            await msg.edit(content=result)
+            if errs:
+                snippet = "\n".join(errs[:5]) + (f"\n…(+{len(errs)-5} more)" if len(errs)>5 else "")
+                await ctx.send(f"<a:sukoon_reddot:1322894157794119732> Issues:\n{snippet}")
+
     async def check_admin_and_move_perms(self, ctx: commands.Context) -> bool:
         if not ctx.guild:
             await ctx.send("<a:sukoon_reddot:1322894157794119732> This command can't be used in DMs.")
             return False
         if not (ctx.author.guild_permissions.administrator or ctx.author.guild_permissions.move_members):
             await ctx.send("<a:sukoon_reddot:1322894157794119732> You need Admin or Move-Members permission.")
+            return False
+        return True
+
+    async def check_admin_and_mute_perms(self, ctx: commands.Context) -> bool:
+        if not ctx.guild:
+            await ctx.send("<a:sukoon_reddot:1322894157794119732> This command can't be used in DMs.")
+            return False
+        perms = ctx.author.guild_permissions
+        if not (perms.administrator or perms.move_members or perms.mute_members):
+            await ctx.send("<a:sukoon_reddot:1322894157794119732> You need Admin, Mute-Members or Move-Members permission.")
             return False
         return True
 
@@ -382,14 +445,16 @@ class VoiceManager(commands.Cog):
     @commands.command(name="mute")
     @commands.guild_only()
     @commands.cooldown(1, 5, commands.BucketType.user)
-    async def mute(self, ctx: commands.Context, confirm: str):
+    async def mute(self, ctx: commands.Context, target: str = None, *more: str):
         """
-        Mute everyone in your voice channel (except you/bots). Confirm: `mute all`
+        Mute specific user(s) or everyone in your voice channel.
+        • `mute @user [more users]` — mute only those user(s)
+        • `mute all` — mute everyone (except you/bots)
         """
-        if confirm.lower() != "all":
-            return await ctx.send("<a:sukoon_reddot:1322894157794119732> To confirm, type: `mute all`")
+        if not target:
+            return await ctx.send("<a:sukoon_reddot:1322894157794119732> Usage: `mute @user` or `mute all`")
 
-        if not await self.check_admin_and_move_perms(ctx):
+        if not await self.check_admin_and_mute_perms(ctx):
             return
 
         if not ctx.author.voice or not ctx.author.voice.channel:
@@ -399,35 +464,32 @@ class VoiceManager(commands.Cog):
         if not await self.check_bot_permissions(ctx, vc, need_mute=True):
             return
 
-        members = [m for m in vc.members if not m.bot and m.id != ctx.author.id]
-        if not members:
-            return await ctx.send("<:sukoon_info:1323251063910043659> No one to mute.")
+        if target.lower() == "all":
+            if more:
+                return await ctx.send("<a:sukoon_reddot:1322894157794119732> Either pick specific users or `all`, not both.")
+            members = [m for m in vc.members if not m.bot and m.id != ctx.author.id]
+            if not members:
+                return await ctx.send("<:sukoon_info:1323251063910043659> No one to mute.")
+        else:
+            members = await self.resolve_vc_members(ctx, vc, (target,) + more)
+            if not members:
+                return
 
-        lock = self.get_user_lock(ctx.author.id)
-        if lock.locked():
-            return await ctx.send("<a:heartspar:1335854160322498653> Hold on, operation in progress.")
-
-        async with lock:
-            msg = await ctx.send(f"<a:heartspar:1335854160322498653> Muting `{len(members)}` user(s)…")
-
-            processed, errs = await self._process_mute_batch(members, True)
-
-            await msg.edit(content=f"<a:sukoon_whitetick:1323992464058482729> Successfully Muted `{processed}/{len(members)}` users!")
-            if errs:
-                snippet = "\n".join(errs[:5]) + (f"\n…(+{len(errs)-5} more)" if len(errs)>5 else "")
-                await ctx.send(f"<a:sukoon_reddot:1322894157794119732> Issues:\n{snippet}")
+        await self.run_mute(ctx, members, True)
 
     @commands.command(name="unmute")
     @commands.guild_only()
     @commands.cooldown(1, 5, commands.BucketType.user)
-    async def unmute(self, ctx: commands.Context, confirm: str):
+    async def unmute(self, ctx: commands.Context, target: str = None, *more: str):
         """
-        Unmute everyone in your voice channel. Confirm: `unmute all`
+        Unmute specific user(s) or everyone in your voice channel.
+        • `unmute @user [more users]` — unmute only those user(s)
+        • `unmute all` — unmute everyone
         """
-        if confirm.lower() != "all":
-            return await ctx.send("<a:sukoon_reddot:1322894157794119732> To confirm, type: `unmute all`")
+        if not target:
+            return await ctx.send("<a:sukoon_reddot:1322894157794119732> Usage: `unmute @user` or `unmute all`")
 
-        if not await self.check_admin_and_move_perms(ctx):
+        if not await self.check_admin_and_mute_perms(ctx):
             return
 
         if not ctx.author.voice or not ctx.author.voice.channel:
@@ -437,23 +499,18 @@ class VoiceManager(commands.Cog):
         if not await self.check_bot_permissions(ctx, vc, need_mute=True):
             return
 
-        members = [m for m in vc.members if not m.bot]
-        if not members:
-            return await ctx.send("<:sukoon_info:1323251063910043659> No one to unmute.")
+        if target.lower() == "all":
+            if more:
+                return await ctx.send("<a:sukoon_reddot:1322894157794119732> Either pick specific users or `all`, not both.")
+            members = [m for m in vc.members if not m.bot]
+            if not members:
+                return await ctx.send("<:sukoon_info:1323251063910043659> No one to unmute.")
+        else:
+            members = await self.resolve_vc_members(ctx, vc, (target,) + more)
+            if not members:
+                return
 
-        lock = self.get_user_lock(ctx.author.id)
-        if lock.locked():
-            return await ctx.send("<a:heartspar:1335854160322498653> Hold on, operation in progress.")
-
-        async with lock:
-            msg = await ctx.send(f"<a:heartspar:1335854160322498653> Unmuting `{len(members)}` user(s)…")
-
-            processed, errs = await self._process_mute_batch(members, False)
-
-            await msg.edit(content=f"<a:sukoon_whitetick:1323992464058482729> Successfully Unmuted `{processed}/{len(members)}` users!")
-            if errs:
-                snippet = "\n".join(errs[:5]) + (f"\n…(+{len(errs)-5} more)" if len(errs)>5 else "")
-                await ctx.send(f"<a:sukoon_reddot:1322894157794119732> Issues:\n{snippet}")
+        await self.run_mute(ctx, members, False)
 
     @commands.command(name="lock")
     @commands.guild_only()
