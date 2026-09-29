@@ -17,7 +17,7 @@ class BulkPingCog(commands.Cog):
         self.bot = bot
         self.active_operations: Dict[int, asyncio.Task] = {}  # guild_id -> task
         self.operation_states: Dict[int, dict] = {}  # guild_id -> state
-        self.dm_sent_operations: Set[int] = set()  # Track operations that already sent DM
+        self.dm_sent_operations: Set[tuple] = set()  # (guild_id, operation_id) that already sent DM
 
         # MongoDB collections
         self.settings_col = self.bot.mongo_client['discord_bot']['bulkping_settings']
@@ -156,7 +156,7 @@ class BulkPingCog(commands.Cog):
         interaction: discord.Interaction,
         channel: discord.TextChannel,
         role: discord.Role,
-        message: str,
+        message: app_commands.Range[str, 1, 1900],
         log_channel: discord.TextChannel,
         concurrent: Optional[int] = 1
     ):
@@ -214,6 +214,9 @@ class BulkPingCog(commands.Cog):
         # Show message preview
         sample_member = members_to_ping[0] if members_to_ping else interaction.user
         preview_message = f"{sample_member.mention} {message}"
+        # Embed field values cap at 1024 chars (the backticks add 2 more)
+        if len(preview_message) > 1018:
+            preview_message = preview_message[:1015] + "..."
         preview_embed.add_field(
             name="📝 Message Preview",
             value=f"`{preview_message}`",
@@ -236,6 +239,12 @@ class BulkPingCog(commands.Cog):
             view=view,
             ephemeral=True
         )
+
+        # Remember the message so on_timeout can update it
+        try:
+            view.preview_message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
 
         # Set cooldown
         await self.set_user_cooldown(interaction.guild_id, interaction.user.id)
@@ -299,6 +308,9 @@ class BulkPingCog(commands.Cog):
             except Exception as e:
                 logger.error(f"Failed to send bulk ping dashboard DM to user {user.id}: {e}")
 
+        if dashboard_message:
+            cancel_view.message = dashboard_message
+
         # Store operation state
         self.operation_states[guild.id] = {
             'cancelled': False,
@@ -340,7 +352,16 @@ class BulkPingCog(commands.Cog):
                             continue
 
                         ping_message = f"{member.mention} {message}"
-                        sent_msg = await channel.send(ping_message)
+                        if len(ping_message) > 2000:
+                            ping_message = ping_message[:1997] + "..."
+                        # Only the member is pinged: an @everyone or role
+                        # mention in the text must not mass-ping once per member.
+                        sent_msg = await channel.send(
+                            ping_message,
+                            allowed_mentions=discord.AllowedMentions(
+                                users=True, roles=False, everyone=False
+                            )
+                        )
                         sent_messages.append(sent_msg)
 
                         # Mark member as pinged
@@ -475,7 +496,14 @@ class BulkPingCog(commands.Cog):
 
             try:
                 ping_message = f"{member.mention} {message}"
-                sent_msg = await channel.send(ping_message)
+                if len(ping_message) > 2000:
+                    ping_message = ping_message[:1997] + "..."
+                sent_msg = await channel.send(
+                    ping_message,
+                    allowed_mentions=discord.AllowedMentions(
+                        users=True, roles=False, everyone=False
+                    )
+                )
 
                 # Mark as pinged and increment count
                 pinged_member_ids.add(member_id)
@@ -549,9 +577,11 @@ class BulkPingCog(commands.Cog):
         except Exception as e:
             logger.error(f"Failed to send analytics: {e}")
 
-        # Send DM only once per operation
-        if operation_id not in self.dm_sent_operations:
-            self.dm_sent_operations.add(operation_id)
+        # Send DM only once per operation (IDs are per-guild counters, so key
+        # by guild as well or another guild's DMs get skipped)
+        dm_key = (guild.id, operation_id)
+        if dm_key not in self.dm_sent_operations:
+            self.dm_sent_operations.add(dm_key)
             try:
                 operation_data = await self.get_operation(guild.id, operation_id)
                 if operation_data:
@@ -603,9 +633,21 @@ class BulkPingConfirmView(discord.ui.View):
         self.log_channel = log_channel
         self.concurrent = concurrent
         self.members_to_ping = members_to_ping
+        # NB: self.message above is the ping *text*; this is the preview
+        # message the view is attached to (used by on_timeout).
+        self.preview_message = None
 
     @discord.ui.button(label="Start", style=discord.ButtonStyle.green, emoji="▶️")
     async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # The command checks this too, but a second admin can press Start on
+        # their own preview while another operation is already running.
+        if self.guild.id in self.cog.active_operations:
+            await interaction.response.send_message(
+                "❌ An operation is already running.",
+                ephemeral=True
+            )
+            return
+
         await interaction.response.edit_message(
             content="✅ **Bulk ping operation started!** Check the log channel for progress updates.",
             embed=None,
@@ -649,9 +691,15 @@ class BulkPingConfirmView(discord.ui.View):
         )
 
     async def on_timeout(self):
-        # Disable all buttons when view times out
+        # Disable all buttons when view times out (in memory only is not
+        # enough - persist it so the message stops looking clickable)
         for item in self.children:
             item.disabled = True
+        if self.preview_message:
+            try:
+                await self.preview_message.edit(view=None)
+            except discord.HTTPException:
+                pass
 
 class BulkPingCancelView(discord.ui.View):
     def __init__(self, cog: BulkPingCog, guild_id: int, operation_id: int):
@@ -659,6 +707,7 @@ class BulkPingCancelView(discord.ui.View):
         self.cog = cog
         self.guild_id = guild_id
         self.operation_id = operation_id
+        self.message = None  # dashboard message this view is attached to
 
     @discord.ui.button(label="Cancel Operation", style=discord.ButtonStyle.red, emoji="🛑")
     async def cancel_operation(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -672,6 +721,16 @@ class BulkPingCancelView(discord.ui.View):
             )
             return
 
+        # This view can outlive the operation it was created for (states are
+        # keyed by guild only), so ignore clicks from a stale dashboard.
+        state = self.cog.operation_states.get(self.guild_id)
+        if state is None or state.get('operation_id') != self.operation_id:
+            await interaction.response.send_message(
+                "⚠️ That bulk ping operation is no longer active.",
+                ephemeral=True
+            )
+            return
+
         self.cog.cancel_operation(self.guild_id)
 
         await interaction.response.send_message(
@@ -679,12 +738,15 @@ class BulkPingCancelView(discord.ui.View):
             ephemeral=True
         )
 
-        # Disable the button
+        # Disable the button on the dashboard message this view lives on
+        # (edit_original_response would edit the ephemeral reply above instead).
         button.disabled = True
-        try:
-            await interaction.edit_original_response(view=self)
-        except discord.NotFound:
-            pass  # Message was deleted
+        dashboard = interaction.message or self.message
+        if dashboard:
+            try:
+                await dashboard.edit(view=self)
+            except discord.HTTPException:
+                pass  # Message was deleted
 
 async def setup(bot):
     await bot.add_cog(BulkPingCog(bot))

@@ -2,6 +2,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import os
+import time
+import copy
 import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
 import re
@@ -12,6 +14,7 @@ from collections import defaultdict
 message_timestamps = defaultdict(list)
 RATE_LIMIT = 5  # max 5 reactions per 10 seconds per channel
 RATE_LIMIT_INTERVAL = 10
+CONFIG_CACHE_TTL = 30  # seconds a guild's auto-react config stays cached
 
 class AutoReact(commands.Cog):
     def __init__(self, bot):
@@ -19,15 +22,30 @@ class AutoReact(commands.Cog):
         self.mongo_client = AsyncIOMotorClient(os.getenv('MONGO_URL'))
         self.db = self.mongo_client['discord_bot']
         self.collection = self.db['autoreact_config']
+        self._config_cache: Dict[int, tuple] = {}  # guild_id -> (fetched_at, config)
 
     async def get_server_config(self, guild_id: int):
-        """Get auto-react configuration for a server"""
+        """Get auto-react configuration for a server (cached for CONFIG_CACHE_TTL)
+
+        on_message fires for every non-bot message, so this deliberately avoids
+        an uncached find_one on each one; invalidation happens in
+        update_server_config when a config is saved.
+        """
+        now = time.monotonic()
+        cached = self._config_cache.get(guild_id)
+        if cached and now - cached[0] < CONFIG_CACHE_TTL:
+            # Hand out a copy so callers cannot mutate the cached document.
+            return copy.deepcopy(cached[1])
+
         default_config = {'guild_id': guild_id, 'channels': {}}
         try:
             config = await self.collection.find_one({'guild_id': guild_id})
-            return config if config else default_config
+            config = config if config else default_config
         except Exception:
-            return default_config
+            config = default_config
+
+        self._config_cache[guild_id] = (now, config)
+        return copy.deepcopy(config)
 
     async def update_server_config(self, guild_id: int, config: dict):
         """Update auto-react configuration for a server"""
@@ -39,6 +57,8 @@ class AutoReact(commands.Cog):
             )
         except Exception as e:
             raise Exception(f"Failed to update configuration: {e}")
+        # Invalidate the cache so the next message sees the saved config.
+        self._config_cache.pop(guild_id, None)
 
     @staticmethod
     def parse_emojis(emoji_string: str) -> List[str]:
@@ -316,7 +336,7 @@ class AutoReact(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        # Get server configuration (already has timeout protection via safe_find_one)
+        # Get server configuration (brief TTL cache inside - no uncached DB hit per message)
         config = await self.get_server_config(message.guild.id)
         
         # If config is None (timeout/error), skip this message
@@ -328,10 +348,6 @@ class AutoReact(commands.Cog):
 
         if not channel_config:
             return
-
-        # Check rate limit
-        if self.is_rate_limited(message.channel.id):
-            return  # Too many reactions in short period
 
         emojis = channel_config.get('emojis', [])
         message_type = channel_config.get('message_type', 'attachments')
@@ -354,6 +370,11 @@ class AutoReact(commands.Cog):
 
         if not should_react:
             return
+
+        # Check rate limit only now that we are actually going to react, so
+        # messages that never match don't consume the budget.
+        if self.is_rate_limited(message.channel.id):
+            return  # Too many reactions in short period
 
         # React with all configured emojis (with error handling)
         for emoji in emojis:
@@ -378,23 +399,24 @@ class AutoReact(commands.Cog):
     async def autoreact_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         """Error handler for autoreact command"""
         if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="❌ Missing Permissions",
-                    description="You need **Administrator** permission to use this command.",
-                    color=discord.Color.red()
-                ),
-                ephemeral=True
+            embed = discord.Embed(
+                title="❌ Missing Permissions",
+                description="You need **Administrator** permission to use this command.",
+                color=discord.Color.red()
             )
         else:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="❌ Error",
-                    description=f"An error occurred: {str(error)}",
-                    color=discord.Color.red()
-                ),
-                ephemeral=True
+            embed = discord.Embed(
+                title="❌ Error",
+                description=f"An error occurred: {str(error)}",
+                color=discord.Color.red()
             )
+
+        # The command defers first, so a failure inside it has already used up
+        # the initial response - answer through the followup in that case.
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(AutoReact(bot))

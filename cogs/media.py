@@ -260,12 +260,14 @@ class MediaOnly(commands.Cog):
                 logger.error(f"Missing manage_messages permission in channel {message.channel.id}")
                 return
 
-            if not self.rate_limiter.can_proceed(message.channel.id):
-                return
-
             has_media = self._has_media(message)
             
             if has_media:
+                return
+
+            # Checked right before enforcement so allowed media traffic does
+            # not consume the rate-limit budget.
+            if not self.rate_limiter.can_proceed(message.channel.id):
                 return
 
             try:

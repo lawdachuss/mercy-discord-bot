@@ -108,6 +108,17 @@ class SnipeView(View):
 class Snipe(commands.Cog):
     _loaded = False
 
+    # Collection handle is a property so it always binds to the bot's CURRENT
+    # Mongo client. main.py swaps in a new client after a reconnect (which
+    # closes the old one); a statically-bound handle would keep pointing at the
+    # closed client until a manual reload. (Same pattern as cogs/drops.py.)
+    @property
+    def collection(self):
+        client = getattr(self.bot, 'mongo_client', None)
+        if client is None:
+            raise RuntimeError("MongoDB is not connected")
+        return client['discord_bot']['deleted_messages']
+
     def __init__(self, bot: commands.Bot):
         if Snipe._loaded:
             logger.error("Snipe cog is already loaded! Duplicate loading prevented.")
@@ -138,7 +149,8 @@ class Snipe(commands.Cog):
 
     async def _init_db(self):
         try:
-            self.collection = self.bot.mongo_client['discord_bot']['deleted_messages']
+            if getattr(self.bot, 'mongo_client', None) is None:
+                raise RuntimeError("MongoDB is not connected")
             self.db_ready = True
 
             if not self.cleanup_task:
@@ -187,24 +199,42 @@ class Snipe(commands.Cog):
                 raise
 
     @commands.Cog.listener()
-    async def on_message_delete(self, message: discord.Message) -> None:
-        if message.author.bot:
-            return
-
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        # on_message_delete only fires for messages still in discord.py's cache
+        # (max_messages=1000), so most deletions were never recorded at all.
         if not self.db_ready:
             return
 
-        safe_attachments = [
-            att.url for att in message.attachments
-            if att.url.startswith('https://cdn.discordapp.com/')
-        ]
+        message = payload.cached_message
+        if message is not None:
+            # Cached message: we have everything, record it as before.
+            if message.author.bot:
+                return
+
+            safe_attachments = [
+                att.url for att in message.attachments
+                if att.url.startswith('https://cdn.discordapp.com/')
+            ]
+            content = message.content
+            author = message.author.name
+            author_id = message.author.id
+        else:
+            # Not cached: the raw gateway payload only carries
+            # id/channel_id/guild_id - Discord does not send the content,
+            # author or attachments for an already-evicted message. Store a
+            # placeholder record so the deletion is at least visible, and let
+            # the render path show its existing placeholders.
+            safe_attachments = []
+            content = None
+            author = 'Unknown'
+            author_id = None
 
         try:
             await self.collection.insert_one({
-                'channel_id': message.channel.id,
-                'content': message.content,
-                'author': message.author.name,
-                'author_id': message.author.id,
+                'channel_id': payload.channel_id,
+                'content': content,
+                'author': author,
+                'author_id': author_id,
                 'deleted_at': datetime.utcnow().isoformat(),
                 'attachments': ','.join(safe_attachments) if safe_attachments else None
             })
@@ -292,7 +322,10 @@ class Snipe(commands.Cog):
             embed.add_field(name="author mention", value=author_mention, inline=False)
             embed.add_field(name="deleted at", value=f"{readable_time}", inline=False)
 
-            # Add the content section
+            # Add the content section (embed field values cap at 1024 chars,
+            # and deleted content can be up to 2000)
+            if len(content_section) > 1024:
+                content_section = content_section[:1021] + "..."
             embed.add_field(name="content", value=content_section, inline=False)
 
             # Set the user's avatar as thumbnail

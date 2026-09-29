@@ -53,6 +53,12 @@ class VoiceManager(commands.Cog):
         self.active_summon_views.discard(view)
 
     def get_user_lock(self, user_id: int) -> asyncio.Lock:
+        # Bound the dict so it can't grow one lock per user forever.
+        # Only unlocked (idle) locks are dropped, never a held one.
+        if len(self.user_locks) > 500:
+            for uid, lock in list(self.user_locks.items()):
+                if not lock.locked():
+                    del self.user_locks[uid]
         if user_id not in self.user_locks:
             self.user_locks[user_id] = asyncio.Lock()
         return self.user_locks[user_id]
@@ -154,7 +160,7 @@ class VoiceManager(commands.Cog):
         return True
 
     async def check_bot_permissions(
-        self, ctx: commands.Context, channel: discord.abc.GuildChannel
+        self, ctx: commands.Context, channel: discord.abc.GuildChannel, *, need_mute: bool = False
     ) -> bool:
         bot_member = ctx.guild.get_member(ctx.bot.user.id)
         if not bot_member:
@@ -167,6 +173,8 @@ class VoiceManager(commands.Cog):
             missing.append("Connect")
         if not bot_perms.move_members:
             missing.append("Move Members")
+        if need_mute and not bot_perms.mute_members:
+            missing.append("Mute Members")
         if missing:
             await ctx.send(f"<a:sukoon_reddot:1322894157794119732> I need: {', '.join(missing)}.")
             return False
@@ -388,7 +396,7 @@ class VoiceManager(commands.Cog):
             return await ctx.send("<:sukoon_info:1323251063910043659> Join a voice channel first.")
 
         vc = ctx.author.voice.channel
-        if not await self.check_bot_permissions(ctx, vc):
+        if not await self.check_bot_permissions(ctx, vc, need_mute=True):
             return
 
         members = [m for m in vc.members if not m.bot and m.id != ctx.author.id]
@@ -426,7 +434,7 @@ class VoiceManager(commands.Cog):
             return await ctx.send("<:sukoon_info:1323251063910043659> Join a voice channel first.")
 
         vc = ctx.author.voice.channel
-        if not await self.check_bot_permissions(ctx, vc):
+        if not await self.check_bot_permissions(ctx, vc, need_mute=True):
             return
 
         members = [m for m in vc.members if not m.bot]

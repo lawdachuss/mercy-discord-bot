@@ -41,7 +41,7 @@ class StealEmoji(commands.Cog):
         """Initialize aiohttp session when cog loads."""
         if self.session and not self.session.closed:
             await self.session.close()
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20, connect=10))
 
     # ------------------------------------------------------------------
     # Storage
@@ -175,10 +175,11 @@ class StealEmoji(commands.Cog):
         except Exception as e:
             logger.warning(f"[Steal] Could not send message: {e}")
 
-    async def _send_transient(self, destination: Any, content: str) -> None:
+    async def _send_transient(self, destination: Any, content: str,
+                              allowed_mentions: Optional[discord.AllowedMentions] = None) -> None:
         """Send a message and clear it after 5s, matching the cog's error style."""
         try:
-            message = await destination.send(content)
+            message = await destination.send(content, allowed_mentions=allowed_mentions)
         except Exception as e:
             logger.warning(f"[Steal] Could not send message: {e}")
             return
@@ -195,7 +196,10 @@ class StealEmoji(commands.Cog):
         config = await self.get_config(ctx.guild.id)
         denied = self.access_denial(ctx.author, config)
         if denied:
-            return await self._send_transient(ctx, denied)
+            # roles=False so a mentionable role never gets pinged on denial.
+            return await self._send_transient(
+                ctx, denied, allowed_mentions=discord.AllowedMentions(roles=False)
+            )
 
         if not ctx.message.reference:
             return await ctx.send("You must reply to a message containing an emoji or sticker.")
@@ -261,13 +265,15 @@ class StealEmoji(commands.Cog):
         # helper stays safe if it is ever called from somewhere else.
         denied = self.access_denial(ctx.author, await self.get_config(ctx.guild.id))
         if denied:
-            return await ctx.send(denied)
+            return await ctx.send(
+                denied, allowed_mentions=discord.AllowedMentions(roles=False)
+            )
         if not ctx.guild.me.guild_permissions.manage_emojis_and_stickers:
             return await ctx.send("I lack the necessary permissions to manage stickers.")
 
         # Ensure session is available
         if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20, connect=10))
 
         sticker_url = sticker.url
         embed = discord.Embed(
@@ -283,9 +289,14 @@ class StealEmoji(commands.Cog):
 
         async with self.session.get(sticker_url, headers=headers) as resp:
             if resp.status != 200:
-                await processing_message.edit(content=f"Failed to fetch sticker: HTTP {resp.status}")
+                await processing_message.edit(
+                    content=f"Failed to fetch sticker: HTTP {resp.status}", embed=None
+                )
                 await asyncio.sleep(5)
-                await processing_message.delete()
+                try:
+                    await processing_message.delete()
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    pass
                 return
 
             sticker_data = await resp.read()
@@ -323,9 +334,15 @@ class StealEmoji(commands.Cog):
             except discord.HTTPException as e:
                 # Handle specific error code for max stickers reached
                 if "Maximum number of stickers reached" in str(e):
-                    await processing_message.edit(content="Maximum number of stickers reached. Unable to add sticker.")
+                    await processing_message.edit(
+                        content="Maximum number of stickers reached. Unable to add sticker.",
+                        embed=None,
+                    )
                     await asyncio.sleep(5)  # Auto-delete after 5 seconds
-                    await processing_message.delete()  # Delete the bot's message
+                    try:
+                        await processing_message.delete()  # Delete the bot's message
+                    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                        pass
 
                 else:
                     await self.handle_bot_error(ctx, f"Failed to add sticker: {e}")
@@ -335,14 +352,34 @@ class StealEmoji(commands.Cog):
 
     async def steal_emoji(self, ctx, emojis, branding):
         """Handles stealing emojis with processing and success message."""
+        guild = ctx.guild
+        # Fail fast: without the permission or free emoji slots the loop below
+        # would otherwise send one identical error per emoji.
+        if not guild.me.guild_permissions.manage_emojis_and_stickers:
+            return await ctx.send("I lack the necessary permissions to manage emojis.")
+
+        total = len(emojis)
+        slot_limit = 50 * (guild.premium_tier + 1) if guild.premium_tier else 50
+        static_used = sum(1 for e in guild.emojis if not e.animated)
+        animated_used = sum(1 for e in guild.emojis if e.animated)
+        static_needed = sum(1 for e in emojis if not e.startswith("<a:"))
+        animated_needed = total - static_needed
+        if (static_used + static_needed > slot_limit
+                or animated_used + animated_needed > slot_limit):
+            return await ctx.send(
+                f"Not enough emoji slots: {static_used + static_needed}/{slot_limit} static and "
+                f"{animated_used + animated_needed}/{slot_limit} animated needed. "
+                "Remove some emoji and try again."
+            )
+
         embed = discord.Embed(
             description="<a:sukoon_loading:1322897472338526240> **Processing** to Steal Emojis...",
             color=EMBED_COLOR
         )
         processing_message = await ctx.send(embed=embed)
 
-        total = len(emojis)
         added = 0
+        stopped = None
         for emoji in emojis:
             emoji_parts = emoji.strip("<>").split(":")
             emoji_id = emoji_parts[-1]
@@ -351,18 +388,27 @@ class StealEmoji(commands.Cog):
                 emoji_name = f"{branding}_{emoji_name}"
             emoji_ext = "gif" if emoji.startswith("<a:") else "png"
             emoji_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{emoji_ext}"
-            result = await self.add_emoji(ctx, emoji_url, emoji_name)
+            try:
+                result = await self.add_emoji(ctx, emoji_url, emoji_name)
+            except discord.Forbidden:
+                # Missing permission or the emoji slots filled up mid-batch:
+                # every remaining emoji would fail the same way, so stop here.
+                stopped = ("Stopped early: I can't add more emoji "
+                           "(missing permission or emoji slots full).")
+                break
             if result:
                 added += 1
 
         if added == 0:
-            await processing_message.edit(content="Failed to steal any emojis.")
+            await processing_message.edit(
+                content=stopped or "Failed to steal any emojis.", embed=None
+            )
         else:
             success_embed = discord.Embed(
                 description=f"<a:stolen_success:1322894423755063316> Successfully created **{added}/{total}** Emojis",
                 color=EMBED_COLOR
             )
-            await processing_message.edit(embed=success_embed)
+            await processing_message.edit(content=stopped, embed=success_embed)
 
     def extract_emojis(self, message):
         """Extract custom emojis from a message."""
@@ -377,7 +423,7 @@ class StealEmoji(commands.Cog):
 
         if image_data is None:
             if not self.session or self.session.closed:
-                self.session = aiohttp.ClientSession()
+                self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20, connect=10))
             headers = {
                 "User-Agent": "MercyBot/1.0",
                 "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
@@ -399,6 +445,10 @@ class StealEmoji(commands.Cog):
         while retries < max_retries:
             try:
                 return await guild.create_custom_emoji(name=name, image=image_data)
+            except discord.Forbidden:
+                # Fatal for the batch (lost permission / no emoji slots left):
+                # let the caller stop instead of failing once per emoji.
+                raise
             except discord.HTTPException as e:
                 if e.status == 429:
                     retries += 1
@@ -441,7 +491,10 @@ class StealEmoji(commands.Cog):
 
         # Auto delete the error message after 5 seconds
         await asyncio.sleep(5)
-        await error_message_sent.delete()
+        try:
+            await error_message_sent.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
 
     @steal.error
     async def steal_error(self, ctx, error):

@@ -4,7 +4,7 @@ import motor.motor_asyncio
 import os
 import asyncio
 import logging
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -35,6 +35,10 @@ class RoleManager(commands.Cog, name="Role Management"):
                 logging.info("RoleManager: Database indexes created")
             except Exception as e:
                 logging.error(f"RoleManager: Failed to create indexes: {e}")
+    
+    def _db_ready(self) -> bool:
+        """Check whether the shared MongoDB connection is available."""
+        return self.db is not None
     
     async def get_reqrole(self, guild_id: int) -> Optional[int]:
         """Get the required role ID for a guild"""
@@ -158,6 +162,29 @@ class RoleManager(commands.Cog, name="Role Management"):
             
         return True
     
+    def _filter_roles(self, ctx: commands.Context, roles: List[discord.Role],
+                      *, granting: bool) -> Tuple[List[discord.Role], List[str]]:
+        """Split roles into (allowed, violation messages) after hierarchy checks.
+
+        Rejects roles the bot may not touch (is_assignable covers @everyone,
+        managed/bot roles and roles above the bot's top role) and, when
+        granting, roles at or above the invoker's top role unless they are an
+        administrator.
+        """
+        allowed: List[discord.Role] = []
+        violations: List[str] = []
+        invoker_is_admin = ctx.author.guild_permissions.administrator
+        for role in roles:
+            if not role.is_assignable():
+                violations.append(
+                    f"**{role.name}** can't be changed by me (@everyone/managed role or above my top role)."
+                )
+            elif granting and not invoker_is_admin and role >= ctx.author.top_role:
+                violations.append(f"**{role.name}** is above your top role, so you can't grant it.")
+            else:
+                allowed.append(role)
+        return allowed, violations
+    
     @commands.command(name="setupreqrole")
     @commands.has_permissions(administrator=True)
     async def setup_reqrole(self, ctx, role: discord.Role):
@@ -169,6 +196,9 @@ class RoleManager(commands.Cog, name="Role Management"):
         Usage: .setupreqrole @role
         Example: .setupreqrole @RoleManager
         """
+        if not self._db_ready():
+            return await ctx.send("The database is unavailable right now, please try again later.")
+        
         await self.db.reqrole.replace_one(
             {"guild_id": ctx.guild.id},
             {"guild_id": ctx.guild.id, "role_id": role.id},
@@ -188,6 +218,9 @@ class RoleManager(commands.Cog, name="Role Management"):
         Usage: .setrole <custom_name> @role [description]
         Example: .setrole staff @StaffMember Staff members can moderate chat
         """
+        if not self._db_ready():
+            return await ctx.send("The database is unavailable right now, please try again later.")
+        
         await self.db.custom_roles.replace_one(
             {
                 "guild_id": ctx.guild.id,
@@ -216,6 +249,9 @@ class RoleManager(commands.Cog, name="Role Management"):
         Usage: .removerole <custom_name> [@role]
         Example: .removerole staff @StaffMember
         """
+        if not self._db_ready():
+            return await ctx.send("The database is unavailable right now, please try again later.")
+        
         if role:
             result = await self.db.custom_roles.delete_one({
                 "guild_id": ctx.guild.id,
@@ -246,6 +282,9 @@ class RoleManager(commands.Cog, name="Role Management"):
         
         Usage: .resetserver
         """
+        if not self._db_ready():
+            return await ctx.send("The database is unavailable right now, please try again later.")
+        
         # Ask for confirmation
         confirm_msg = await ctx.send("⚠️ **WARNING**: This will delete ALL role configurations for this server. "
                                     "Type `confirm` within 30 seconds to proceed.")
@@ -277,6 +316,9 @@ class RoleManager(commands.Cog, name="Role Management"):
         Usage: .deletemappedrole <role_id>
         Example: .deletemappedrole 123456789012345678
         """
+        if not self._db_ready():
+            return await ctx.send("The database is unavailable right now, please try again later.")
+        
         # Check if the role exists in any mapping
         cursor = self.db.custom_roles.find({
             "guild_id": ctx.guild.id,
@@ -313,6 +355,9 @@ class RoleManager(commands.Cog, name="Role Management"):
         Usage: .setlogchannel #channel
         Example: .setlogchannel #role-logs
         """
+        if not self._db_ready():
+            return await ctx.send("The database is unavailable right now, please try again later.")
+        
         await self.db.log_channels.replace_one(
             {"guild_id": ctx.guild.id},
             {"guild_id": ctx.guild.id, "channel_id": channel.id},
@@ -443,14 +488,23 @@ class RoleManager(commands.Cog, name="Role Management"):
         Example: .clearroles @Username
         """
         custom_roles = await self.get_all_custom_roles(ctx.guild.id)
-        removed_roles = []
+        candidates = []
         
         for custom_name, roles_data in custom_roles.items():
             for role_data in roles_data:
                 role = ctx.guild.get_role(role_data["role_id"])
                 if role and role in user.roles:
-                    await user.remove_roles(role)
-                    removed_roles.append(role)
+                    candidates.append(role)
+        
+        # Skip roles the bot isn't allowed to remove (hierarchy check)
+        targets, violations = self._filter_roles(ctx, candidates, granting=False)
+        for violation in violations:
+            await ctx.send(f"⚠️ Skipping: {violation}")
+        
+        removed_roles = []
+        for role in targets:
+            await user.remove_roles(role)
+            removed_roles.append(role)
         
         if removed_roles:
             await ctx.send(f"Removed {len(removed_roles)} custom roles from {user.mention}.")
@@ -471,6 +525,9 @@ class RoleManager(commands.Cog, name="Role Management"):
         if not roles:
             await ctx.send("You must specify at least one role.")
             return
+        
+        if not self._db_ready():
+            return await ctx.send("The database is unavailable right now, please try again later.")
         
         # First remove existing mappings
         await self.db.custom_roles.delete_many({
@@ -550,15 +607,25 @@ class RoleManager(commands.Cog, name="Role Management"):
             has_any_role = any(role in target_user.roles for role in roles_to_toggle)
             
             if has_any_role:
-                # Remove roles
-                await target_user.remove_roles(*roles_to_toggle)
-                await ctx.send(f"Removed {', '.join(role.name for role in roles_to_toggle)} from {target_user.mention}.")
-                await self.log_role_change(ctx.guild, target_user, roles_to_toggle, "Removed", ctx.author)
+                # Remove roles (skip any the bot may not touch)
+                targets, violations = self._filter_roles(ctx, roles_to_toggle, granting=False)
+                for violation in violations:
+                    await ctx.send(f"⚠️ Skipping removal: {violation}")
+                if not targets:
+                    return
+                await target_user.remove_roles(*targets)
+                await ctx.send(f"Removed {', '.join(role.name for role in targets)} from {target_user.mention}.")
+                await self.log_role_change(ctx.guild, target_user, targets, "Removed", ctx.author)
             else:
-                # Add roles
-                await target_user.add_roles(*roles_to_toggle)
-                await ctx.send(f"Added {', '.join(role.name for role in roles_to_toggle)} to {target_user.mention}.")
-                await self.log_role_change(ctx.guild, target_user, roles_to_toggle, "Added", ctx.author)
+                # Add roles (skip any above the invoker's top role etc.)
+                targets, violations = self._filter_roles(ctx, roles_to_toggle, granting=True)
+                for violation in violations:
+                    await ctx.send(f"⚠️ Skipping grant: {violation}")
+                if not targets:
+                    return
+                await target_user.add_roles(*targets)
+                await ctx.send(f"Added {', '.join(role.name for role in targets)} to {target_user.mention}.")
+                await self.log_role_change(ctx.guild, target_user, targets, "Added", ctx.author)
 
     @commands.Cog.listener()
     async def on_command_error(self, ctx, error):

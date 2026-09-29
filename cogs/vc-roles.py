@@ -45,6 +45,10 @@ class VCRoles(commands.Cog):
         self.processing_users: Set[int] = set()
         self._ready = False
         self._db_retry_task: Optional[asyncio.Task] = None
+        # Consecutive 12-hour-window misses per (guild_id, role_id) before a
+        # config is considered invalid - guards against guilds whose
+        # GUILD_CREATE has not arrived yet (stub/unavailable/not in cache).
+        self._missing_role_hits: Dict[int, Dict[int, int]] = {}
 
         # MongoDB setup
         self.mongo_uri: str = os.getenv("MONGO_URL", "")
@@ -675,6 +679,16 @@ class VCRoles(commands.Cog):
         except Exception as e:
             logger.error(f"Error syncing roles for guild {guild.name}: {e}", exc_info=True)
 
+    def _record_missing_role(self, guild_id: int, role_id: int) -> bool:
+        """Record one consecutive miss for a (guild, role) pair.
+
+        Returns True only once the pair has been missing for 3 consecutive
+        12-hour windows, so a single miss never proves the guild/role is gone.
+        """
+        hits = self._missing_role_hits.setdefault(guild_id, {})
+        hits[role_id] = hits.get(role_id, 0) + 1
+        return hits[role_id] >= 3
+
     @tasks.loop(hours=12)
     async def check_role_validity(self) -> None:
         """Check for invalid roles and guilds, cleaning up as needed."""
@@ -686,12 +700,17 @@ class VCRoles(commands.Cog):
             
             for guild_id, (role_id, log_channel_id) in list(self.vc_role_configs.items()):
                 guild = self.bot.get_guild(guild_id)
-                if not guild:
-                    invalid_guilds.append(guild_id)
+                # Never treat an unavailable guild as deleted (stub guilds from
+                # the READY payload / GUILD_CREATE not arrived yet)
+                if guild is not None and getattr(guild, "unavailable", False):
                     continue
                     
-                role = guild.get_role(role_id)
-                if not role:
+                role = guild.get_role(role_id) if guild else None
+                if role:
+                    # Role confirmed present - reset the miss counter
+                    self._missing_role_hits.get(guild_id, {}).pop(role_id, None)
+                elif self._record_missing_role(guild_id, role_id):
+                    # Missing for 3 consecutive 12-hour windows - now invalid
                     invalid_guilds.append(guild_id)
 
             # Batch delete invalid configurations
@@ -706,6 +725,7 @@ class VCRoles(commands.Cog):
                     
                     for guild_id in invalid_guilds:
                         self.vc_role_configs.pop(guild_id, None)
+                        self._missing_role_hits.pop(guild_id, None)
 
                 except Exception as e:
                     logger.error(f"Failed to batch delete invalid configs: {e}", exc_info=True)

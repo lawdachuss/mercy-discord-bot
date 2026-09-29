@@ -202,11 +202,15 @@ class AlwaysVC(commands.Cog):
         self.connection_manager = ConnectionManager()
         self._guild_locks = defaultdict(asyncio.Lock)
         self._rejoin_cooldown = defaultdict(float)
+        # guild_id -> unix timestamp until which auto-rejoin stays paused.
+        # Shared by the manual-disconnect handler and join_vc (health_check),
+        # so the 15s health check can't rejoin during the 60s grace window.
+        self._paused_until = {}
         self._ready = False
         self._vc_collection: Optional[AsyncIOMotorCollection] = None
 
         # Start health check when bot is ready
-        self.bot.loop.create_task(self._start_health_check())
+        self._health_task: Optional[asyncio.Task] = self.bot.loop.create_task(self._start_health_check())
         
     async def _start_health_check(self):
         await self.bot.wait_until_ready()
@@ -269,6 +273,11 @@ class AlwaysVC(commands.Cog):
                 
             vc_channel_id = config.get('vc_channel_id')
             if not vc_channel_id:
+                return
+            
+            # Honor the manual-disconnect/pause window (health_check calls
+            # join_vc too, so both paths agree on one timestamp)
+            if time.time() < self._paused_until.get(guild_id, 0):
                 return
             
             # EARLY EXIT: Already connected to the correct channel
@@ -405,6 +414,8 @@ class AlwaysVC(commands.Cog):
                 # Wait before rejoining (manual disconnect)
                 if config.get('respect_manual_disconnect', True):
                     logger.debug(f"Manual disconnect in guild {guild_id} - waiting 60 seconds before rejoin")
+                    # Block health_check/join_vc from rejoining in this window
+                    self._paused_until[guild_id] = time.time() + 60
                     await asyncio.sleep(60)
                 
                 # Rejoin the configured always-vc channel
@@ -518,10 +529,18 @@ class AlwaysVC(commands.Cog):
         """Cleanup when cog is unloaded."""
         try:
             self.health_check.cancel()
+            if self._health_task is not None and not self._health_task.done():
+                self._health_task.cancel()
             
+            # Only leave the configured always-vc channel - never other VCs
             for guild in self.bot.guilds:
-                if guild.voice_client:
-                    await guild.voice_client.disconnect(force=True)
+                voice_client = guild.voice_client
+                if not voice_client or not voice_client.is_connected():
+                    continue
+                config = self.guild_configs.get(str(guild.id), {})
+                vc_channel_id = config.get('vc_channel_id')
+                if vc_channel_id and voice_client.channel and voice_client.channel.id == vc_channel_id:
+                    await voice_client.disconnect(force=True)
             
             await self.save_data()
         except Exception as e:
