@@ -517,7 +517,9 @@ class AFK(commands.Cog):
         rendered the whole thing as plain text. Emoji mentions are therefore
         pulled out, the remaining text is escaped, and they are put back.
         """
-        emoji_pattern = re.compile(r"<a?:[A-Za-z0-9_]{2,32}:\d{17,20}>")
+        # The whole match is a capture group: re.split only returns separators
+        # for groups, so without it the emoji is dropped from the result.
+        emoji_pattern = re.compile(r"(<a?:[A-Za-z0-9_]{2,32}:\d{17,20}>)")
         parts = emoji_pattern.split(reason.strip())
         # split() with one capture group returns [text, sep, text, sep, ...]
         # so the odd indices are the emoji mentions to restore untouched.
