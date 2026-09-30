@@ -100,9 +100,25 @@ class NotificationManager:
                             pass
                 except Exception:
                     pass
-            asyncio.create_task(_delete_later())
+            _spawn_tracked(_delete_later())
         except Exception:
             pass
+
+# Strong references for NotificationManager's fire-and-forget delete tasks.
+# asyncio only weakly references tasks, so without this a scheduled DM deletion
+# can be garbage collected before it runs.
+_NOTIF_TASKS: set = set()
+
+
+def _spawn_tracked(coro):
+    try:
+        task = asyncio.ensure_future(coro)
+    except Exception:
+        return None
+    _NOTIF_TASKS.add(task)
+    task.add_done_callback(_NOTIF_TASKS.discard)
+    return task
+
 
 notif_manager = NotificationManager()
 
@@ -323,12 +339,13 @@ class ThreadControls(discord.ui.View):
                     pass
                 await self.cog._close_match_row(self.thread_id)
                 self.cog.match_meta.pop(self.thread_id, None)
+                self.cog._activity_write_ts.pop(self.thread_id, None)
                 try:
                     await self.cog.pending_deletions_col.delete_one({"thread_id": self.thread_id})
                 except Exception:
                     pass
 
-            asyncio.create_task(_delete_later())
+            self.cog._spawn(_delete_later())
             
             try:
                 await self.cog.pending_deletions_col.update_one(
@@ -408,7 +425,8 @@ class ReportModal(discord.ui.Modal):
                 return
 
             report_ch = interaction.guild.get_channel(cfg["report_channel_id"])
-            if not isinstance(report_ch, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
+            # ForumChannel has no .send; posting there would fail every report.
+            if not isinstance(report_ch, (discord.TextChannel, discord.Thread)):
                 try:
                     await interaction.edit_original_response(content="⚠️ Report channel not found.")
                 except discord.errors.NotFound:
@@ -485,6 +503,10 @@ class Matchmaker(commands.Cog):
         self._match_backoff: dict[int, int] = {}
         # thread_id -> unix ts of the last last_activity write (throttle).
         self._activity_write_ts: dict[int, int] = {}
+        # Strong references to fire-and-forget tasks. asyncio only holds a weak
+        # reference to a task, so an unreferenced create_task can be garbage
+        # collected mid-execution and silently drop the work.
+        self._bg_tasks: set[asyncio.Task] = set()
 
         db = self.bot.mongo_client['discord_bot']
         self.guild_config_col = db['matchmaker_guild_config']
@@ -501,28 +523,44 @@ class Matchmaker(commands.Cog):
         notif_manager.set_collections(self.user_prefs_col, self.dm_messages_col)
 
     def cog_unload(self):
-        try:
-            if self.match_loop.is_running():
-                self.match_loop.cancel()
-        except Exception:
-            pass
-        try:
-            if self.queue_panel_loop.is_running():
-                self.queue_panel_loop.cancel()
-        except Exception:
-            pass
-        try:
-            if self.cleanup_loop.is_running():
-                self.cleanup_loop.cancel()
-        except Exception:
-            pass
-        try:
-            if self.dm_cleanup_loop.is_running():
-                self.dm_cleanup_loop.cancel()
-        except Exception:
-            pass
+        for loop in (
+            getattr(self, "match_loop", None),
+            getattr(self, "queue_panel_loop", None),
+            getattr(self, "cleanup_loop", None),
+            getattr(self, "dm_cleanup_loop", None),
+            getattr(self, "cleanup_inactive_threads", None),
+        ):
+            try:
+                if loop and loop.is_running():
+                    loop.cancel()
+            except Exception:
+                pass
 
     # ----- Helpers for thread actions -----
+    def _spawn(self, coro):
+        """Run a fire-and-forget coroutine, keeping a strong reference.
+
+        asyncio holds only a weak reference to a running task, so a bare
+        create_task can be garbage collected before it finishes. The wrapper
+        also swallows the result so a failing background job never surfaces as
+        "Task exception was never retrieved".
+        """
+        async def _runner():
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Matchmaking: background task failed")
+
+        try:
+            task = asyncio.ensure_future(_runner())
+        except Exception:
+            return None
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
     def _get_thread_meta(self, thread_id: int):
         return self.match_meta.get(thread_id)
 
@@ -560,17 +598,45 @@ class Matchmaker(commands.Cog):
                 return
 
             await self.guild_config_col.create_index([("guild_id", 1)], unique=True)
+            try:
+                await self.waiting_queue_col.create_index(
+                    [("guild_id", 1), ("user_id", 1)], unique=True
+                )
+            except Exception:
+                pass
             await self.waiting_queue_col.create_index([("guild_id", 1), ("enqueued_at", 1)])
             await self.waiting_queue_col.create_index([("guild_id", 1), ("priority_score", -1)])
             await self.matches_col.create_index([("guild_id", 1), ("status", 1), ("last_activity", 1)])
             await self.recent_blocks_col.create_index([("guild_id", 1), ("blocked_until", 1)])
             await self.match_skips_col.create_index([("guild_id", 1), ("skipped_at", 1)])
             await self.queue_history_col.create_index([("guild_id", 1), ("user_id", 1)])
+            await self.queue_history_col.create_index([("guild_id", 1), ("matched_at", 1)])
             await self.queue_panels_col.create_index([("guild_id", 1)], unique=True)
             await self.pending_deletions_col.create_index([("delete_after", 1)])
             await self.dm_messages_col.create_index([("delete_after", 1)])
 
             self.bot.add_view(MatchPanel(self))
+            try:
+                # Dedupe waiting queue: if duplicates existed before adding unique index
+                try:
+                    for g in self.bot.guilds:
+                        cur = self.waiting_queue_col.aggregate([
+                            {"$match": {"guild_id": g.id}},
+                            {"$group": {
+                                "_id": {"guild_id": "$guild_id", "user_id": "$user_id"},
+                                "ids": {"$addToSet": "$_id"},
+                                "count": {"$sum": 1}
+                            }},
+                            {"$match": {"count": {"$gt": 1}}}
+                        ])
+                        async for grp in cur:
+                            ids = grp.get("ids") or []
+                            for oid in list(ids)[1:]:
+                                await self.waiting_queue_col.delete_one({"_id": oid})
+                except Exception:
+                    pass
+            except Exception:
+                pass
             try:
                 open_rows = await self.matches_col.find(
                     {"status": "open"},
@@ -595,12 +661,38 @@ class Matchmaker(commands.Cog):
             except Exception:
                 pass
 
+            # Restore paused guilds. _paused was in-memory only, so a restart
+            # silently resumed matchmaking in guilds an admin had shut off.
+            try:
+                paused_rows = await self.guild_config_col.find(
+                    {"paused": True}, {"guild_id": 1}
+                ).to_list(length=None)
+                self._paused = {int(r["guild_id"]) for r in paused_rows or []}
+            except Exception:
+                pass
+
             self._initialized = True
             if not self.match_loop.is_running():
                 self.match_loop.start()
+            if not self.cleanup_inactive_threads.is_running():
+                self.cleanup_inactive_threads.start()
+            if not self.queue_panel_loop.is_running():
+                self.queue_panel_loop.start()
+            if not self.cleanup_loop.is_running():
+                self.cleanup_loop.start()
+            if not self.dm_cleanup_loop.is_running():
+                self.dm_cleanup_loop.start()
             self._on_ready_done = True
-        except Exception:
+        except asyncio.CancelledError:
             raise
+        except Exception:
+            # Re-raising here was the worst possible behaviour: one failed
+            # create_index (for example an IndexOptionsConflict, or a
+            # transient timeout) propagated out of on_ready and left
+            # _initialized False with every loop dead, so the cog looked
+            # loaded but did nothing for the life of the process. Startup is
+            # best-effort per step; the loops are started either way.
+            logger.exception("Matchmaking: startup step failed; continuing")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -704,7 +796,7 @@ class Matchmaker(commands.Cog):
         action="setup/configure/report_channel/clear/pause/resume/stats/queue/queue_panel",
         channel="Text Channel",
         report="Report Channel",
-        days="Stat Days"
+        days="Stat Days (1-3650)"
     )
     @app_commands.choices(action=[
         app_commands.Choice(name="setup", value="setup"),
@@ -723,10 +815,17 @@ class Matchmaker(commands.Cog):
                  channel: Optional[discord.TextChannel] = None,
                  report: Optional[discord.TextChannel] = None,
                  days: int = 7):
+        # Admin check runs before any state change, and the whole body is
+        # wrapped: every action below operates on a deferred interaction, so an
+        # unhandled raise would leave Discord showing "The application did not
+        # respond" instead of an error the admin can act on.
         try:
-            # Admin check
-            if not interaction.user.guild_permissions.administrator:
-                return await interaction.response.send_message("You need administrator permissions to use this command.", ephemeral=True)
+            perms = interaction.user.guild_permissions if interaction.guild else None
+            if perms is None or not perms.administrator:
+                return await interaction.response.send_message(
+                    "You need administrator permissions to use this command.",
+                    ephemeral=True,
+                )
 
             if interaction.response.is_done() is False:
                 await interaction.response.defer(ephemeral=True)
@@ -741,6 +840,20 @@ class Matchmaker(commands.Cog):
                 pass
             return
 
+        try:
+            return await self._run_mm_action(interaction, act, guild, channel, report, days)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Matchmaking: /mm action %s failed in guild %s", act, interaction.guild_id)
+            try:
+                await interaction.edit_original_response(
+                    content="❌ That action failed. Check the bot logs for details."
+                )
+            except Exception:
+                pass
+
+    async def _run_mm_action(self, interaction, act: str, guild, channel, report, days: int):
         if act == "setup":
             if not all([channel, report]):
                 return await interaction.edit_original_response(content="Provide channel and report channel.")
@@ -802,14 +915,32 @@ class Matchmaker(commands.Cog):
 
         if act == "pause":
             self._paused.add(guild.id)
+            try:
+                await self.guild_config_col.update_one(
+                    {"guild_id": guild.id},
+                    {"$set": {"guild_id": guild.id, "paused": True}},
+                    upsert=True
+                )
+            except Exception:
+                pass
             return await interaction.edit_original_response(content="⏸️ Matchmaking paused for this server.")
 
         if act == "resume":
             self._paused.discard(guild.id)
+            try:
+                await self.guild_config_col.update_one(
+                    {"guild_id": guild.id},
+                    {"$set": {"guild_id": guild.id, "paused": False}},
+                    upsert=True
+                )
+            except Exception:
+                pass
             return await interaction.edit_original_response(content="▶️ Matchmaking resumed for this server.")
 
         if act == "stats":
             try:
+                # An unbounded or negative window silently reported nonsense.
+                days = max(1, min(int(days or 7), 3650))
                 since = int(time.time()) - days * 86400
                 total_matches = await self.matches_col.count_documents(
                     {"guild_id": guild.id, "created_at": {"$gte": since}}
@@ -843,6 +974,12 @@ class Matchmaker(commands.Cog):
                         panel_msg = await channel.fetch_message(int(row["message_id"]))
                     except Exception:
                         panel_msg = None
+                else:
+                    # The panel now lives in a different channel. Forget the old
+                    # row so the 20s loop stops editing the previous message,
+                    # which would otherwise update forever in a channel nobody
+                    # is looking at.
+                    await self._delete_queue_panel_row(guild.id)
             if panel_msg:
                 await panel_msg.edit(embed=embed)
                 await self._upsert_queue_panel_row(guild.id, channel.id, panel_msg.id)
@@ -1010,6 +1147,10 @@ class Matchmaker(commands.Cog):
 
                 for i, u1 in enumerate(cands[:SCAN_WINDOW]):
                     for u2 in cands[i + 1:i + 1 + SCAN_WINDOW]:
+                        # A duplicate row for the same user would otherwise let
+                        # someone be paired with themselves.
+                        if int(u1["user_id"]) == int(u2["user_id"]):
+                            continue
                         pair_sorted = tuple(sorted((int(u1["user_id"]), int(u2["user_id"])) ))
                         if pair_sorted in blocks:
                             continue
@@ -1097,11 +1238,21 @@ class Matchmaker(commands.Cog):
                 channel_id = cfg.get("parent_channel_id") or cfg.get("channel_id")
             channel = guild.get_channel(int(channel_id)) if channel_id else None
             if not isinstance(channel, discord.TextChannel):
-                for ch in guild.text_channels:
-                    if ch.permissions_for(guild.me).create_private_threads:
-                        channel = ch
-                        break
-            if not isinstance(channel, discord.TextChannel):
+                # Only a channel the guild explicitly configured may host rooms.
+                # Guessing at "any text channel the bot can post in" put match
+                # threads in #general for unconfigured or blipped guilds.
+                logger.warning(
+                    "Matchmaking: guild %s has no usable configured parent channel; "
+                    "run /mm action:configure to set one",
+                    guild.id,
+                )
+                return None
+            if not channel.permissions_for(guild.me).create_private_threads:
+                logger.warning(
+                    "Matchmaking: configured channel %s in guild %s is missing "
+                    "Create Private Threads; cannot create rooms there",
+                    channel.id, guild.id,
+                )
                 return None
 
             room_no = await self.consume_room_number(guild.id)
@@ -1186,20 +1337,24 @@ class Matchmaker(commands.Cog):
 
                 # Resolve both members BEFORE removing anyone from the queue so a
                 # failed match never silently drops the other participant.
+                if u1_id == u2_id:
+                    # Corrupt queue state: remove the duplicate(s) and retry later.
+                    await self.waiting_queue_col.delete_many({"guild_id": guild.id, "user_id": u1_id})
+                    return
                 m1 = guild.get_member(u1_id)
                 if m1 is None:
                     try:
                         m1 = await guild.fetch_member(u1_id)
                     except discord.NotFound:
                         # User left the guild: drop only their row and retry later.
-                        await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u1_id})
+                        await self.waiting_queue_col.delete_many({"guild_id": guild.id, "user_id": u1_id})
                         return
                 m2 = guild.get_member(u2_id)
                 if m2 is None:
                     try:
                         m2 = await guild.fetch_member(u2_id)
                     except discord.NotFound:
-                        await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u2_id})
+                        await self.waiting_queue_col.delete_many({"guild_id": guild.id, "user_id": u2_id})
                         return
 
                 thread = await self._create_match_thread(guild, u1_id, u2_id)
@@ -1214,8 +1369,8 @@ class Matchmaker(commands.Cog):
                     )
                     return
 
-                await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u1_id})
-                await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u2_id})
+                await self.waiting_queue_col.delete_many({"guild_id": guild.id, "user_id": u1_id})
+                await self.waiting_queue_col.delete_many({"guild_id": guild.id, "user_id": u2_id})
 
                 # Record the pairing, now that the thread actually exists.
                 matched_at = int(time.time())
@@ -1229,6 +1384,20 @@ class Matchmaker(commands.Cog):
                         })
                     except Exception:
                         pass
+                # Keep only one row per (guild_id, user_id). If duplicates existed,
+                # remove the rest so future operations can't create self-pairs.
+                try:
+                    for doc in (u1_doc, u2_doc):
+                        uid = int(doc["user_id"])
+                        cur = self.waiting_queue_col.find(
+                            {"guild_id": guild.id, "user_id": uid},
+                            {"_id": 1}
+                        )
+                        rows = await cur.to_list(length=None)
+                        for oid in [r["_id"] for r in rows[1:]]:
+                            await self.waiting_queue_col.delete_one({"_id": oid})
+                except Exception:
+                    pass
 
                 try:
                     if m1:
@@ -1250,7 +1419,10 @@ class Matchmaker(commands.Cog):
             lock = self._locks[guild.id]
             if lock.locked():
                 continue
-            asyncio.create_task(self._attempt_match(guild))
+            try:
+                self.bot.loop.create_task(self._attempt_match(guild))
+            except Exception:
+                pass
 
     @tasks.loop(minutes=1)
     async def cleanup_inactive_threads(self):
@@ -1261,9 +1433,15 @@ class Matchmaker(commands.Cog):
             now = int(time.time())
             inactive_threshold = now - (30 * 60)
             
+            # Fetch once for all guilds: doing a distinct() per guild in the
+            # loop was a query per guild per minute for no extra correctness.
+            try:
+                pending_thread_ids = await self.pending_deletions_col.distinct("thread_id")
+            except Exception:
+                pending_thread_ids = []
+
             for guild in self.bot.guilds:
                 try:
-                    pending_thread_ids = await self.pending_deletions_col.distinct("thread_id")
                     cursor = self.matches_col.find({
                         "guild_id": guild.id,
                         "status": "open",
@@ -1296,7 +1474,7 @@ class Matchmaker(commands.Cog):
                                         color=0xE74C3C
                                     )
                                     await thread.send(embed=warning_embed)
-                                    
+
                                     for user_id in [int(row["user1_id"]), int(row["user2_id"])]:
                                         try:
                                             member = await guild.fetch_member(user_id)
@@ -1308,23 +1486,37 @@ class Matchmaker(commands.Cog):
                                                 )
                                         except Exception:
                                             continue
-                                            
+
                                     await thread.delete(reason="Inactive for 30 minutes")
                                 except Exception:
                                     await thread.delete(reason="Inactive for 30 minutes")
-                            
-                            await self.matches_col.update_one(
-                                {"thread_id": thread_id},
-                                {"$set": {"status": "closed", "closed_at": now, "close_reason": "inactivity"}}
-                            )
-                            
-                            if thread_id in self.match_meta:
-                                self.match_meta.pop(thread_id, None)
-                            
-                        except Exception as e:
+
+                            # Close the row and clear in-memory state in their own
+                            # try blocks. Previously both sat inside the block
+                            # above, so any failure while notifying or deleting
+                            # left the match "open" forever and the same two
+                            # users were re-notified every single minute.
+                            try:
+                                await self.matches_col.update_one(
+                                    {"thread_id": thread_id, "status": "open"},
+                                    {"$set": {"status": "closed", "closed_at": now, "close_reason": "inactivity"}}
+                                )
+                            except Exception:
+                                pass
+                            self.match_meta.pop(thread_id, None)
+                            self._activity_write_ts.pop(thread_id, None)
+                            # Stop routing the thread's buttons now that it is gone.
+                            try:
+                                self.bot.remove_view(
+                                    ThreadControls(self, guild.id, thread_id)
+                                )
+                            except Exception:
+                                pass
+
+                        except Exception:
                             continue
-                    
-                except Exception as e:
+
+                except Exception:
                     continue
                     
         except asyncio.CancelledError:
@@ -1376,13 +1568,81 @@ class Matchmaker(commands.Cog):
 
         try:
             now = int(time.time())
-            # Expire skip-blocks whose window has elapsed. Nothing else prunes
-            # these, so without this the blocks table grows without bound and
-            # every dequeue scan reads dead rows.
-            cursor = self.recent_blocks_col.find({"blocked_until": {"$lte": now}})
-            expired = await cursor.to_list(length=None)
-            if expired:
+
+            # --- Scheduled thread deletions ---
+            # _on_leave records a row here so a restart does not strand the
+            # room. Nothing else acted on these rows, so every thread whose
+            # user left stayed alive forever. Delete the thread, close the match
+            # row and clear the in-memory state.
+            try:
+                due = await self.pending_deletions_col.find(
+                    {"delete_after": {"$lte": now}}, {"thread_id": 1, "guild_id": 1}
+                ).to_list(length=200)
+                for row in due:
+                    tid = int(row["thread_id"])
+                    gid = int(row.get("guild_id") or 0)
+                    try:
+                        guild = self.bot.get_guild(gid) if gid else None
+                        if guild:
+                            thread = await self._safe_get_thread(guild, tid)
+                            if thread:
+                                await thread.delete(reason="User left; scheduled cleanup")
+                    except Exception:
+                        pass
+                    await self._close_match_row(tid)
+                    self.match_meta.pop(tid, None)
+                    self._activity_write_ts.pop(tid, None)
+                    try:
+                        await self.pending_deletions_col.delete_one({"thread_id": tid})
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+            # --- Expire skip-blocks whose window has elapsed ---
+            # Without this the blocks table grows without bound and every
+            # dequeue scan reads dead rows.
+            try:
                 await self.recent_blocks_col.delete_many({"blocked_until": {"$lte": now}})
+            except Exception:
+                pass
+
+            # --- Prune the write-only collections ---
+            # match_skips only affects a 24h window, queue_history only
+            # powers stats, and both grow forever otherwise.
+            try:
+                await self.match_skips_col.delete_many(
+                    {"skipped_at": {"$lte": now - 2 * 86400}}
+                )
+            except Exception:
+                pass
+            try:
+                await self.queue_history_col.delete_many(
+                    {"matched_at": {"$lte": now - 90 * 86400}}
+                )
+            except Exception:
+                pass
+
+            # Closed match rows older than a week are only kept so a stale
+            # view can still be reconciled; drop them once nothing needs them.
+            try:
+                await self.matches_col.delete_many({
+                    "status": "closed",
+                    "closed_at": {"$lte": now - 7 * 86400},
+                })
+            except Exception:
+                pass
+
+            # Thread ids already gone from Discord are safe to forget.
+            try:
+                stale = self._activity_write_ts
+                cutoff = now - 86400
+                for tid in [t for t, ts in stale.items() if ts < cutoff]:
+                    stale.pop(tid, None)
+            except Exception:
+                pass
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1401,18 +1661,25 @@ class Matchmaker(commands.Cog):
             # their database records) behind forever.
             rows = await self.dm_messages_col.find({"delete_after": {"$lte": now}}).to_list(length=200)
             for row in rows:
-                try:
-                    if row.get("delete_after") and int(row["delete_after"]) > now:
-                        continue
-                    channel = self.bot.get_channel(int(row["channel_id"])) if row.get("channel_id") else None
-                    if channel is not None and row.get("message_id"):
+                # Resolve the DM channel via the cache first, then fetch it. A
+                # DM channel is not in the cache after a restart, so a bare
+                # get_channel left the message undeleted.
+                chan = None
+                if row.get("channel_id"):
+                    chan = self.bot.get_channel(int(row["channel_id"]))
+                    if chan is None:
                         try:
-                            await channel.delete_message(int(row["message_id"]))
+                            chan = await self.bot.fetch_channel(int(row["channel_id"]))
+                        except Exception:
+                            chan = None
+                try:
+                    if isinstance(chan, discord.DMChannel) and row.get("message_id"):
+                        try:
+                            await chan.delete_message(int(row["message_id"]))
                         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                             pass
-                except Exception:
-                    pass
-                try:
+                    # The row goes regardless: the message is either deleted or
+                    # unreachable, and keeping it would retry forever.
                     await self.dm_messages_col.delete_one({"message_id": int(row["message_id"])})
                 except Exception:
                     pass
