@@ -22,25 +22,25 @@ logger = logging.getLogger(__name__)
 
 # ----- Safe Reply -----
 
-async def safe_reply(interaction: discord.Interaction, content: Optional[str] = None, embed: Optional[discord.Embed] = None, ephemeral: bool = True):
+async def safe_reply(interaction: discord.Interaction, content: Optional[str] = None, embed: Optional[discord.Embed] = None, ephemeral: bool = True, view: Optional[discord.ui.View] = None):
     try:
         if not interaction.response.is_done():
             if embed:
-                await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+                await interaction.response.send_message(embed=embed, ephemeral=ephemeral, view=view)
             else:
-                await interaction.response.send_message(content, ephemeral=ephemeral)
+                await interaction.response.send_message(content, ephemeral=ephemeral, view=view)
         else:
             if embed:
-                await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+                await interaction.followup.send(embed=embed, ephemeral=ephemeral, view=view)
             else:
-                await interaction.followup.send(content, ephemeral=ephemeral)
+                await interaction.followup.send(content, ephemeral=ephemeral, view=view)
     except Exception:
         try:
             if interaction.channel:
                 if embed:
-                    await interaction.channel.send(f"{interaction.user.mention}", embed=embed, delete_after=15 if ephemeral else None)
+                    await interaction.channel.send(f"{interaction.user.mention}", embed=embed, view=view, delete_after=15 if ephemeral else None)
                 else:
-                    await interaction.channel.send(f"{interaction.user.mention} {content}", delete_after=15 if ephemeral else None)
+                    await interaction.channel.send(f"{interaction.user.mention} {content}", view=view, delete_after=15 if ephemeral else None)
         except Exception:
             pass
 
@@ -619,6 +619,68 @@ class Matchmaker(commands.Cog):
         except Exception:
             pass
 
+    # ----- Slash Commands -----
+    # These are the only entry points into the feature. Before they existed the
+    # cog registered its views and loops but nothing ever showed a panel, so
+    # the whole system was unreachable and contributed nothing to bot.tree.
+
+    @app_commands.command(name="matchmaking", description="Open the matchmaking panel to get paired with someone.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_channels=True)
+    async def matchmaking_slash(self, interaction: discord.Interaction):
+        await safe_reply(
+            interaction,
+            embed=discord.Embed(
+                title="Matchmaking",
+                description=(
+                    "Click **Get A Match** to join the chat queue.\n"
+                    "When a partner is found you will get a DM with a private thread link."
+                ),
+                color=EMBED_COLOR,
+            ),
+            view=MatchPanel(self),
+        )
+
+    @app_commands.command(name="queue", description="Check your position in the matchmaking queue.")
+    @app_commands.guild_only()
+    async def queue_slash(self, interaction: discord.Interaction):
+        try:
+            pos, total, eta = await self.get_position_and_eta(interaction.guild.id, interaction.user.id)
+        except Exception:
+            embed = discord.Embed(title="Queue", color=0xE74C3C)
+            embed.description = "Could not read the queue right now. Please try again."
+            return await safe_reply(interaction, embed=embed)
+
+        if pos == 0:
+            embed = discord.Embed(title="Queue", color=EMBED_COLOR)
+            embed.description = "You are not in the queue. Use `/matchmaking` to join."
+            return await safe_reply(interaction, embed=embed)
+
+        minutes, seconds = eta // 60, eta % 60
+        embed = discord.Embed(title="Queue Position", color=EMBED_COLOR)
+        embed.description = (
+            f"You are currently **#{pos}** in the chat queue\n"
+            f"\U0001f465 **Total Users Waiting:** {total}\n\n"
+            f"Estimated wait: {minutes}m {seconds}s"
+        )
+        await safe_reply(interaction, embed=embed)
+
+    @app_commands.command(name="leavequeue", description="Leave the matchmaking queue.")
+    @app_commands.guild_only()
+    async def leave_queue_slash(self, interaction: discord.Interaction):
+        try:
+            await self.waiting_queue_col.delete_one(
+                {"guild_id": interaction.guild.id, "user_id": interaction.user.id}
+            )
+        except Exception:
+            embed = discord.Embed(title="Queue", color=0xE74C3C)
+            embed.description = "Could not update the queue right now. Please try again."
+            return await safe_reply(interaction, embed=embed)
+
+        embed = discord.Embed(title="Left Queue", color=EMBED_COLOR)
+        embed.description = "You have been removed from the matchmaking queue."
+        await safe_reply(interaction, embed=embed)
+
     # ----- Queue Helpers -----
 
     async def calculate_priority(self, guild_id: int, user_id: int) -> int:
@@ -1062,10 +1124,52 @@ class Matchmaker(commands.Cog):
         if not self._initialized:
             return
 
+        try:
+            now = int(time.time())
+            # Expire skip-blocks whose window has elapsed. Nothing else prunes
+            # these, so without this the blocks table grows without bound and
+            # every dequeue scan reads dead rows.
+            cursor = self.recent_blocks_col.find({"blocked_until": {"$lte": now}})
+            expired = await cursor.to_list(length=None)
+            if expired:
+                await self.recent_blocks_col.delete_many({"blocked_until": {"$lte": now}})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
     @tasks.loop(minutes=5)
     async def dm_cleanup_loop(self):
         if not self._initialized:
             return
+
+        try:
+            now = int(time.time())
+            # NotificationManager deletes each DM via an asyncio task 60s after
+            # sending, but that task dies with the process. These rows record
+            # what still needs deleting, so a restart does not leave DMs (and
+            # their database records) behind forever.
+            rows = await self.dm_messages_col.find({"delete_after": {"$lte": now}}).to_list(length=200)
+            for row in rows:
+                try:
+                    if row.get("delete_after") and int(row["delete_after"]) > now:
+                        continue
+                    channel = self.bot.get_channel(int(row["channel_id"])) if row.get("channel_id") else None
+                    if channel is not None and row.get("message_id"):
+                        try:
+                            await channel.delete_message(int(row["message_id"]))
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            pass
+                except Exception:
+                    pass
+                try:
+                    await self.dm_messages_col.delete_one({"message_id": int(row["message_id"])})
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     @match_loop.before_loop
     async def before_loop(self):
