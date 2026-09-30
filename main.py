@@ -631,14 +631,14 @@ class DiscordBot(commands.Bot):
                 logging.info(f"✅ Rate limit backoff period expired. Resetting rate limit status.")
                 self._rate_limit_count = max(0, self._rate_limit_count - 1)  # Gradually reduce count
                 was_rate_limited = False
-            
-            # Only sync if:
-            # 1. Commands changed AND at least 1 hour passed
-            # 2. OR it's been more than 24 hours (for periodic refresh)
-            should_sync = (
-                (current_hash != last_hash and time_since_last_sync > min_sync_interval) or 
-                time_since_last_sync > 86400  # 24 hours
-            )
+
+            # A real change to the command tree is always worth pushing. Holding
+            # it back for an hour just leaves users without the command (e.g. a
+            # newly added one stays invisible until the next restart), and the
+            # 429 backoff above is what actually protects us from rate limits.
+            # The 1h cooldown is kept for the no-op refresh path only.
+            commands_changed = current_hash != last_hash
+            should_sync = commands_changed or time_since_last_sync > 86400  # 24h refresh
             
             if should_sync:
                 try:
@@ -679,8 +679,11 @@ class DiscordBot(commands.Bot):
                         )
                         self._last_sync_attempt = current_time
                         
-                        # Save that we were rate limited to prevent retries
-                        await self._save_sync_cache(current_hash, current_time, rate_limited=True, retry_after=retry_after_seconds)
+                        # Save the rate-limit state, but keep the PREVIOUS hash:
+                        # this sync did not happen, so recording current_hash
+                        # would make the next boot think the change landed and
+                        # never retry it.
+                        await self._save_sync_cache(last_hash, current_time, rate_limited=True, retry_after=retry_after_seconds)
                         self._synced_commands = self.tree.get_commands()
                     else:
                         logging.error(f"Failed to sync slash commands: {e}")
@@ -711,18 +714,25 @@ class DiscordBot(commands.Bot):
                 current_time = time.time()
                 time_since_last_sync = current_time - last_sync
                 
-                if not was_rate_limited:
+                current_hash = self._get_command_hash()
+                commands_changed = current_hash != cache.get('command_hash')
+
+                # Nothing to do when the tree already matches Discord and we
+                # are not in a rate-limit backoff.
+                if not was_rate_limited and not commands_changed:
                     continue  # No action needed
-                
+
                 # Calculate if backoff period has expired
                 rate_limit_backoff = min(3600 * (2 ** rate_limit_count), 86400)
-                
+
                 if time_since_last_sync >= rate_limit_backoff:
-                    logging.info("🔄 Auto-sync: Rate limit backoff expired, attempting sync...")
-                    
+                    if commands_changed:
+                        logging.info("🔄 Auto-sync: pending command change, syncing...")
+                    else:
+                        logging.info("🔄 Auto-sync: Rate limit backoff expired, attempting sync...")
+
                     async with self._sync_lock:
                         try:
-                            current_hash = self._get_command_hash()
                             self._synced_commands = await self.tree.sync()
                             logging.info(f"✅ Auto-sync successful! Synced {len(self._synced_commands)} commands")
                             
@@ -745,7 +755,13 @@ class DiscordBot(commands.Bot):
                                     f"⚠️ Auto-sync still rate limited. "
                                     f"Will retry in {hours}h (attempt #{self._rate_limit_count})"
                                 )
-                                await self._save_sync_cache(current_hash, current_time, rate_limited=True, retry_after=retry_after_seconds)
+                                # Keep the previous hash: this sync failed, so
+                                # the change is still pending and must be retried.
+                                await self._save_sync_cache(
+                                    cache.get('command_hash'), current_time,
+                                    rate_limited=True,
+                                    retry_after=retry_after_seconds
+                                )
                             else:
                                 logging.error(f"Auto-sync failed: {e}")
                         except Exception as e:
