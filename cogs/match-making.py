@@ -12,6 +12,7 @@ from typing import Optional, Tuple, List, Dict, Any
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from pymongo import ReturnDocument
 
 EMBED_COLOR = 0x2F3136
 SKIP_BLOCK_MINUTES = 1440  # 24 hours
@@ -558,11 +559,14 @@ class Matchmaker(commands.Cog):
             if self._on_ready_done:
                 return
 
+            await self.guild_config_col.create_index([("guild_id", 1)], unique=True)
             await self.waiting_queue_col.create_index([("guild_id", 1), ("enqueued_at", 1)])
             await self.waiting_queue_col.create_index([("guild_id", 1), ("priority_score", -1)])
             await self.matches_col.create_index([("guild_id", 1), ("status", 1), ("last_activity", 1)])
             await self.recent_blocks_col.create_index([("guild_id", 1), ("blocked_until", 1)])
             await self.match_skips_col.create_index([("guild_id", 1), ("skipped_at", 1)])
+            await self.queue_history_col.create_index([("guild_id", 1), ("user_id", 1)])
+            await self.queue_panels_col.create_index([("guild_id", 1)], unique=True)
             await self.pending_deletions_col.create_index([("delete_after", 1)])
             await self.dm_messages_col.create_index([("delete_after", 1)])
 
@@ -579,6 +583,7 @@ class Matchmaker(commands.Cog):
                     # keep working for matches created before a restart.
                     if r.get("user1_id") is not None and r.get("user2_id") is not None:
                         self.match_meta.setdefault(tid, {
+                            "guild_id": gid,
                             "pairs": [int(r["user1_id"]), int(r["user2_id"])],
                             "created_at": int(r.get("created_at", 0)),
                         })
@@ -619,67 +624,235 @@ class Matchmaker(commands.Cog):
         except Exception:
             pass
 
-    # ----- Slash Commands -----
-    # These are the only entry points into the feature. Before they existed the
-    # cog registered its views and loops but nothing ever showed a panel, so
-    # the whole system was unreachable and contributed nothing to bot.tree.
+    # ----- Configuration -----
 
-    @app_commands.command(name="matchmaking", description="Open the matchmaking panel to get paired with someone.")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_channels=True)
-    async def matchmaking_slash(self, interaction: discord.Interaction):
-        await safe_reply(
-            interaction,
-            embed=discord.Embed(
-                title="Matchmaking",
-                description=(
-                    "Click **Get A Match** to join the chat queue.\n"
-                    "When a partner is found you will get a DM with a private thread link."
-                ),
-                color=EMBED_COLOR,
-            ),
-            view=MatchPanel(self),
+    async def set_parent_channel(self, gid: int, ch: int):
+        await self.guild_config_col.update_one(
+            {"guild_id": gid},
+            {"$set": {"guild_id": gid, "parent_channel_id": int(ch), "channel_id": int(ch)}},
+            upsert=True
         )
 
-    @app_commands.command(name="queue", description="Check your position in the matchmaking queue.")
-    @app_commands.guild_only()
-    async def queue_slash(self, interaction: discord.Interaction):
-        try:
-            pos, total, eta = await self.get_position_and_eta(interaction.guild.id, interaction.user.id)
-        except Exception:
-            embed = discord.Embed(title="Queue", color=0xE74C3C)
-            embed.description = "Could not read the queue right now. Please try again."
-            return await safe_reply(interaction, embed=embed)
-
-        if pos == 0:
-            embed = discord.Embed(title="Queue", color=EMBED_COLOR)
-            embed.description = "You are not in the queue. Use `/matchmaking` to join."
-            return await safe_reply(interaction, embed=embed)
-
-        minutes, seconds = eta // 60, eta % 60
-        embed = discord.Embed(title="Queue Position", color=EMBED_COLOR)
-        embed.description = (
-            f"You are currently **#{pos}** in the chat queue\n"
-            f"\U0001f465 **Total Users Waiting:** {total}\n\n"
-            f"Estimated wait: {minutes}m {seconds}s"
+    async def set_report_channel(self, gid: int, rc: int):
+        await self.guild_config_col.update_one(
+            {"guild_id": gid},
+            {"$set": {"guild_id": gid, "report_channel_id": int(rc)}},
+            upsert=True
         )
-        await safe_reply(interaction, embed=embed)
 
-    @app_commands.command(name="leavequeue", description="Leave the matchmaking queue.")
-    @app_commands.guild_only()
-    async def leave_queue_slash(self, interaction: discord.Interaction):
+    async def consume_room_number(self, gid: int) -> int:
+        """Atomically hand out the next room number for this guild.
+
+        $inc inside find_one_and_update means two matches created in the same
+        tick can never be told they own the same room number. We read the value
+        AFTER the increment, so a brand new guild lands on room 1 and an
+        existing guild continues from wherever its counter left off.
+        """
         try:
-            await self.waiting_queue_col.delete_one(
-                {"guild_id": interaction.guild.id, "user_id": interaction.user.id}
+            doc = await self.guild_config_col.find_one_and_update(
+                {"guild_id": gid},
+                {"$inc": {"next_room_number": 1}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
             )
         except Exception:
-            embed = discord.Embed(title="Queue", color=0xE74C3C)
-            embed.description = "Could not update the queue right now. Please try again."
-            return await safe_reply(interaction, embed=embed)
+            logger.exception("Matchmaking: room number allocation failed for guild %s", gid)
+            return 1
+        if not doc:
+            return 1
+        try:
+            return max(1, int(doc.get("next_room_number") or 1))
+        except (TypeError, ValueError):
+            return 1
 
-        embed = discord.Embed(title="Left Queue", color=EMBED_COLOR)
-        embed.description = "You have been removed from the matchmaking queue."
-        await safe_reply(interaction, embed=embed)
+    # ----- Queue Panel Helpers -----
+
+    async def _get_queue_counts(self, guild_id: int) -> Dict[str, int]:
+        total = await self.waiting_queue_col.count_documents({"guild_id": guild_id})
+        return {"total": int(total or 0)}
+
+    def _build_queue_embed(self, guild: discord.Guild, counts: Dict[str, int]) -> discord.Embed:
+        embed = discord.Embed(title=f"Queue — {guild.name}", color=EMBED_COLOR)
+        embed.add_field(name="Users Waiting", value=str(counts.get("total", 0)), inline=True)
+        embed.set_footer(text="Updates every ~20s")
+        return embed
+
+    async def _get_queue_panel_row(self, guild_id: int) -> Optional[dict]:
+        try:
+            return await self.queue_panels_col.find_one({"guild_id": guild_id})
+        except Exception:
+            return None
+
+    async def _upsert_queue_panel_row(self, guild_id: int, channel_id: int, message_id: int):
+        await self.queue_panels_col.update_one(
+            {"guild_id": guild_id},
+            {"$set": {"guild_id": guild_id, "channel_id": channel_id, "message_id": message_id}},
+            upsert=True
+        )
+
+    async def _delete_queue_panel_row(self, guild_id: int):
+        try:
+            await self.queue_panels_col.delete_one({"guild_id": guild_id})
+        except Exception:
+            pass
+
+    # ----- Admin Commands -----
+
+    @app_commands.guild_only()
+    @app_commands.command(name="mm", description="Configure matchmaking")
+    @app_commands.describe(
+        action="setup/configure/report_channel/clear/pause/resume/stats/queue/queue_panel",
+        channel="Text Channel",
+        report="Report Channel",
+        days="Stat Days"
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="setup", value="setup"),
+        app_commands.Choice(name="configure", value="configure"),
+        app_commands.Choice(name="report_channel", value="report_channel"),
+        app_commands.Choice(name="clear", value="clear"),
+        app_commands.Choice(name="pause", value="pause"),
+        app_commands.Choice(name="resume", value="resume"),
+        app_commands.Choice(name="stats", value="stats"),
+        app_commands.Choice(name="queue", value="queue"),
+        app_commands.Choice(name="queue_panel", value="queue_panel"),
+    ])
+    async def mm(self,
+                 interaction: discord.Interaction,
+                 action: app_commands.Choice[str],
+                 channel: Optional[discord.TextChannel] = None,
+                 report: Optional[discord.TextChannel] = None,
+                 days: int = 7):
+        try:
+            # Admin check
+            if not interaction.user.guild_permissions.administrator:
+                return await interaction.response.send_message("You need administrator permissions to use this command.", ephemeral=True)
+
+            if interaction.response.is_done() is False:
+                await interaction.response.defer(ephemeral=True)
+
+            act = action.value
+            guild = interaction.guild
+        except Exception:
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("An error occurred. Please try again.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        if act == "setup":
+            if not all([channel, report]):
+                return await interaction.edit_original_response(content="Provide channel and report channel.")
+            await self.set_parent_channel(guild.id, channel.id)
+            await self.set_report_channel(guild.id, report.id)
+
+            embed = discord.Embed(
+                title="Private Rooms",
+                description="Get paired with a random stranger in a private room for a one-on-one chat.",
+                color=EMBED_COLOR
+            )
+            # Optional banner
+            try:
+                if os.path.exists("banner.gif"):
+                    embed.set_image(url="attachment://banner.gif")
+                    with open("banner.gif", "rb") as f:
+                        banner_file = discord.File(f, filename="banner.gif")
+                        await channel.send(embed=embed, view=MatchPanel(self), file=banner_file)
+                else:
+                    await channel.send(embed=embed, view=MatchPanel(self))
+            except Exception:
+                await channel.send(embed=embed, view=MatchPanel(self))
+
+            return await interaction.edit_original_response(content="✅ Setup complete! Matchmaking panel created.")
+
+        if act == "configure":
+            if not channel:
+                return await interaction.edit_original_response(content="Provide channel.")
+            await self.set_parent_channel(guild.id, channel.id)
+
+            embed = discord.Embed(
+                title="Matchmaking Panel",
+                description="Click the button below to find your match.",
+                color=EMBED_COLOR
+            )
+            try:
+                if os.path.exists("banner.gif"):
+                    embed.set_image(url="attachment://banner.gif")
+                    with open("banner.gif", "rb") as f:
+                        banner_file = discord.File(f, filename="banner.gif")
+                        await channel.send(embed=embed, view=MatchPanel(self), file=banner_file)
+                else:
+                    await channel.send(embed=embed, view=MatchPanel(self))
+            except Exception:
+                await channel.send(embed=embed, view=MatchPanel(self))
+
+            return await interaction.edit_original_response(content=f"✅ Configured to {channel.mention}")
+
+        if act == "report_channel":
+            if not report:
+                return await interaction.edit_original_response(content="Provide a report channel.")
+            await self.set_report_channel(guild.id, report.id)
+            return await interaction.edit_original_response(content=f"✅ Report channel set to {report.mention}")
+
+        if act == "clear":
+            await self.waiting_queue_col.delete_many({"guild_id": guild.id})
+            await self.recent_blocks_col.delete_many({"guild_id": guild.id})
+            return await interaction.edit_original_response(content="🧹 Cleared waiting queue and recent blocks.")
+
+        if act == "pause":
+            self._paused.add(guild.id)
+            return await interaction.edit_original_response(content="⏸️ Matchmaking paused for this server.")
+
+        if act == "resume":
+            self._paused.discard(guild.id)
+            return await interaction.edit_original_response(content="▶️ Matchmaking resumed for this server.")
+
+        if act == "stats":
+            try:
+                since = int(time.time()) - days * 86400
+                total_matches = await self.matches_col.count_documents(
+                    {"guild_id": guild.id, "created_at": {"$gte": since}}
+                )
+                queued_now = await self.waiting_queue_col.count_documents({"guild_id": guild.id})
+                embed = discord.Embed(title="Matchmaking Stats", color=EMBED_COLOR)
+                embed.add_field(name="Days", value=str(days), inline=True)
+                embed.add_field(name="Matches Created", value=str(int(total_matches or 0)), inline=True)
+                embed.add_field(name="Queued Now", value=str(int(queued_now or 0)), inline=True)
+                return await interaction.edit_original_response(embed=embed)
+            except Exception:
+                return await interaction.edit_original_response(content="❌ Failed to compute stats.")
+
+        if act == "queue":
+            count = await self.waiting_queue_col.count_documents({"guild_id": guild.id})
+            embed = discord.Embed(title="Current Queue", color=EMBED_COLOR)
+            embed.add_field(name="Users Waiting", value=str(int(count or 0)), inline=True)
+            return await interaction.edit_original_response(embed=embed)
+
+        if act == "queue_panel":
+            if not channel:
+                return await interaction.edit_original_response(content="Provide channel to host the queue panel.")
+            counts = await self._get_queue_counts(guild.id)
+            embed = self._build_queue_embed(guild, counts)
+            # Try to reuse existing message if present in same channel
+            row = await self._get_queue_panel_row(guild.id)
+            panel_msg = None
+            if row:
+                if int(row["channel_id"]) == channel.id:
+                    try:
+                        panel_msg = await channel.fetch_message(int(row["message_id"]))
+                    except Exception:
+                        panel_msg = None
+            if panel_msg:
+                await panel_msg.edit(embed=embed)
+                await self._upsert_queue_panel_row(guild.id, channel.id, panel_msg.id)
+                return await interaction.edit_original_response(content=f"✅ Queue panel updated in {channel.mention}.")
+            else:
+                sent = await channel.send(embed=embed)
+                await self._upsert_queue_panel_row(guild.id, channel.id, sent.id)
+                return await interaction.edit_original_response(content=f"✅ Queue panel created in {channel.mention}.")
+
+        return await interaction.edit_original_response(content="Unknown action.")
 
     # ----- Queue Helpers -----
 
@@ -917,32 +1090,51 @@ class Matchmaker(commands.Cog):
     async def _create_match_thread(self, guild: discord.Guild, u1_id: int, u2_id: int) -> Optional[discord.Thread]:
         try:
             cfg = await self.get_config(guild.id)
-            channel_id = cfg.get("channel_id") if cfg else None
-            channel = guild.get_channel(channel_id) if channel_id else None
-            if not channel:
+            # parent_channel_id is what /mm writes; channel_id is the older field
+            # name, still honoured for guilds configured before the rename.
+            channel_id = None
+            if cfg:
+                channel_id = cfg.get("parent_channel_id") or cfg.get("channel_id")
+            channel = guild.get_channel(int(channel_id)) if channel_id else None
+            if not isinstance(channel, discord.TextChannel):
                 for ch in guild.text_channels:
                     if ch.permissions_for(guild.me).create_private_threads:
                         channel = ch
                         break
-            if not channel:
+            if not isinstance(channel, discord.TextChannel):
                 return None
 
+            room_no = await self.consume_room_number(guild.id)
             ts = int(time.time())
-            thread = await channel.create_thread(
-                name=f"match-{u1_id}-{u2_id}-{ts}",
-                type=discord.ChannelType.private_thread,
-                reason="Matchmaking"
-            )
 
             m1 = guild.get_member(u1_id) or await guild.fetch_member(u1_id)
             m2 = guild.get_member(u2_id) or await guild.fetch_member(u2_id)
             for m in (m1, m2):
                 if m:
-                    await self._grant_thread_overwrites(thread, m)
-                    await thread.add_user(m)
+                    await self._ensure_thread_perms(channel, m)
 
-            meta = {"pairs": [u1_id, u2_id], "created_at": ts}
-            self.match_meta[thread.id] = meta
+            thread = await channel.create_thread(
+                name=f"Room {room_no}",
+                type=discord.ChannelType.private_thread,
+                auto_archive_duration=1440,
+                invitable=False,
+                reason="Matchmaking"
+            )
+
+            for m in (m1, m2):
+                if m:
+                    try:
+                        await thread.add_user(m)
+                    except Exception:
+                        pass
+                    await self._grant_thread_overwrites(thread, m)
+
+            self.match_meta[thread.id] = {
+                "guild_id": guild.id,
+                "pairs": [u1_id, u2_id],
+                "created_at": ts,
+                "room_no": room_no,
+            }
 
             await self.matches_col.update_one(
                 {"thread_id": thread.id},
@@ -953,12 +1145,29 @@ class Matchmaker(commands.Cog):
                     "user2_id": u2_id,
                     "status": "open",
                     "created_at": ts,
-                    "last_activity": ts
+                    "last_activity": ts,
+                    "room_no": room_no
                 }},
                 upsert=True
             )
 
-            self.bot.add_view(ThreadControls(self, guild.id, thread.id))
+            # Post the room embed carrying the Skip/Leave/Report controls. The
+            # view is also registered via add_view so those buttons keep routing
+            # after a restart, but this message is what makes them visible.
+            controls = ThreadControls(self, guild.id, thread.id)
+            try:
+                self.bot.add_view(controls)
+            except Exception:
+                pass
+            try:
+                embed = discord.Embed(
+                    title=f"Room {room_no}",
+                    description="This private room is just for you two. Be respectful, have fun, and enjoy your chat!",
+                    color=EMBED_COLOR
+                )
+                await thread.send(embed=embed, view=controls)
+            except Exception:
+                pass
             return thread
         except Exception:
             return None
@@ -1007,6 +1216,19 @@ class Matchmaker(commands.Cog):
 
                 await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u1_id})
                 await self.waiting_queue_col.delete_one({"guild_id": guild.id, "user_id": u2_id})
+
+                # Record the pairing, now that the thread actually exists.
+                matched_at = int(time.time())
+                for doc in (u1_doc, u2_doc):
+                    try:
+                        await self.queue_history_col.insert_one({
+                            "guild_id": guild.id,
+                            "user_id": int(doc["user_id"]),
+                            "enqueued_at": int(doc["enqueued_at"]),
+                            "matched_at": matched_at,
+                        })
+                    except Exception:
+                        pass
 
                 try:
                     if m1:
@@ -1114,10 +1336,38 @@ class Matchmaker(commands.Cog):
     async def before_cleanup_loop(self):
         await self.bot.wait_until_ready()
 
-    @tasks.loop(minutes=5)
+    @tasks.loop(seconds=20)
     async def queue_panel_loop(self):
         if not self._initialized:
             return
+        try:
+            for guild in list(self.bot.guilds):
+                try:
+                    row = await self._get_queue_panel_row(guild.id)
+                    if not row:
+                        continue
+                    channel = guild.get_channel(int(row["channel_id"]))
+                    if not isinstance(channel, discord.TextChannel):
+                        continue
+                    try:
+                        msg = await channel.fetch_message(int(row["message_id"]))
+                    except Exception:
+                        # Panel message was deleted by hand; stop tracking it
+                        # rather than re-fetching it forever every 20 seconds.
+                        await self._delete_queue_panel_row(guild.id)
+                        continue
+                    counts = await self._get_queue_counts(guild.id)
+                    embed = self._build_queue_embed(guild, counts)
+                    try:
+                        await msg.edit(embed=embed)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     @tasks.loop(minutes=2)
     async def cleanup_loop(self):
