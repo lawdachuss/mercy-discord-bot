@@ -5,6 +5,7 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase, AsyncI
 from dotenv import load_dotenv
 import os
 import asyncio
+import re
 from typing import Optional, Dict, Any, List, Union
 import logging
 import random
@@ -508,6 +509,24 @@ class AFK(commands.Cog):
                 logger.error(f"Error fetching AFK status for {user_id}: {e}")
             return None
 
+    def _sanitize_reason(self, reason: str) -> str:
+        """Escape markdown in the AFK reason while keeping emoji mentions intact.
+
+        ``discord.utils.escape_markdown`` escapes ``_``, so a custom emoji like
+        ``<:eclairs_cutecry:123>`` became ``<:eclairs\\_cutecry:123>`` and Discord
+        rendered the whole thing as plain text. Emoji mentions are therefore
+        pulled out, the remaining text is escaped, and they are put back.
+        """
+        emoji_pattern = re.compile(r"<a?:[A-Za-z0-9_]{2,32}:\d{17,20}>")
+        parts = emoji_pattern.split(reason.strip())
+        # split() with one capture group returns [text, sep, text, sep, ...]
+        # so the odd indices are the emoji mentions to restore untouched.
+        escaped = [discord.utils.escape_markdown(part) for part in parts[::2]]
+        result = escaped[0] if escaped else ""
+        for emoji, text in zip(parts[1::2], escaped[1:]):
+            result += emoji + text
+        return result[:self.max_reason_length]
+
     async def set_afk_status(self, user_id: int, reason: str, scope: str = "global", server_id: Optional[int] = None) -> bool:
         """Set or update a user's AFK status with a scope (global or server)."""
         # Nicknames edited before the DB write; if the write fails they must be
@@ -515,7 +534,7 @@ class AFK(commands.Cog):
         # trigger its removal. (member, nickname-before-edit)
         edited_members: List[tuple] = []
         try:
-            reason = discord.utils.escape_markdown(reason.strip())[:self.max_reason_length]
+            reason = self._sanitize_reason(reason)
             now = datetime.now(timezone.utc)
             
             # Handle nickname updates
