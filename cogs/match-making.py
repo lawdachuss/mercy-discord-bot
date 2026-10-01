@@ -1,5 +1,4 @@
-﻿import os
-import time
+﻿import time
 import random
 import logging
 import json
@@ -18,6 +17,19 @@ EMBED_COLOR = 0x2F3136
 SKIP_BLOCK_MINUTES = 1440  # 24 hours
 MAX_DB_CANDIDATES = 2000
 SCAN_WINDOW = 200
+
+# Banner shown on the matchmaking panel embeds.
+#
+# Must be the *raw* GitHub URL, not the /blob/ link: /blob/ serves an HTML
+# page, which Discord cannot render. raw.githubusercontent.com serves the
+# bytes directly, with a .gif extension and image/gif content type, which is
+# what Discord's image proxy needs to display (and animate) an embed image.
+#
+# Point this somewhere else to rebrand; the file is ~8 MB, so hosting it
+# yourself is worth it if you ever change it.
+MATCHMAKER_BANNER_URL = (
+    "https://raw.githubusercontent.com/vasud3v/mercy/master/banner.gif"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -865,17 +877,12 @@ class Matchmaker(commands.Cog):
                 description="Get paired with a random stranger in a private room for a one-on-one chat.",
                 color=EMBED_COLOR
             )
-            # Optional banner
+            embed.set_image(url=MATCHMAKER_BANNER_URL)
+
             try:
-                if os.path.exists("banner.gif"):
-                    embed.set_image(url="attachment://banner.gif")
-                    with open("banner.gif", "rb") as f:
-                        banner_file = discord.File(f, filename="banner.gif")
-                        await channel.send(embed=embed, view=MatchPanel(self), file=banner_file)
-                else:
-                    await channel.send(embed=embed, view=MatchPanel(self))
-            except Exception:
                 await channel.send(embed=embed, view=MatchPanel(self))
+            except Exception:
+                logger.exception("Matchmaking: could not post panel in guild %s", guild.id)
 
             return await interaction.edit_original_response(content="✅ Setup complete! Matchmaking panel created.")
 
@@ -889,16 +896,12 @@ class Matchmaker(commands.Cog):
                 description="Click the button below to find your match.",
                 color=EMBED_COLOR
             )
+            embed.set_image(url=MATCHMAKER_BANNER_URL)
+
             try:
-                if os.path.exists("banner.gif"):
-                    embed.set_image(url="attachment://banner.gif")
-                    with open("banner.gif", "rb") as f:
-                        banner_file = discord.File(f, filename="banner.gif")
-                        await channel.send(embed=embed, view=MatchPanel(self), file=banner_file)
-                else:
-                    await channel.send(embed=embed, view=MatchPanel(self))
-            except Exception:
                 await channel.send(embed=embed, view=MatchPanel(self))
+            except Exception:
+                logger.exception("Matchmaking: could not post panel in guild %s", guild.id)
 
             return await interaction.edit_original_response(content=f"✅ Configured to {channel.mention}")
 
