@@ -40,6 +40,24 @@ def mongo_client_closed(client) -> bool:
 # Load environment variables
 load_dotenv()
 
+# ----- Emoji -----
+#
+# These are standard Unicode emoji on purpose. The AFK UI previously used
+# custom emoji (hardcoded `<:og_left:...>`, `<a:white_tick:...>`, etc.), which
+# rendered as blank boxes for most users: Discord only shows a custom emoji to
+# someone who is a member of the server that uploaded it, or to a Nitro
+# subscriber. An emoji hosted on any other server is therefore invisible here
+# no matter how the mention is spelled - and the old set mixed static
+# (`<:name:id>`) and animated (`<a:name:id>`) forms and used a mixed-case name,
+# all of which are easy to get subtly wrong.
+#
+# Unicode emoji carry none of those constraints: no guild membership, no
+# Nitro, no boost tier, and no `a:`-vs-`:` prefix to get wrong.
+EMOJI_TICK = "\u2705"          # success
+EMOJI_AFK = "\U0001F319"       # crescent moon, shown next to the scope prompt
+EMOJI_PREV = "\u2B05\uFE0F"   # left arrow, paginator
+EMOJI_NEXT = "\u27A1\uFE0F"   # right arrow, paginator
+
 class DatabaseError(Exception):
     """Custom exception for database-related errors."""
     pass
@@ -179,7 +197,7 @@ class MentionPaginator(discord.ui.View):
 
         return embed
 
-    @discord.ui.button(emoji="<:og_left:1426488800875380818>", style=discord.ButtonStyle.secondary, disabled=True)
+    @discord.ui.button(emoji=EMOJI_PREV, style=discord.ButtonStyle.secondary, disabled=True)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Show the previous mention."""
         if interaction.user.id != self.author.id:
@@ -188,7 +206,7 @@ class MentionPaginator(discord.ui.View):
         await self._update_buttons()
         await interaction.response.edit_message(embed=self.get_page_content(), view=self)
 
-    @discord.ui.button(emoji="<:og_right:1426489179159658578>", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(emoji=EMOJI_NEXT, style=discord.ButtonStyle.secondary)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Show the next mention."""
         if interaction.user.id != self.author.id:
@@ -254,7 +272,7 @@ class AFKChoiceView(discord.ui.View):
         success = await self.afk_cog.set_afk_status(interaction.user.id, self.afk_reason, scope="global", server_id=None)
         if success:
             embed = discord.Embed(
-                description=f"<a:white_tick:1426439810733572136> | Successfully set your AFK status for reason: {self.afk_reason}",
+                description=f"{EMOJI_TICK} | Successfully set your AFK status for reason: {self.afk_reason}",
                 color=random.randint(0, 0xFFFFFF)
             )
             await interaction.followup.send(embed=embed)
@@ -281,7 +299,7 @@ class AFKChoiceView(discord.ui.View):
         success = await self.afk_cog.set_afk_status(interaction.user.id, self.afk_reason, scope="server", server_id=server_id)
         if success:
             embed = discord.Embed(
-                description=f"<a:white_tick:1426439810733572136> | Successfully set your AFK status for reason: {self.afk_reason}",
+                description=f"{EMOJI_TICK} | Successfully set your AFK status for reason: {self.afk_reason}",
                 color=random.randint(0, 0xFFFFFF)
             )
             await interaction.followup.send(embed=embed)
@@ -674,7 +692,7 @@ class AFK(commands.Cog):
         """
         try:
             embed = discord.Embed(
-                description="<:FairyBadg:1426484412870295714> Please choose your AFK scope:",
+                description=f"{EMOJI_AFK} Please choose your AFK scope:",
                 color=random.randint(0, 0xFFFFFF)
             )
             view = AFKChoiceView(reason, self, ctx.author)
