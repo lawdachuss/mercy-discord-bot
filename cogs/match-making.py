@@ -58,6 +58,41 @@ async def safe_reply(interaction: discord.Interaction, content: Optional[str] = 
         except Exception:
             pass
 
+async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True) -> bool:
+    """Claim Discord's interaction window *before* doing any database work.
+
+    A button handler has three seconds to send its first response. The shared
+    Mongo client is configured with a 5s serverSelectionTimeoutMS and a 10s
+    socketTimeoutMS over a pool of only 10 sockets, so anything that makes an
+    operation wait - pool exhaustion, a reconnect, a cold index - can outlast
+    that window. When it does, Discord shows the user "The application didn't
+    respond in time" and the bot's own error message is discarded, which is
+    precisely what a slow database should never be allowed to do.
+
+    Deferring first raises the ceiling from 3 seconds to 15 minutes, so the
+    user always gets a real reply with a real explanation.
+    """
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+    except Exception:
+        logger.warning(
+            "Matchmaking: could not defer interaction for user %s; it may already have expired",
+            getattr(interaction.user, "id", "?"), exc_info=True,
+        )
+    return interaction.response.is_done()
+
+async def safe_edit(interaction: discord.Interaction, content: Optional[str] = None, embed: Optional[discord.Embed] = None, view: Optional[discord.ui.View] = None):
+    """Finish an interaction that safe_defer() already claimed."""
+    try:
+        if interaction.response.is_done():
+            await interaction.edit_original_response(content=content, embed=embed, view=view)
+            return
+    except Exception:
+        pass
+    # Either the defer never landed or the response can no longer be edited.
+    await safe_reply(interaction, content=content, embed=embed, ephemeral=True, view=view)
+
 # ----- Notification Manager -----
 
 class NotificationManager:
@@ -217,23 +252,33 @@ class MatchPanel(discord.ui.View):
                 embed.description = "The bot needs permission to create private threads to function properly."
                 return await safe_reply(interaction, embed=embed, ephemeral=True)
 
+            # Claim the window before the database work. Everything below is
+            # network round trips against Mongo, and they used to run before the
+            # first response - so a slow or busy database turned into "The
+            # application didn't respond in time" instead of an error we control.
+            await safe_defer(interaction, ephemeral=True)
+
             await self.cog.enqueue(interaction.guild.id, interaction.user.id)
             pos, total, eta = await self.cog.get_position_and_eta(interaction.guild.id, interaction.user.id)
             minutes = eta // 60
             seconds = eta % 60
             embed = discord.Embed(title="Queue Position", color=EMBED_COLOR)
             embed.description = f"⏰ You are currently **#{pos}** in the chat queue\n👥 **Total Users Waiting:** {total}\n\nEstimated wait: {minutes}m {seconds}s"
-            await safe_reply(interaction, embed=embed, ephemeral=True)
-            
+            await safe_edit(interaction, embed=embed)
+
         except ValueError as e:
             embed = discord.Embed(title="Cannot Join Queue", color=0xE74C3C)
             embed.description = str(e)
-            await safe_reply(interaction, embed=embed, ephemeral=True)
-            
+            await safe_edit(interaction, embed=embed)
+
         except Exception:
+            logger.exception(
+                "Matchmaking: failed to queue user %s in guild %s",
+                interaction.user.id, interaction.guild.id,
+            )
             embed = discord.Embed(title="Error queuing. Please try again.", color=0xE74C3C)
             embed.description = "An unexpected error occurred. Please try again."
-            await safe_reply(interaction, embed=embed, ephemeral=True)
+            await safe_edit(interaction, embed=embed)
 
 class ThreadControls(discord.ui.View):
     def __init__(self, cog: "Matchmaker", guild_id: int, thread_id: int):
@@ -272,6 +317,10 @@ class ThreadControls(discord.ui.View):
             other_id = self.cog._get_other_id(self.thread_id, interaction.user.id)
             if not other_id:
                 return await safe_reply(interaction, embed=discord.Embed(title="No active match found.", color=0xE74C3C))
+
+            # Claim the window: a skip does several database round trips
+            # (block, record, re-queue) plus DMs before it replies.
+            await safe_defer(interaction, ephemeral=True)
 
             try:
                 await thread.remove_user(interaction.user)
@@ -328,7 +377,7 @@ class ThreadControls(discord.ui.View):
                 title="You skipped. Re-queued for a new match." if requeued else "You skipped. You are already in the queue.",
                 color=EMBED_COLOR,
             )
-            await safe_reply(interaction, embed=embed, ephemeral=True)
+            await safe_edit(interaction, embed=embed)
 
             try:
                 meta = self.cog.match_meta.get(self.thread_id)
@@ -352,8 +401,12 @@ class ThreadControls(discord.ui.View):
             except Exception:
                 pass
         except Exception:
+            logger.exception(
+                "Matchmaking: skip failed for user %s in thread %s",
+                interaction.user.id, self.thread_id,
+            )
             embed = discord.Embed(title="Error processing skip. Please try again.", color=0xE74C3C)
-            await safe_reply(interaction, embed=embed)
+            await safe_edit(interaction, embed=embed)
 
     async def _on_leave(self, interaction: discord.Interaction):
         try:
@@ -362,6 +415,10 @@ class ThreadControls(discord.ui.View):
                 return await safe_reply(interaction, embed=discord.Embed(title="Thread not found.", color=0xE74C3C))
 
             other_id = self.cog._get_other_id(self.thread_id, interaction.user.id)
+
+            # Claim the window: leaving writes a block row, DM's the partner
+            # and records a pending deletion before it replies.
+            await safe_defer(interaction, ephemeral=True)
 
             try:
                 await thread.remove_user(interaction.user)
@@ -380,7 +437,7 @@ class ThreadControls(discord.ui.View):
                 pass
 
             embed = discord.Embed(title="You left the match. This room will be deleted in 2 minutes.", color=EMBED_COLOR)
-            await safe_reply(interaction, embed=embed, ephemeral=True)
+            await safe_edit(interaction, embed=embed)
 
             async def _delete_later():
                 await asyncio.sleep(120)
@@ -408,8 +465,12 @@ class ThreadControls(discord.ui.View):
             except Exception:
                 pass
         except Exception:
+            logger.exception(
+                "Matchmaking: leave failed for user %s in thread %s",
+                interaction.user.id, self.thread_id,
+            )
             embed = discord.Embed(title="Error processing leave. Please try again.", color=0xE74C3C)
-            await safe_reply(interaction, embed=embed)
+            await safe_edit(interaction, embed=embed)
 
     async def _on_report(self, interaction: discord.Interaction):
         try:
@@ -431,6 +492,9 @@ class ThreadControls(discord.ui.View):
                 self.cog.bot.add_view(modal)
             except Exception:
                 logger.exception("Matchmaking: could not register report modal")
+            # Note: a modal submission is its own interaction with its own 3s
+            # window, so the handler below is fast and needs no defer - but
+            # nothing here may touch the database first.
             await interaction.response.send_modal(modal)
         except Exception:
             embed = discord.Embed(title="Error processing report. Please try again.", color=0xE74C3C)
@@ -1087,41 +1151,40 @@ class Matchmaker(commands.Cog):
         ts = int(time.time())
         max_retries = 3
         last_error = None
-        
-        try:
-            existing = await self.waiting_queue_col.find_one(
-                {"guild_id": guild_id, "user_id": user_id},
-                {"_id": 1}
-            )
-            if existing:
-                raise ValueError("You are already in the queue!")
-        except ValueError:
-            raise
-        except Exception:
-            pass
-            
+
         for attempt in range(max_retries):
             try:
-                wait = 0
-                score = wait // 60
-                await self.waiting_queue_col.update_one(
+                # One atomic round trip instead of find_one() then update_one().
+                # The old pair had two problems: it doubled the latency on the
+                # hottest user action in the cog, and the "is this user already
+                # queued" check ran in a separate operation from the insert, so
+                # two people clicking at once could both pass the check and one
+                # would silently overwrite the other's enqueued_at. $setOnInsert
+                # makes the create-if-absent decision server-side against the
+                # unique (guild_id, user_id) index, and upserted_id tells us which
+                # of the two happened.
+                res = await self.waiting_queue_col.update_one(
                     {"guild_id": guild_id, "user_id": user_id},
-                    {"$set": {
+                    {"$setOnInsert": {
                         "guild_id": guild_id,
                         "user_id": user_id,
                         "enqueued_at": ts,
-                        "priority_score": score,
+                        "priority_score": 0,
                         "boost_until": None
                     }},
                     upsert=True
                 )
+                if getattr(res, "upserted_id", None) is None:
+                    raise ValueError("You are already in the queue!")
                 return
+            except ValueError:
+                raise
             except Exception as e:
                 last_error = e
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.1 * (attempt + 1))
                 continue
-        
+
         raise last_error
 
     async def get_position_and_eta(self, guild_id: int, user_id: int) -> Tuple[int, int, int]:
