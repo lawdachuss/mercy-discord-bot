@@ -1,7 +1,5 @@
 ﻿import time
-import random
 import logging
-import json
 import io
 import asyncio
 import math
@@ -16,6 +14,9 @@ from pymongo import ReturnDocument
 EMBED_COLOR = 0x2F3136
 SKIP_BLOCK_MINUTES = 1440  # 24 hours
 MAX_DB_CANDIDATES = 2000
+# How many pages of the queue to walk when collecting live candidates. Bounds
+# the worst case where a guild's queue head is entirely stale rows.
+MAX_QUEUE_PAGES = 5
 SCAN_WINDOW = 200
 
 # Banner shown on the matchmaking panel embeds.
@@ -137,23 +138,33 @@ notif_manager = NotificationManager()
 # ----- Member Roles Cache (to minimize fetch_member in big servers) -----
 
 class MemberRoleCache:
+    """Per-(guild, user) role cache.
+
+    Keyed by BOTH ids on purpose. Role *ids* are globally unique, but the set of
+    roles a user holds is a property of a (user, guild) pair: the same person in
+    two of the bot's servers has different role sets. Keying on user_id alone
+    returned the first guild's roles for every other guild, which is wrong for
+    any role-based matching rule.
+    """
+
     def __init__(self, max_size: int = 5000, ttl_seconds: int = 300):
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
-        self._cache: Dict[int, Tuple[int, set[int]]] = {}
-        self._order: List[int] = []
+        self._cache: Dict[Tuple[int, int], Tuple[int, set[int]]] = {}
+        self._order: List[Tuple[int, int]] = []
         self._lock = asyncio.Lock()
 
     async def get_roles(self, guild: discord.Guild, user_id: int) -> Optional[set[int]]:
         now = int(time.time())
+        key = (int(guild.id), int(user_id))
         async with self._lock:
-            item = self._cache.get(user_id)
+            item = self._cache.get(key)
             if item and now - item[0] <= self.ttl_seconds:
                 try:
-                    self._order.remove(user_id)
+                    self._order.remove(key)
                 except ValueError:
                     pass
-                self._order.append(user_id)
+                self._order.append(key)
                 return set(item[1])
         try:
             member = guild.get_member(user_id)
@@ -168,14 +179,22 @@ class MemberRoleCache:
         if roles is None:
             return None
         async with self._lock:
-            self._cache[user_id] = (now, set(roles))
-            self._order.append(user_id)
-            if len(self._order) > self.max_size:
+            # Re-check: another coroutine may have populated this while we
+            # awaited, and _order can already hold a stale entry for it.
+            if key in self._cache:
+                try:
+                    self._order.remove(key)
+                except ValueError:
+                    pass
+            self._cache[key] = (now, set(roles))
+            self._order.append(key)
+            while len(self._order) > self.max_size:
                 try:
                     oldest = self._order.pop(0)
-                    self._cache.pop(oldest, None)
-                except Exception:
-                    pass
+                except IndexError:
+                    break
+                if oldest in self._cache:
+                    del self._cache[oldest]
         return set(roles)
 
 # ----- UI Views -----
@@ -211,7 +230,7 @@ class MatchPanel(discord.ui.View):
             embed.description = str(e)
             await safe_reply(interaction, embed=embed, ephemeral=True)
             
-        except Exception as e:
+        except Exception:
             embed = discord.Embed(title="Error queuing. Please try again.", color=0xE74C3C)
             embed.description = "An unexpected error occurred. Please try again."
             await safe_reply(interaction, embed=embed, ephemeral=True)
@@ -271,11 +290,30 @@ class ThreadControls(discord.ui.View):
                 })
             except Exception:
                 pass
-            await self.cog.enqueue(self.guild_id, interaction.user.id)
+            # The re-queue is the only step that can legitimately fail here, and
+            # it must not abort the rest: block_pair, the skip record and the
+            # thread teardown below have already happened, so letting this raise
+            # skipped the partner notification, the dual-skip vote and the
+            # confirmation embed, leaving the user staring at a generic error
+            # for an action that in fact mostly succeeded.
+            requeued = True
+            try:
+                await self.cog.enqueue(self.guild_id, interaction.user.id)
+            except ValueError:
+                # Already waiting (a second panel, or a double click). Fine -
+                # they are in the queue either way.
+                requeued = False
+            except Exception:
+                requeued = False
+                logger.exception(
+                    "Matchmaking: could not re-queue user %s after skip in guild %s",
+                    interaction.user.id, self.guild_id,
+                )
 
             await notif_manager.send(
                 interaction.user,
-                "Skipped your current match. You've been re-queued for a new match.",
+                "Skipped your current match. You've been re-queued for a new match."
+                if requeued else "Skipped your current match. You are already in the queue.",
                 "skip"
             )
 
@@ -286,7 +324,10 @@ class ThreadControls(discord.ui.View):
             except Exception:
                 pass
 
-            embed = discord.Embed(title="You skipped. Re-queued for a new match.", color=EMBED_COLOR)
+            embed = discord.Embed(
+                title="You skipped. Re-queued for a new match." if requeued else "You skipped. You are already in the queue.",
+                color=EMBED_COLOR,
+            )
             await safe_reply(interaction, embed=embed, ephemeral=True)
 
             try:
@@ -302,7 +343,7 @@ class ThreadControls(discord.ui.View):
                         except Exception:
                             pass
                         await self.cog._close_match_row(self.thread_id)
-                        self.cog.match_meta.pop(self.thread_id, None)
+                        self.cog._forget_thread_state(self.thread_id)
                         try:
                             await self.cog.pending_deletions_col.delete_one({"thread_id": self.thread_id})
                         except Exception:
@@ -350,8 +391,7 @@ class ThreadControls(discord.ui.View):
                 except Exception:
                     pass
                 await self.cog._close_match_row(self.thread_id)
-                self.cog.match_meta.pop(self.thread_id, None)
-                self.cog._activity_write_ts.pop(self.thread_id, None)
+                self.cog._forget_thread_state(self.thread_id)
                 try:
                     await self.cog.pending_deletions_col.delete_one({"thread_id": self.thread_id})
                 except Exception:
@@ -381,6 +421,16 @@ class ThreadControls(discord.ui.View):
                 return await safe_reply(interaction, embed=discord.Embed(title="Could not find the other participant.", color=0xE74C3C))
 
             modal = ReportModal(self.cog, self.thread_id, other_id)
+            # Register the modal before showing it. dispatch_modal() looks the
+            # submission up by custom_id in the view store and silently discards
+            # anything it cannot find, so an unregistered modal means on_submit
+            # never runs: the user fills the form, submits, and gets "The
+            # application did not respond". Each instance generates a fresh
+            # custom_id, so this has to happen per report.
+            try:
+                self.cog.bot.add_view(modal)
+            except Exception:
+                logger.exception("Matchmaking: could not register report modal")
             await interaction.response.send_modal(modal)
         except Exception:
             embed = discord.Embed(title="Error processing report. Please try again.", color=0xE74C3C)
@@ -414,6 +464,12 @@ class ReportModal(discord.ui.Modal):
         self.add_item(self.details)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Every report registers a modal with a fresh custom_id, so the store
+        # entry has to go or it grows for the life of the process.
+        try:
+            self.cog.bot.remove_view(self)
+        except Exception:
+            pass
         try:
             try:
                 await interaction.response.send_message("Processing your report...", ephemeral=True)
@@ -471,7 +527,7 @@ class ReportModal(discord.ui.Modal):
                             fp=io.BytesIO(transcript.encode("utf-8")),
                             filename=f"transcript_{self.thread_id}.txt"
                         )
-            except Exception as e:
+            except Exception:
                 pass
 
             try:
@@ -479,7 +535,7 @@ class ReportModal(discord.ui.Modal):
                     await report_ch.send(embed=embed, file=transcript_file)
                 else:
                     await report_ch.send(embed=embed)
-            except Exception as e:
+            except Exception:
                 try:
                     await interaction.edit_original_response(content="⚠️ Error sending report to staff. Please contact a moderator.")
                 except discord.errors.NotFound:
@@ -491,7 +547,7 @@ class ReportModal(discord.ui.Modal):
             except discord.errors.NotFound:
                 pass
 
-        except Exception as e:
+        except Exception:
             try:
                 await interaction.edit_original_response(content="❌ Error submitting report. Please try again.")
             except discord.errors.NotFound:
@@ -575,6 +631,25 @@ class Matchmaker(commands.Cog):
 
     def _get_thread_meta(self, thread_id: int):
         return self.match_meta.get(thread_id)
+
+    def _forget_thread_state(self, thread_id: int):
+        """Drop every piece of in-memory state for a finished match.
+
+        The view must be unregistered using the *same instance* that was passed
+        to add_view. discord.py's ViewStore.remove_view compares against the
+        view's own item snapshot, and a freshly constructed ThreadControls has
+        an empty one - so removing a new instance silently does nothing and the
+        store entry (and its routing) survived for the life of the process.
+        """
+        meta = self.match_meta.pop(thread_id, None)
+        self._activity_write_ts.pop(thread_id, None)
+        view = meta.get("view") if isinstance(meta, dict) else None
+        if view is not None:
+            try:
+                self.bot.remove_view(view)
+            except Exception:
+                pass
+        return meta
 
     def _get_other_id(self, thread_id: int, user_id: int) -> Optional[int]:
         meta = self._get_thread_meta(thread_id)
@@ -995,17 +1070,13 @@ class Matchmaker(commands.Cog):
         return await interaction.edit_original_response(content="Unknown action.")
 
     # ----- Queue Helpers -----
-
-    async def calculate_priority(self, guild_id: int, user_id: int) -> int:
-        doc = await self.waiting_queue_col.find_one(
-            {"guild_id": guild_id, "user_id": user_id},
-            {"enqueued_at": 1, "boost_until": 1}
-        )
-        if not doc:
-            return 0
-        wait = int(time.time()) - int(doc["enqueued_at"])
-        score = wait // 60
-        return int(score)
+    #
+    # There used to be calculate_priority/update_priority here. Neither had a
+    # caller: priority is actually computed fresh inside dequeue_pair on every
+    # scan (waiting minutes, plus a skip bonus), because a value stored at
+    # enqueue time goes stale immediately. The stored priority_score therefore
+    # stayed 0 forever, which is harmless - it just means ranking falls through
+    # to enqueued_at, i.e. first-in-first-out.
 
     async def enqueue(self, guild_id: int, user_id: int):
         if not isinstance(guild_id, int) or guild_id <= 0:
@@ -1026,7 +1097,7 @@ class Matchmaker(commands.Cog):
                 raise ValueError("You are already in the queue!")
         except ValueError:
             raise
-        except Exception as e:
+        except Exception:
             pass
             
         for attempt in range(max_retries):
@@ -1054,44 +1125,125 @@ class Matchmaker(commands.Cog):
         raise last_error
 
     async def get_position_and_eta(self, guild_id: int, user_id: int) -> Tuple[int, int, int]:
-        cursor = self.waiting_queue_col.find(
-            {"guild_id": guild_id},
-            {"user_id": 1, "enqueued_at": 1, "priority_score": 1}
+        # Ranked with counting queries rather than by pulling the whole queue
+        # into memory and sorting it client-side: a busy guild's queue is
+        # unbounded, and this runs on every button press.
+        row = await self.waiting_queue_col.find_one(
+            {"guild_id": guild_id, "user_id": int(user_id)},
+            {"priority_score": 1, "enqueued_at": 1},
         )
-        rows = await cursor.to_list(length=None)
-        if not rows:
-            return (0, 0, 0)
-        cands: List[Dict[str, Any]] = [dict(r) for r in rows]
-        cands.sort(key=lambda x: (-int(x["priority_score"]), int(x["enqueued_at"])))
-        total = len(cands)
-        position = next((i + 1 for i, r in enumerate(cands) if int(r["user_id"]) == int(user_id)), 0)
-        if position == 0:
-            return (0, total, 0)
-        ahead = max(0, position - 1)
+        if not row:
+            return (0, await self.waiting_queue_col.count_documents({"guild_id": guild_id}), 0)
+
+        my_score = int(row.get("priority_score") or 0)
+        my_ts = int(row.get("enqueued_at") or 0)
+        # Same ordering as dequeue_pair: highest priority first, then oldest.
+        ahead = await self.waiting_queue_col.count_documents({
+            "guild_id": guild_id,
+            "$or": [
+                {"priority_score": {"$gt": my_score}},
+                {"priority_score": my_score, "enqueued_at": {"$lt": my_ts}},
+            ],
+        })
+        total = await self.waiting_queue_col.count_documents({"guild_id": guild_id})
+        position = min(int(ahead) + 1, int(total) or 1)
+        # Two people are consumed per match, so a slot frees roughly every other
+        # match_loop tick (~20s) when the rest of the queue is matchable.
         pair_slots = max(1, math.ceil(ahead / 2))
         eta_seconds = pair_slots * 20
         return (position, total, eta_seconds)
 
-    async def update_priority(self, guild_id: int, user_id: int):
-        score = await self.calculate_priority(guild_id, user_id)
-        await self.waiting_queue_col.update_one(
-            {"guild_id": guild_id, "user_id": user_id},
-            {"$set": {"priority_score": score}}
-        )
+    async def _purge_dead_queue_rows(self, guild: discord.Guild, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Drop queue rows that can never be matched.
+
+        Two kinds of row are dead weight:
+
+        * a user who has left the guild (or is otherwise unresolvable), and
+        * a duplicate row for a user who already has one.
+
+        Neither could ever produce a match - the pairing loop skips them - but
+        they stayed in the collection forever and, because candidates are read
+        oldest-first under a LIMIT, a few thousand stale rows at the front of
+        the queue meant the real waiters were never even fetched, so the guild
+        stopped matching altogether.
+        """
+        alive: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+        dead_ids: List[object] = []
+        for row in candidates:
+            try:
+                uid = int(row["user_id"])
+            except (KeyError, TypeError, ValueError):
+                dead_ids.append(row.get("_id"))
+                continue
+            if uid in seen:
+                dead_ids.append(row.get("_id"))
+                continue
+            if await self._roles_cache.get_roles(guild, uid) is None:
+                dead_ids.append(row.get("_id"))
+                continue
+            seen.add(uid)
+            alive.append(row)
+
+        dead_ids = [i for i in dead_ids if i is not None]
+        if dead_ids:
+            try:
+                await self.waiting_queue_col.delete_many({"_id": {"$in": dead_ids}})
+            except Exception:
+                logger.exception(
+                    "Matchmaking: could not prune %d dead queue rows in guild %s",
+                    len(dead_ids), guild.id,
+                )
+        return alive
+
+    async def _load_live_candidates(self, guild: discord.Guild, want: int) -> List[Dict[str, Any]]:
+        """Return up to `want` queue rows that could actually be matched.
+
+        Reads in pages of MAX_DB_CANDIDATES and drops the unusable rows as it
+        goes. Paging matters: candidates are read oldest-first under a LIMIT, so
+        if the head of a guild's queue is made up of members who have since
+        left, a single page can be entirely dead weight and the live waiters
+        behind them are never even fetched - the guild then stops matching
+        entirely, even though nothing about the bot has changed. Deleting the
+        dead rows as we go both unblocks the window and stops the queue length
+        from overstating how many people are really waiting.
+        """
+        alive: List[Dict[str, Any]] = []
+        for _ in range(MAX_QUEUE_PAGES):
+            if len(alive) >= want:
+                break
+            # skip(len(alive)) is exact because of what _purge_dead_queue_rows
+            # did on the previous pass: it deleted every row it stepped over and
+            # kept every row in `alive`. So the rows still ahead of the cursor are
+            # precisely the ones already collected, and the deleted ones no
+            # longer shift anything.
+            cursor = self.waiting_queue_col.find(
+                {"guild_id": guild.id},
+                {"user_id": 1, "enqueued_at": 1, "boost_until": 1}
+            ).sort("enqueued_at", 1).skip(len(alive)).limit(MAX_DB_CANDIDATES)
+            page = await cursor.to_list(length=MAX_DB_CANDIDATES)
+            if not page:
+                break
+            fresh = await self._purge_dead_queue_rows(guild, [dict(r) for r in page])
+            if not fresh:
+                if len(page) < MAX_DB_CANDIDATES:
+                    break
+                # Whole page was dead and is now deleted, so the next iteration's
+                # window slides forward by a full page on its own.
+                continue
+            alive.extend(fresh)
+        return alive[:want] if want else alive
 
     async def dequeue_pair(self, guild: discord.Guild):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                cursor = self.waiting_queue_col.find(
-                    {"guild_id": guild.id},
-                    {"user_id": 1, "enqueued_at": 1, "boost_until": 1}
-                ).sort("enqueued_at", 1).limit(MAX_DB_CANDIDATES)
-                candidates = await cursor.to_list(length=MAX_DB_CANDIDATES)
-                if len(candidates) < 2:
+                cands: List[Dict[str, Any]] = await self._load_live_candidates(
+                    guild, 2 * SCAN_WINDOW + 1
+                )
+                if len(cands) < 2:
                     return None
 
-                cands: List[Dict[str, Any]] = [dict(r) for r in candidates]
                 now_ts = int(time.time())
                 pipeline = [
                     {"$match": {"guild_id": guild.id, "skipped_at": {"$gte": now_ts - 300}}},
@@ -1142,34 +1294,47 @@ class Matchmaker(commands.Cog):
                     recently_matched.add(int(match["user1_id"]))
                     recently_matched.add(int(match["user2_id"]))
 
-                async def get_roles(uid: int) -> Optional[set[int]]:
-                    return await self._roles_cache.get_roles(guild, int(uid))
+                # Only the first 2 * SCAN_WINDOW + 1 candidates can ever take
+                # part in a pair (see the slice below), so resolve their roles
+                # once here. The old code awaited a locked cache lookup twice per
+                # *pair*, which is up to 2 * SCAN_WINDOW**2 awaits - around
+                # 80 000 per guild per tick, enough to stall the event loop
+                # while the queue was busy and nothing matched.
+                window = cands[: 2 * SCAN_WINDOW + 1]
+                roles_by_user: Dict[int, Optional[set[int]]] = {}
+                for row in window:
+                    uid = int(row["user_id"])
+                    if uid not in roles_by_user:
+                        roles_by_user[uid] = await self._roles_cache.get_roles(guild, uid)
+                # Someone who is not (or is no longer) a guild member can never
+                # be added to a private thread. Tested with `is None` rather than
+                # truthiness: an empty role set is falsy but still a real member.
+                window = [r for r in window if roles_by_user.get(int(r["user_id"])) is not None]
+                if len(window) < 2:
+                    return None
 
-                def ok(pref: str, roles: Optional[set[int]]) -> bool:
-                        return roles is not None
-
-                for i, u1 in enumerate(cands[:SCAN_WINDOW]):
-                    for u2 in cands[i + 1:i + 1 + SCAN_WINDOW]:
-                        # A duplicate row for the same user would otherwise let
-                        # someone be paired with themselves.
-                        if int(u1["user_id"]) == int(u2["user_id"]):
+                for i, u1 in enumerate(window[:SCAN_WINDOW]):
+                    for u2 in window[i + 1:i + 1 + SCAN_WINDOW]:
+                        uid1 = int(u1["user_id"])
+                        uid2 = int(u2["user_id"])
+                        if uid1 == uid2:
                             continue
-                        pair_sorted = tuple(sorted((int(u1["user_id"]), int(u2["user_id"])) ))
+                        pair_sorted = (uid1, uid2) if uid1 < uid2 else (uid2, uid1)
                         if pair_sorted in blocks:
                             continue
-                        if int(u1["user_id"]) in recently_matched or int(u2["user_id"]) in recently_matched:
+                        if uid1 in recently_matched or uid2 in recently_matched:
                             continue
-                        r1 = await get_roles(int(u1["user_id"]))
-                        r2 = await get_roles(int(u2["user_id"]))
-                        if not r1 or not r2:
-                            continue
-                        if ok("random", r2) and ok("random", r1):
-                            return (u1, u2)
+                        return (u1, u2)
                 return None
             except Exception:
+                logger.exception(
+                    "Matchmaking: candidate scan failed for guild %s (attempt %d/%d)",
+                    guild.id, attempt + 1, max_retries,
+                )
                 if attempt == max_retries - 1:
                     return None
                 await asyncio.sleep(0.1 * (attempt + 1))
+        return None
 
     async def _ensure_thread_perms(self, channel: discord.TextChannel, member: discord.Member):
         try:
@@ -1312,16 +1477,20 @@ class Matchmaker(commands.Cog):
             try:
                 self.bot.add_view(controls)
             except Exception:
-                pass
-            try:
-                embed = discord.Embed(
-                    title=f"Room {room_no}",
-                    description="This private room is just for you two. Be respectful, have fun, and enjoy your chat!",
-                    color=EMBED_COLOR
-                )
-                await thread.send(embed=embed, view=controls)
-            except Exception:
-                pass
+                controls = None
+            # Keep the instance so the view can actually be unregistered later;
+            # see _forget_thread_state.
+            self.match_meta[thread.id]["view"] = controls
+            if controls is not None:
+                try:
+                    embed = discord.Embed(
+                        title=f"Room {room_no}",
+                        description="This private room is just for you two. Be respectful, have fun, and enjoy your chat!",
+                        color=EMBED_COLOR
+                    )
+                    await thread.send(embed=embed, view=controls)
+                except Exception:
+                    pass
             return thread
         except Exception:
             return None
@@ -1341,7 +1510,14 @@ class Matchmaker(commands.Cog):
                 # Resolve both members BEFORE removing anyone from the queue so a
                 # failed match never silently drops the other participant.
                 if u1_id == u2_id:
-                    # Corrupt queue state: remove the duplicate(s) and retry later.
+                    # dequeue_pair can no longer produce this - it de-duplicates
+                    # and drops unresolvable rows before returning - so reaching
+                    # here means the invariant broke. Log loudly and drop the row
+                    # rather than pairing someone with themselves.
+                    logger.error(
+                        "Matchmaking: dequeue_pair returned the same user twice in guild %s (%s); purging",
+                        guild.id, u1_id,
+                    )
                     await self.waiting_queue_col.delete_many({"guild_id": guild.id, "user_id": u1_id})
                     return
                 m1 = guild.get_member(u1_id)
@@ -1387,20 +1563,6 @@ class Matchmaker(commands.Cog):
                         })
                     except Exception:
                         pass
-                # Keep only one row per (guild_id, user_id). If duplicates existed,
-                # remove the rest so future operations can't create self-pairs.
-                try:
-                    for doc in (u1_doc, u2_doc):
-                        uid = int(doc["user_id"])
-                        cur = self.waiting_queue_col.find(
-                            {"guild_id": guild.id, "user_id": uid},
-                            {"_id": 1}
-                        )
-                        rows = await cur.to_list(length=None)
-                        for oid in [r["_id"] for r in rows[1:]]:
-                            await self.waiting_queue_col.delete_one({"_id": oid})
-                except Exception:
-                    pass
 
                 try:
                     if m1:
@@ -1410,7 +1572,10 @@ class Matchmaker(commands.Cog):
                 except Exception:
                     pass
         except Exception:
-            pass
+            # This used to be a bare `pass`, which meant any failure in the
+            # matching path left no trace at all: the queue simply stopped
+            # producing rooms and the only symptom was silence.
+            logger.exception("Matchmaking: match attempt failed in guild %s", guild.id)
 
     @tasks.loop(seconds=5)
     async def match_loop(self):
@@ -1423,9 +1588,15 @@ class Matchmaker(commands.Cog):
             if lock.locked():
                 continue
             try:
-                self.bot.loop.create_task(self._attempt_match(guild))
+                # _spawn, not loop.create_task: asyncio only holds a weak
+                # reference to a task, so a bare create_task could be garbage
+                # collected mid-flight. That silently abandoned attempts in the
+                # middle - sometimes after the Discord thread had been created
+                # but before the pair left the queue - which is exactly how rooms
+                # ended up duplicated or orphaned.
+                self._spawn(self._attempt_match(guild))
             except Exception:
-                pass
+                logger.exception("Matchmaking: could not schedule a match attempt for guild %s", guild.id)
 
     @tasks.loop(minutes=1)
     async def cleanup_inactive_threads(self):
@@ -1506,15 +1677,9 @@ class Matchmaker(commands.Cog):
                                 )
                             except Exception:
                                 pass
-                            self.match_meta.pop(thread_id, None)
-                            self._activity_write_ts.pop(thread_id, None)
-                            # Stop routing the thread's buttons now that it is gone.
-                            try:
-                                self.bot.remove_view(
-                                    ThreadControls(self, guild.id, thread_id)
-                                )
-                            except Exception:
-                                pass
+                            # Drops match_meta, the activity throttle and the
+                            # thread's control view (now that it is gone).
+                            self._forget_thread_state(thread_id)
 
                         except Exception:
                             continue
@@ -1524,7 +1689,7 @@ class Matchmaker(commands.Cog):
                     
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except Exception:
             pass
 
     @cleanup_inactive_threads.before_loop
@@ -1593,8 +1758,7 @@ class Matchmaker(commands.Cog):
                     except Exception:
                         pass
                     await self._close_match_row(tid)
-                    self.match_meta.pop(tid, None)
-                    self._activity_write_ts.pop(tid, None)
+                    self._forget_thread_state(tid)
                     try:
                         await self.pending_deletions_col.delete_one({"thread_id": tid})
                     except Exception:
@@ -1644,6 +1808,20 @@ class Matchmaker(commands.Cog):
                 cutoff = now - 86400
                 for tid in [t for t, ts in stale.items() if ts < cutoff]:
                     stale.pop(tid, None)
+            except Exception:
+                pass
+
+            # _locks and _match_backoff are keyed by guild_id and grew for the
+            # life of the process, so a bot in many guilds (or one that had been
+            # in many) never released them.
+            try:
+                live = {g.id for g in self.bot.guilds}
+                for gid in [gid for gid in self._locks if gid not in live]:
+                    lock = self._locks[gid]
+                    if not lock.locked():
+                        self._locks.pop(gid, None)
+                for gid in [gid for gid in self._match_backoff if gid not in live]:
+                    self._match_backoff.pop(gid, None)
             except Exception:
                 pass
         except asyncio.CancelledError:
