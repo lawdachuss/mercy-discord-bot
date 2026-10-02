@@ -1105,6 +1105,7 @@ class DiscordBot(commands.Bot):
             'data_validator.py',  # Data validation utility, not a cog
             'safe_data.py',  # Safe data retrieval utility, not a cog
             'safe_formatter.py',  # Safe formatting utility, not a cog
+            'interaction_utils.py',  # Shared interaction helpers, not a cog
             'README.md',
             'INTEGRATION_GUIDE.md',
             'IMPROVEMENTS_SUMMARY.md'

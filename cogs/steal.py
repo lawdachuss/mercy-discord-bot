@@ -9,6 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 import io
 import asyncio
+from cogs.interaction_utils import deregister_modal, send_modal
 
 logger = logging.getLogger(__name__)
 
@@ -696,6 +697,9 @@ class BrandModal(discord.ui.Modal, title="Set Brand Prefix"):
         self.view = view
 
     async def on_submit(self, interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         text = self.answer.value.strip()
         if text:
             self.view.brand = text
@@ -735,7 +739,7 @@ class BrandView(discord.ui.View):
     async def set_brand(self, interaction, button):
         modal = BrandModal(self)
         try:
-            await interaction.response.send_modal(modal)
+            await send_modal(interaction, modal)
         except discord.HTTPException:
             return
 

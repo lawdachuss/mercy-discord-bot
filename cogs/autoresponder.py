@@ -7,6 +7,7 @@ import pathlib
 import logging
 import asyncio
 import re
+from cogs.interaction_utils import deregister_modal, send_modal
 
 # Set up logger
 logger = logging.getLogger('discord.autoresponder')
@@ -35,6 +36,9 @@ class AutoresponderModal(ui.Modal, title="Add Autoresponder"):
     
     async def on_submit(self, interaction: discord.Interaction):
         # Get values from the modal
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         trigger = self.trigger_input.value
         response = self.response_input.value
         
@@ -187,7 +191,7 @@ class AutoResponder(commands.Cog):
         """Add a new autoresponder trigger and response using a popup form."""
         # Create and send the modal
         modal = AutoresponderModal(self)
-        await interaction.response.send_modal(modal)
+        await send_modal(interaction, modal)
 
     async def _process_autoresponder_add(self, interaction: discord.Interaction, trigger: str, response: str):
         """Process adding a new autoresponder after modal submission."""

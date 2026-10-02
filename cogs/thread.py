@@ -15,6 +15,7 @@ from discord import app_commands, Interaction, TextChannel
 from discord.app_commands import checks
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING
+from cogs.interaction_utils import deregister_modal, send_modal
 
 logger = logging.getLogger(__name__)
 
@@ -1346,6 +1347,9 @@ class AddChannelModal(discord.ui.Modal, title="Add a channel to autothreads"):
         self.guild_id = guild_id
 
     async def on_submit(self, interaction: Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         if not is_admin_check(interaction):
             return await interaction.response.send_message(
                 "You must be an administrator to use this.", ephemeral=True
@@ -1494,9 +1498,7 @@ class ThreadChannelSelect(discord.ui.Select):
 
         value = self.values[0]
         if value == "__add__":
-            return await interaction.response.send_modal(
-                AddChannelModal(self.cog, self.guild_id)
-            )
+            return await send_modal(interaction, AddChannelModal(self.cog, self.guild_id))
 
         await self.cog._open_settings_panel(interaction, self.guild_id, value)
 

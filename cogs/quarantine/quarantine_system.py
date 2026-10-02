@@ -21,6 +21,7 @@ from .config import (
     PERMISSION_MAX_RETRIES, LARGE_SERVER_THRESHOLD, HUGE_SERVER_THRESHOLD,
     JAIL_WELCOME_MESSAGE
 )
+from cogs.interaction_utils import send_modal
 
 # Hardcoded Colors - All embeds use dark grey (#2f3136)
 class Colors:
@@ -143,7 +144,7 @@ class AppealButton(discord.ui.View):
         
         # Show the appeal modal
         modal = AppealModal(appeal_cog, self.case_id, self.guild_id)
-        await interaction.response.send_modal(modal)
+        await send_modal(interaction, modal)
 
 
 class ImprovedMuteCog(commands.Cog):

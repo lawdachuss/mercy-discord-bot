@@ -37,26 +37,41 @@ logger = logging.getLogger(__name__)
 # ----- Safe Reply -----
 
 async def safe_reply(interaction: discord.Interaction, content: Optional[str] = None, embed: Optional[discord.Embed] = None, ephemeral: bool = True, view: Optional[discord.ui.View] = None):
+    """Reply, honouring `ephemeral`, and never fall back to a public message.
+
+    The old fallback posted to interaction.channel when the response failed.
+    That is a plain channel send, so an interaction the *caller* asked to be
+    private - every error embed here - was posted publicly, visible to everyone,
+    whenever the response path raised. Most commonly that was an expired token:
+    the handler had already run, and the user got a public "Thread not found."
+    or "Error processing skip." embed instead of a private one. Fallbacks must
+    not silently change the visibility the caller requested.
+    """
+    kwargs = {"embed": embed} if embed else {"content": content}
     try:
         if not interaction.response.is_done():
-            if embed:
-                await interaction.response.send_message(embed=embed, ephemeral=ephemeral, view=view)
-            else:
-                await interaction.response.send_message(content, ephemeral=ephemeral, view=view)
-        else:
-            if embed:
-                await interaction.followup.send(embed=embed, ephemeral=ephemeral, view=view)
-            else:
-                await interaction.followup.send(content, ephemeral=ephemeral, view=view)
+            await interaction.response.send_message(ephemeral=ephemeral, view=view, **kwargs)
+            return
+        await interaction.followup.send(ephemeral=ephemeral, view=view, **kwargs)
+        return
+    except discord.HTTPException as e:
+        logger.warning(
+            "Matchmaking: could not reply to interaction %s (ephemeral=%s): %s",
+            getattr(interaction, "id", "?"), ephemeral, e,
+        )
     except Exception:
-        try:
-            if interaction.channel:
-                if embed:
-                    await interaction.channel.send(f"{interaction.user.mention}", embed=embed, view=view, delete_after=15 if ephemeral else None)
-                else:
-                    await interaction.channel.send(f"{interaction.user.mention} {content}", view=view, delete_after=15 if ephemeral else None)
-        except Exception:
-            pass
+        logger.exception("Matchmaking: unexpected failure replying to interaction %s", getattr(interaction, "id", "?"))
+
+    # Last resort. followup is the only other way to address an interaction
+    # privately, so it is worth one more try; interaction.channel.send is NOT a
+    # valid substitute because it is always public.
+    try:
+        await interaction.followup.send(ephemeral=ephemeral, view=view, **kwargs)
+    except Exception:
+        logger.debug(
+            "Matchmaking: interaction %s could not be answered at all (likely expired)",
+            getattr(interaction, "id", "?"), exc_info=True,
+        )
 
 async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True) -> bool:
     """Claim Discord's interaction window *before* doing any database work.

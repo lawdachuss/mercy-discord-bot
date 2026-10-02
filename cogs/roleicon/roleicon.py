@@ -78,7 +78,7 @@ class RoleIconCog(Cog):
                 description=f"Could not find role with ID: `{role}`",
                 color=discord.Color.red()
             )
-            return await interaction.followup.send(embed=embed)
+            return await interaction.followup.send(embed=embed, ephemeral=True)
 
         if not await self._check_permissions_slash(interaction, role_obj):
             return
@@ -94,7 +94,7 @@ class RoleIconCog(Cog):
                 description=f"Could not parse emoji: `{emoji}`\n\nUse a custom emoji like `<:name:id>`",
                 color=discord.Color.red()
             )
-            return await interaction.followup.send(embed=embed)
+            return await interaction.followup.send(embed=embed, ephemeral=True)
 
         await self._set_role_icon_slash(interaction, role_obj, emoji_info)
 
@@ -224,7 +224,7 @@ class RoleIconCog(Cog):
                 description="I don't have the **Manage Roles** permission.",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return False
 
         if bot_member.top_role.position <= role.position:
@@ -233,7 +233,7 @@ class RoleIconCog(Cog):
                 description=f"My highest role must be above {role.mention} in the hierarchy.",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return False
 
         # Prevent editing @everyone role
@@ -243,7 +243,7 @@ class RoleIconCog(Cog):
                 description="You cannot modify the @everyone role.",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return False
 
         return True
@@ -312,7 +312,7 @@ class RoleIconCog(Cog):
                             description="Failed to download emoji image.",
                             color=discord.Color.red()
                         )
-                        return await interaction.followup.send(embed=embed)
+                        return await interaction.followup.send(embed=embed, ephemeral=True)
                     icon_data = await resp.read()
             except Exception as e:
                 logger.error(f"Error downloading emoji: {e}")
@@ -321,12 +321,12 @@ class RoleIconCog(Cog):
                     description="Failed to download emoji image.",
                     color=discord.Color.red()
                 )
-                return await interaction.followup.send(embed=embed)
+                return await interaction.followup.send(embed=embed, ephemeral=True)
 
             await role.edit(display_icon=icon_data, reason=f"Icon set by {interaction.user}")
 
             # Simple text response
-            await interaction.followup.send(f"✅ Set role icon for {role.mention} to {emoji_info['display']}")
+            await interaction.followup.send(f"✅ Set role icon for {role.mention} to {emoji_info['display']}", ephemeral=True)
 
         except discord.Forbidden:
             embed = discord.Embed(
@@ -334,14 +334,14 @@ class RoleIconCog(Cog):
                 description="I don't have permission to edit this role.",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
         except discord.HTTPException as e:
             embed = discord.Embed(
                 title="❌ Error Setting Icon",
                 description=f"Failed to set role icon: {str(e)[:100]}",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             logger.error(f"Error setting role icon: {e}")
         except Exception as e:
             embed = discord.Embed(
@@ -349,7 +349,7 @@ class RoleIconCog(Cog):
                 description="An unexpected error occurred.",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             logger.error(f"Unexpected error in _set_role_icon_slash: {e}")
 
     async def _remove_role_icon(self, ctx, role: discord.Role):
@@ -400,13 +400,13 @@ class RoleIconCog(Cog):
                 description=f"{role.mention} does not have an icon set.",
                 color=discord.Color.orange()
             )
-            return await interaction.followup.send(embed=embed)
+            return await interaction.followup.send(embed=embed, ephemeral=True)
 
         try:
             await role.edit(display_icon=None, reason=f"Icon removed by {interaction.user}")
 
             # Simple text response
-            await interaction.followup.send(f"✅ Removed role icon from {role.mention}")
+            await interaction.followup.send(f"✅ Removed role icon from {role.mention}", ephemeral=True)
 
         except discord.Forbidden:
             embed = discord.Embed(
@@ -414,14 +414,14 @@ class RoleIconCog(Cog):
                 description="I don't have permission to edit this role.",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
         except discord.HTTPException as e:
             embed = discord.Embed(
                 title="❌ Error Removing Icon",
                 description=f"Failed to remove role icon: {str(e)[:100]}",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             logger.error(f"Error removing role icon: {e}")
         except Exception as e:
             embed = discord.Embed(
@@ -429,7 +429,7 @@ class RoleIconCog(Cog):
                 description="An unexpected error occurred.",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             logger.error(f"Unexpected error in _remove_role_icon_slash: {e}")
 
 

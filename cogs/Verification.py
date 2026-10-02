@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import io
 from motor.motor_asyncio import AsyncIOMotorCollection
 import logging
+from cogs.interaction_utils import deregister_modal, send_modal
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +400,9 @@ class DeclineModal(discord.ui.Modal, title="Decline Verification"):
     
     async def on_submit(self, interaction: discord.Interaction):
         """Handle modal submission"""
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         guild = interaction.guild
         config = self.cog.get_server_config(guild.id)
         
@@ -682,7 +686,7 @@ class TicketControls(discord.ui.View):
         
         # Open modal for decline reason
         modal = DeclineModal(self.cog, member, interaction.user)
-        await interaction.response.send_modal(modal)
+        await send_modal(interaction, modal)
 
 class TranscriptControls(discord.ui.View):
     """View with transcript and delete buttons"""

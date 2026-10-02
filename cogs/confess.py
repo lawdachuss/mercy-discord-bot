@@ -9,6 +9,7 @@ import logging
 import motor.motor_asyncio
 from pymongo import ReturnDocument
 from dotenv import load_dotenv
+from cogs.interaction_utils import deregister_modal, send_modal
 
 # Configure logging
 logging.basicConfig(level=logging.ERROR)
@@ -131,7 +132,7 @@ class ConfessionView(discord.ui.View):
     @discord.ui.button(label="Reply", style=discord.ButtonStyle.secondary, custom_id="confession_reply")
     async def reply(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         modal = ConfessionModal(is_reply=True, original_message_id=interaction.message.id)
-        await interaction.response.send_modal(modal)
+        await send_modal(interaction, modal)
 
     @discord.ui.button(label="Report", style=discord.ButtonStyle.danger, custom_id="confession_report")
     async def report(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -230,6 +231,9 @@ class ConfessionModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         """Process the submitted confession modal."""
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         await interaction.response.defer(ephemeral=True)
         guild_id = str(interaction.guild.id)
         guild_settings = await CONFIG_MANAGER.get_guild_settings(guild_id)
@@ -388,7 +392,7 @@ class Confessions(commands.Cog):
     @app_commands.command(name="confess", description="Submit an anonymous confession.")
     async def confess(self, interaction: discord.Interaction) -> None:
         modal = ConfessionModal()
-        await interaction.response.send_modal(modal)
+        await send_modal(interaction, modal)
 
     @app_commands.command(name="setup-confess", description="Configure confession settings for your server.")
     @app_commands.default_permissions(administrator=True)

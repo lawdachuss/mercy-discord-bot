@@ -16,6 +16,7 @@ from .config import (
     APPEAL_COOLDOWN_HOURS, MAX_APPEAL_LENGTH, MIN_APPEAL_LENGTH, APPEAL_REVIEW_TIMEOUT_DAYS,
     APPEAL_REASON_PLACEHOLDER, APPEAL_ADDITIONAL_INFO_PLACEHOLDER
 )
+from cogs.interaction_utils import deregister_modal, send_modal
 
 # Hardcoded Colors - All embeds use dark grey (#2f3136)
 class Colors:
@@ -104,6 +105,9 @@ class AppealModal(discord.ui.Modal, title="Submit Appeal"):
         self.guild_id = guild_id
     
     async def on_submit(self, interaction: discord.Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         await interaction.response.defer(ephemeral=True)
         
         success, message, appeal_id = await self.cog._create_appeal(
@@ -682,7 +686,7 @@ class AppealSystem(commands.Cog):
             return
         
         modal = AppealModal(self, case_id, interaction.guild.id)
-        await interaction.response.send_modal(modal)
+        await send_modal(interaction, modal)
     
     @app_commands.command(name="appeal-status", description="Check the status of your appeal")
     @app_commands.describe(appeal_id="The appeal ID to check (optional)")

@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from collections import deque, Counter
 from uuid import uuid4
 import pytz
+from cogs.interaction_utils import deregister_modal, send_modal
 
 # ─── UTILITY FUNCTIONS ─────────────────────────────────────────────────────────
 def get_ist_time(dt: datetime = None) -> datetime:
@@ -81,6 +82,9 @@ class DropModal(ui.Modal, title='Create Drop'):
 
     async def on_submit(self, interaction: discord.Interaction):
         # Verify admin permissions again
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         if not interaction.user.guild_permissions.administrator:
             return await interaction.response.send_message("Admin only.", ephemeral=True)
 
@@ -184,7 +188,7 @@ class DropSystem(commands.Cog):
     async def drop(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             return await interaction.response.send_message("Admin only.", ephemeral=True)
-        await interaction.response.send_modal(DropModal())
+        await send_modal(interaction, DropModal())
 
     @app_commands.command(name='reset_cooldown', description='Reset cooldown for a user or entire server (Admin only)')
     @app_commands.guild_only()

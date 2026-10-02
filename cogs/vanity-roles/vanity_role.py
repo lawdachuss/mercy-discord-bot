@@ -23,6 +23,7 @@ from discord.ext import commands, tasks
 from discord import app_commands
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import ConnectionFailure, OperationFailure
+from cogs.interaction_utils import deregister_modal, send_modal
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -398,6 +399,9 @@ class StatusRoleSetupModal(discord.ui.Modal, title='Create Vanity Role Rule'):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         await interaction.response.defer(ephemeral=True)
         
         try:
@@ -612,7 +616,7 @@ class StatusRoleManagementView(discord.ui.View):
     async def add_rule(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Add a new status rule."""
         modal = StatusRoleSetupModal(self.cog, origin_message=interaction.message)
-        await interaction.response.send_modal(modal)
+        await send_modal(interaction, modal)
 
     @discord.ui.button(label="View Rules", style=discord.ButtonStyle.secondary, emoji="📋")
     async def view_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1074,7 +1078,7 @@ class SettingsView(discord.ui.View):
     @discord.ui.button(label="Change Log Channel", style=discord.ButtonStyle.primary, emoji="📝")
     async def change_log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Change the log channel."""
-        await interaction.response.send_modal(ChangeLogChannelModal(self.cog, self.config))
+        await send_modal(interaction, ChangeLogChannelModal(self.cog, self.config))
 
     @discord.ui.button(label="Test Log Channel", style=discord.ButtonStyle.success, emoji="🧪")
     async def test_log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1146,6 +1150,9 @@ class ChangeLogChannelModal(discord.ui.Modal, title='Change Log Channel'):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         await interaction.response.defer(ephemeral=True)
         
         try:
@@ -1290,7 +1297,7 @@ class IndividualRuleView(discord.ui.View):
     async def edit_rule(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Edit the rule."""
         modal = StatusRoleSetupModal(self.cog, self.rule, origin_message=interaction.message)
-        await interaction.response.send_modal(modal)
+        await send_modal(interaction, modal)
 
     @discord.ui.button(label="Toggle", style=discord.ButtonStyle.secondary, emoji="🔄")
     async def toggle_rule(self, interaction: discord.Interaction, button: discord.ui.Button):

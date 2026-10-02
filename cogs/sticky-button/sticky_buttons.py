@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 from dotenv import load_dotenv
 from typing import List, Optional
+from cogs.interaction_utils import deregister_modal, send_modal
 
 load_dotenv()
 MONGO_URL = os.getenv("MONGO_URL")
@@ -313,11 +314,11 @@ class StickyManagerSelect(discord.ui.Select):
 
         choice = self.values[0]
         if choice == "setup":
-            await interaction.response.send_modal(StickyTextModal(self.cog, interaction))
+            await send_modal(interaction, StickyTextModal(self.cog, interaction))
         elif choice == "add_button":
-            await interaction.response.send_modal(ButtonEmojiModal(self.cog, interaction))
+            await send_modal(interaction, ButtonEmojiModal(self.cog, interaction))
         elif choice == "remove_button":
-            await interaction.response.send_modal(RemoveButtonModal(self.cog, interaction))
+            await send_modal(interaction, RemoveButtonModal(self.cog, interaction))
         elif choice == "list_buttons":
             await self.cog._handle_list_buttons(interaction)
         elif choice == "remove_sticky":
@@ -344,6 +345,9 @@ class StickyTextModal(discord.ui.Modal, title="Sticky Message Setup"):
         self.interaction_ctx = interaction_ctx
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         try:
             guild = interaction.guild
             channel = interaction.channel
@@ -388,6 +392,9 @@ class ButtonEmojiModal(discord.ui.Modal, title="Add/Replace Button (Discohook JS
         self.interaction_ctx = interaction_ctx
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         try:
             guild = interaction.guild
             channel = interaction.channel
@@ -460,6 +467,9 @@ class RemoveButtonModal(discord.ui.Modal, title="Remove Button by Index"):
         self.interaction_ctx = interaction_ctx
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         try:
             guild = interaction.guild
             channel = interaction.channel

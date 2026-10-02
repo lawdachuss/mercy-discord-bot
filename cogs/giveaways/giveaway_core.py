@@ -14,6 +14,7 @@ from typing import List, Dict, Optional, Tuple
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING
+from cogs.interaction_utils import deregister_modal, send_modal
 
 # Load environment variables
 load_dotenv()
@@ -377,19 +378,19 @@ class GiveawayEditView(ui.View):
         
         elif action == "fill":
             modal = FillModal(self.bot)
-            await interaction.response.send_modal(modal)
+            await send_modal(interaction, modal)
         
         elif action == "force":
             modal = ForceWinnerModal(self.bot)
-            await interaction.response.send_modal(modal)
+            await send_modal(interaction, modal)
         
         elif action == "extend":
             modal = ExtendModal(self.bot)
-            await interaction.response.send_modal(modal)
+            await send_modal(interaction, modal)
         
         elif action == "cancel":
             modal = CancelModal(self.bot)
-            await interaction.response.send_modal(modal)
+            await send_modal(interaction, modal)
 
 class FillModal(ui.Modal, title="Fill Giveaway"):
     message_id = ui.TextInput(label="Message ID", placeholder="Enter the giveaway message ID", required=True)
@@ -401,6 +402,9 @@ class FillModal(ui.Modal, title="Fill Giveaway"):
         self.bot = bot
     
     async def on_submit(self, interaction: discord.Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         admin_cog = self.bot.get_cog("GiveawayAdminCog")
         if admin_cog:
             try:
@@ -440,6 +444,9 @@ class ForceWinnerModal(ui.Modal, title="Force Winner"):
         self.bot = bot
     
     async def on_submit(self, interaction: discord.Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         admin_cog = self.bot.get_cog("GiveawayAdminCog")
         if admin_cog:
             try:
@@ -468,6 +475,9 @@ class ExtendModal(ui.Modal, title="Extend Giveaway"):
         self.bot = bot
     
     async def on_submit(self, interaction: discord.Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         admin_cog = self.bot.get_cog("GiveawayAdminCog")
         if admin_cog:
             try:
@@ -498,6 +508,9 @@ class CancelModal(ui.Modal, title="Cancel Giveaway"):
         self.bot = bot
     
     async def on_submit(self, interaction: discord.Interaction):
+        # Each submission gets a fresh custom_id, so this store entry
+        # is per-submission and must not outlive the modal.
+        deregister_modal(interaction, self)
         admin_cog = self.bot.get_cog("GiveawayAdminCog")
         if admin_cog:
             try:
