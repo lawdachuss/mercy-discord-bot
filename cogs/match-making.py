@@ -1,4 +1,4 @@
-﻿import time
+import time
 import logging
 import io
 import asyncio
@@ -10,6 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from pymongo import ReturnDocument
+from cogs.interaction_utils import deregister_modal, safe_defer, safe_edit, safe_reply, send_modal
 
 EMBED_COLOR = 0x2F3136
 SKIP_BLOCK_MINUTES = 1440  # 24 hours
@@ -33,80 +34,6 @@ MATCHMAKER_BANNER_URL = (
 )
 
 logger = logging.getLogger(__name__)
-
-# ----- Safe Reply -----
-
-async def safe_reply(interaction: discord.Interaction, content: Optional[str] = None, embed: Optional[discord.Embed] = None, ephemeral: bool = True, view: Optional[discord.ui.View] = None):
-    """Reply, honouring `ephemeral`, and never fall back to a public message.
-
-    The old fallback posted to interaction.channel when the response failed.
-    That is a plain channel send, so an interaction the *caller* asked to be
-    private - every error embed here - was posted publicly, visible to everyone,
-    whenever the response path raised. Most commonly that was an expired token:
-    the handler had already run, and the user got a public "Thread not found."
-    or "Error processing skip." embed instead of a private one. Fallbacks must
-    not silently change the visibility the caller requested.
-    """
-    kwargs = {"embed": embed} if embed else {"content": content}
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.send_message(ephemeral=ephemeral, view=view, **kwargs)
-            return
-        await interaction.followup.send(ephemeral=ephemeral, view=view, **kwargs)
-        return
-    except discord.HTTPException as e:
-        logger.warning(
-            "Matchmaking: could not reply to interaction %s (ephemeral=%s): %s",
-            getattr(interaction, "id", "?"), ephemeral, e,
-        )
-    except Exception:
-        logger.exception("Matchmaking: unexpected failure replying to interaction %s", getattr(interaction, "id", "?"))
-
-    # Last resort. followup is the only other way to address an interaction
-    # privately, so it is worth one more try; interaction.channel.send is NOT a
-    # valid substitute because it is always public.
-    try:
-        await interaction.followup.send(ephemeral=ephemeral, view=view, **kwargs)
-    except Exception:
-        logger.debug(
-            "Matchmaking: interaction %s could not be answered at all (likely expired)",
-            getattr(interaction, "id", "?"), exc_info=True,
-        )
-
-async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True) -> bool:
-    """Claim Discord's interaction window *before* doing any database work.
-
-    A button handler has three seconds to send its first response. The shared
-    Mongo client is configured with a 5s serverSelectionTimeoutMS and a 10s
-    socketTimeoutMS over a pool of only 10 sockets, so anything that makes an
-    operation wait - pool exhaustion, a reconnect, a cold index - can outlast
-    that window. When it does, Discord shows the user "The application didn't
-    respond in time" and the bot's own error message is discarded, which is
-    precisely what a slow database should never be allowed to do.
-
-    Deferring first raises the ceiling from 3 seconds to 15 minutes, so the
-    user always gets a real reply with a real explanation.
-    """
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=ephemeral)
-    except Exception:
-        logger.warning(
-            "Matchmaking: could not defer interaction for user %s; it may already have expired",
-            getattr(interaction.user, "id", "?"), exc_info=True,
-        )
-    return interaction.response.is_done()
-
-async def safe_edit(interaction: discord.Interaction, content: Optional[str] = None, embed: Optional[discord.Embed] = None, view: Optional[discord.ui.View] = None):
-    """Finish an interaction that safe_defer() already claimed."""
-    try:
-        if interaction.response.is_done():
-            await interaction.edit_original_response(content=content, embed=embed, view=view)
-            return
-    except Exception:
-        pass
-    # Either the defer never landed or the response can no longer be edited.
-    await safe_reply(interaction, content=content, embed=embed, ephemeral=True, view=view)
 
 # ----- Notification Manager -----
 
@@ -497,20 +424,17 @@ class ThreadControls(discord.ui.View):
                 return await safe_reply(interaction, embed=discord.Embed(title="Could not find the other participant.", color=0xE74C3C))
 
             modal = ReportModal(self.cog, self.thread_id, other_id)
-            # Register the modal before showing it. dispatch_modal() looks the
-            # submission up by custom_id in the view store and silently discards
-            # anything it cannot find, so an unregistered modal means on_submit
-            # never runs: the user fills the form, submits, and gets "The
-            # application did not respond". Each instance generates a fresh
-            # custom_id, so this has to happen per report.
-            try:
-                self.cog.bot.add_view(modal)
-            except Exception:
-                logger.exception("Matchmaking: could not register report modal")
+            # send_modal() registers the modal before showing it, and unregisters
+            # it again if the send fails. Registering is the part that is easy to
+            # miss: dispatch_modal() looks the submission up by custom_id in the
+            # view store and silently discards anything it cannot find, so an
+            # unregistered modal means on_submit never runs - the user fills the
+            # form, submits, and gets "The application did not respond".
+            #
             # Note: a modal submission is its own interaction with its own 3s
-            # window, so the handler below is fast and needs no defer - but
-            # nothing here may touch the database first.
-            await interaction.response.send_modal(modal)
+            # window, so on_submit below is fast and needs no defer - but nothing
+            # in it may touch the database first.
+            await send_modal(interaction, modal)
         except Exception:
             embed = discord.Embed(title="Error processing report. Please try again.", color=0xE74C3C)
             await safe_reply(interaction, embed=embed)
@@ -544,11 +468,9 @@ class ReportModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         # Every report registers a modal with a fresh custom_id, so the store
-        # entry has to go or it grows for the life of the process.
-        try:
-            self.cog.bot.remove_view(self)
-        except Exception:
-            pass
+        # entry has to go or it grows for the life of the process. First
+        # statement, so it happens even if the work below fails.
+        deregister_modal(interaction, self)
         try:
             try:
                 await interaction.response.send_message("Processing your report...", ephemeral=True)
@@ -925,6 +847,100 @@ class Matchmaker(commands.Cog):
 
     # ----- Queue Panel Helpers -----
 
+    def _build_panel_embed(self) -> discord.Embed:
+        """The one canonical matchmaking panel embed.
+
+        Both /mm action:setup and action:configure post this. They used to build
+        their own embeds and had drifted apart: setup posted the real branding
+        ("Private Rooms") while configure posted generic filler ("Matchmaking
+        Panel" / "Click the button below to find your match."). Since configure
+        is the action you re-run to refresh the panel, re-running it silently
+        downgraded the server's panel to the generic copy.
+        """
+        embed = discord.Embed(
+            title="Private Rooms",
+            description="Get paired with a random stranger in a private room for a one-on-one chat.",
+            color=EMBED_COLOR,
+        )
+        embed.set_image(url=MATCHMAKER_BANNER_URL)
+        return embed
+
+    async def _post_panel(self, guild: discord.Guild, channel: discord.TextChannel) -> bool:
+        """Post or refresh the panel, with a fresh MatchPanel view attached.
+
+        The panel message id is tracked in guild_config so re-running setup or
+        configure *updates the existing panel* instead of posting another one.
+        Every run used to send a fresh message, so refreshing the panel left a
+        growing stack of stale copies in the channel, all with working buttons,
+        and nobody could tell which one was current.
+        """
+        embed = self._build_panel_embed()
+        view = MatchPanel(self)
+
+        panel_id = None
+        try:
+            row = await self.guild_config_col.find_one(
+                {"guild_id": guild.id}, {"panel_message_id": 1}
+            )
+            if row and row.get("panel_message_id"):
+                panel_id = int(row["panel_message_id"])
+        except Exception:
+            logger.warning(
+                "Matchmaking: could not read tracked panel message for guild %s",
+                guild.id, exc_info=True,
+            )
+
+        if panel_id:
+            try:
+                msg = await channel.fetch_message(panel_id)
+                # Re-sending the view matters: the old buttons carry a custom_id
+                # that still resolves, but the view instance behind them is dead.
+                await msg.edit(embed=embed, view=view)
+                return True
+            except discord.NotFound:
+                # Deleted by hand - fall through and post a replacement.
+                logger.info(
+                    "Matchmaking: tracked panel %s in guild %s is gone; posting a replacement",
+                    panel_id, guild.id,
+                )
+            except Exception:
+                # Transient failure (rate limit, outage). Do NOT post a new panel
+                # here: the old one is still there and still works, so a second
+                # copy would leave two live panels and nobody would know which
+                # is current - the exact confusion this tracking prevents.
+                logger.exception(
+                    "Matchmaking: could not refresh panel %s in guild %s; leaving it untouched",
+                    panel_id, guild.id,
+                )
+                return False
+
+        return await self._send_new_panel(guild, channel, embed, view)
+
+    async def _send_new_panel(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        embed: discord.Embed,
+        view: MatchPanel,
+    ) -> bool:
+        try:
+            msg = await channel.send(embed=embed, view=view)
+        except Exception:
+            logger.exception("Matchmaking: could not post panel in channel %s", channel.id)
+            return False
+        try:
+            await self.guild_config_col.update_one(
+                {"guild_id": guild.id},
+                {"$set": {"guild_id": guild.id, "panel_message_id": int(msg.id)}},
+                upsert=True,
+            )
+        except Exception:
+            # The panel is posted either way; only future refreshes are affected.
+            logger.warning(
+                "Matchmaking: could not record panel message id for guild %s", guild.id, exc_info=True
+            )
+        return True
+
     async def _get_queue_counts(self, guild_id: int) -> Dict[str, int]:
         total = await self.waiting_queue_col.count_documents({"guild_id": guild_id})
         return {"total": int(total or 0)}
@@ -1026,38 +1042,29 @@ class Matchmaker(commands.Cog):
             await self.set_parent_channel(guild.id, channel.id)
             await self.set_report_channel(guild.id, report.id)
 
-            embed = discord.Embed(
-                title="Private Rooms",
-                description="Get paired with a random stranger in a private room for a one-on-one chat.",
-                color=EMBED_COLOR
-            )
-            embed.set_image(url=MATCHMAKER_BANNER_URL)
-
-            try:
-                await channel.send(embed=embed, view=MatchPanel(self))
-            except Exception:
-                logger.exception("Matchmaking: could not post panel in guild %s", guild.id)
-
+            if not await self._post_panel(guild, channel):
+                return await interaction.edit_original_response(
+                    content="❌ Could not post the panel. Check I can send messages in that channel."
+                )
             return await interaction.edit_original_response(content="✅ Setup complete! Matchmaking panel created.")
 
         if act == "configure":
             if not channel:
                 return await interaction.edit_original_response(content="Provide channel.")
             await self.set_parent_channel(guild.id, channel.id)
+            # configure used to ignore `report` entirely, so a server set up
+            # with it never got a report channel and every Report button press
+            # answered "Report channel not configured."
+            if report:
+                await self.set_report_channel(guild.id, report.id)
 
-            embed = discord.Embed(
-                title="Matchmaking Panel",
-                description="Click the button below to find your match.",
-                color=EMBED_COLOR
-            )
-            embed.set_image(url=MATCHMAKER_BANNER_URL)
-
-            try:
-                await channel.send(embed=embed, view=MatchPanel(self))
-            except Exception:
-                logger.exception("Matchmaking: could not post panel in guild %s", guild.id)
-
-            return await interaction.edit_original_response(content=f"✅ Configured to {channel.mention}")
+            if not await self._post_panel(guild, channel):
+                return await interaction.edit_original_response(
+                    content="❌ Could not post the panel. Check I can send messages in that channel."
+                )
+            msg = f"✅ Configured to {channel.mention}"
+            msg += " and report channel set." if report else " (report channel unchanged)."
+            return await interaction.edit_original_response(content=msg)
 
         if act == "report_channel":
             if not report:

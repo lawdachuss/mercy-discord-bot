@@ -888,11 +888,6 @@ class SafeInteractionHandler:
             True if successful, False otherwise
         """
         try:
-            # Check if already responded
-            if interaction.response.is_done():
-                logger.warning(f"Interaction {interaction.id} already responded to")
-                return False
-            
             # Build message parameters
             message_params = {
                 "ephemeral": ephemeral,
@@ -904,14 +899,38 @@ class SafeInteractionHandler:
                 message_params["embed"] = embed
             if view is not None:
                 message_params["view"] = view
-            
-            # Send response
-            await interaction.response.send_message(**message_params)
+
+            if not interaction.response.is_done():
+                await interaction.response.send_message(**message_params)
+                return True
+
+            # Already responded - most often because the handler deferred.
+            # Returning False here dropped the reply on the floor: the user saw
+            # "thinking..." and then nothing, because the defer had created a
+            # response and this was the only thing meant to fill it in.
+            # followup is the way to still reach them, and it keeps whatever
+            # visibility was requested.
+            logger.debug(
+                f"Interaction {interaction.id} already responded; sending as followup"
+            )
+            await interaction.followup.send(**message_params)
             return True
-            
+
         except discord.InteractionResponded:
-            logger.warning(f"Interaction {interaction.id} already responded (InteractionResponded exception)")
-            return False
+            # Raced another responder between the is_done() check and the send.
+            # One followup attempt is worth it: this is the last thing standing
+            # between the user and seeing no reply at all.
+            logger.debug(
+                f"Interaction {interaction.id} responded concurrently; retrying via followup"
+            )
+            try:
+                await interaction.followup.send(**message_params)
+                return True
+            except Exception:
+                logger.warning(
+                    f"Could not follow up on raced interaction {interaction.id}", exc_info=True
+                )
+                return False
             
         except discord.NotFound:
             logger.warning(f"Interaction {interaction.id} expired (NotFound exception)")
