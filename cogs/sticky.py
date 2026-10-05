@@ -4,7 +4,7 @@
 import asyncio
 import logging
 from collections import defaultdict
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timedelta
 
 import discord
@@ -73,6 +73,8 @@ class StickyMessages(commands.Cog):
         self.repost_cooldown = 2.5  # seconds between reposts in same channel
         self.auto_refresh_interval = 5  # minutes - auto delete and resend stickies
         self.max_content_length = 2000  # Discord limit
+        # How far back a safety sweep looks for sticky copies we lost track of.
+        self.history_scan_limit = 100
 
     # ==================== Lifecycle ====================
     
@@ -205,69 +207,145 @@ class StickyMessages(commands.Cog):
         time_diff = (datetime.utcnow() - last_time).total_seconds()
         return time_diff < self.repost_cooldown
 
-    async def _delete_old_sticky(self, channel_id: int, channel: discord.TextChannel) -> bool:
-        """
-        Delete the old sticky message for a channel.
-        Returns True if successful or message didn't exist.
-        """
-        sticky_info = self.last_sticky_messages.get(channel_id)
-        last_msg_id = sticky_info.get("message_id") if isinstance(sticky_info, dict) else sticky_info
+    async def _sweep_sticky_copies(
+        self,
+        channel: discord.TextChannel,
+        channel_id: int,
+        contents: List[str],
+        skip_ids: Optional[set] = None,
+    ) -> bool:
+        """Delete recent copies of the sticky identified by its content.
 
-        if not last_msg_id:
-            # Memory can be empty after a restart or cleanup while the sticky
-            # is still live - fall back to the persisted id so an old copy can
-            # never survive a repost.
-            try:
-                doc = None
-                if self.stickies is not None:
-                    doc = await self.stickies.find_one(
-                        {"channel_id": channel_id, "text": {"$exists": False}}
-                    )
-                last_msg_id = doc.get("last_message_id") if doc else None
-            except Exception as e:
-                log.warning(f"Could not read persisted sticky state for channel {channel_id}: {e}")
-                return False
+        This is the safety net for every case where the tracked message id is
+        wrong, stale or missing (failed DB write, restart, ``unstick`` error,
+        two systems in one channel...). Without it a single lost id turns into
+        a permanent duplicate that nothing ever removes.
 
-        if not last_msg_id:
-            log.debug(f"No message ID in sticky info for channel {channel_id}")
+        Returns True when the channel is verified clean, False when history
+        could not be read or a copy could not be deleted.
+        """
+        contents = [c for c in (self._normalize_content(x) for x in contents) if c]
+        if not contents:
             return True
-        
+
+        skip_ids = skip_ids or set()
         try:
-            log.debug(f"Attempting to delete old sticky {last_msg_id} in channel {channel_id}")
-            old_sticky = await channel.fetch_message(last_msg_id)
-            await old_sticky.delete()
-            log.info(f"✅ Deleted old sticky {last_msg_id} in channel {channel_id}")
-            # Clear from memory after successful deletion
-            self.last_sticky_messages.pop(channel_id, None)
+            to_delete = []
+            async for m in channel.history(limit=self.history_scan_limit):
+                if m.id in skip_ids:
+                    continue
+                if m.author.id != self.bot.user.id:
+                    continue
+                if self._normalize_content(m.content) not in contents:
+                    continue
+                to_delete.append(m)
+
+            for m in to_delete:
+                try:
+                    await m.delete()
+                    log.info(f"✅ Swept orphaned sticky {m.id} in channel {channel_id}")
+                    await asyncio.sleep(0.2)
+                except discord.NotFound:
+                    pass
+                except discord.Forbidden:
+                    log.error(f"❌ No permission to delete orphaned sticky {m.id} in channel {channel_id}")
+                    return False
+                except discord.HTTPException as e:
+                    log.error(f"❌ HTTP error deleting orphaned sticky {m.id}: {e}")
+                    return False
+                except Exception as e:
+                    log.exception(f"Unexpected error sweeping sticky {m.id}: {e}")
+                    return False
             return True
-            
-        except discord.NotFound:
-            # Message already deleted, that's fine - clear from memory
-            log.debug(f"Old sticky {last_msg_id} already deleted (NotFound)")
-            self.last_sticky_messages.pop(channel_id, None)
-            return True
+
         except discord.Forbidden:
-            log.error(f"❌ No permission to delete message {last_msg_id} in channel {channel_id}")
-            # Clear from memory anyway to avoid repeated failures
-            self.last_sticky_messages.pop(channel_id, None)
-            return False
-        except discord.HTTPException as e:
-            log.error(f"❌ HTTP error deleting sticky {last_msg_id}: {e}")
-            # Clear from memory to avoid repeated failures
-            self.last_sticky_messages.pop(channel_id, None)
+            log.error(f"❌ Cannot read history in channel {channel_id}; cannot verify old stickies")
             return False
         except Exception as e:
-            log.exception(f"Unexpected error deleting sticky: {e}")
-            # Clear from memory to avoid repeated failures
-            self.last_sticky_messages.pop(channel_id, None)
+            log.exception(f"Error sweeping stickies in channel {channel_id}: {e}")
             return False
+
+    async def _delete_old_sticky(
+        self,
+        channel_id: int,
+        channel: discord.TextChannel,
+        contents: Optional[List[str]] = None,
+    ) -> bool:
+        """
+        Delete every copy of the old sticky in a channel.
+
+        Returns True only when the channel is known to be clean. An unknown
+        message id is no longer treated as "nothing to delete": we sweep the
+        channel by content instead, because assuming the channel was clean is
+        exactly what used to stack duplicates.
+        """
+        # Candidate ids: what we remember in memory plus what is persisted
+        # (memory can be empty after a restart while the sticky is still live).
+        candidates: List[int] = []
+        sticky_info = self.last_sticky_messages.get(channel_id)
+        tracked_id = sticky_info.get("message_id") if isinstance(sticky_info, dict) else sticky_info
+        if tracked_id:
+            candidates.append(tracked_id)
+
+        try:
+            if self.stickies is not None:
+                doc = await self.stickies.find_one(
+                    {"channel_id": channel_id, "text": {"$exists": False}}
+                )
+                persisted_id = doc.get("last_message_id") if doc else None
+                if persisted_id and persisted_id not in candidates:
+                    candidates.append(persisted_id)
+        except Exception as e:
+            log.warning(f"Could not read persisted sticky state for channel {channel_id}: {e}")
+            # Not fatal: the content sweep below does not need the database.
+
+        failed = False
+        for msg_id in candidates:
+            try:
+                log.debug(f"Attempting to delete old sticky {msg_id} in channel {channel_id}")
+                old_sticky = await channel.fetch_message(msg_id)
+                await old_sticky.delete()
+                log.info(f"✅ Deleted old sticky {msg_id} in channel {channel_id}")
+            except discord.NotFound:
+                log.debug(f"Old sticky {msg_id} already deleted (NotFound)")
+            except discord.Forbidden:
+                log.error(f"❌ No permission to delete message {msg_id} in channel {channel_id}")
+                failed = True
+            except discord.HTTPException as e:
+                log.error(f"❌ HTTP error deleting sticky {msg_id}: {e}")
+                failed = True
+            except Exception as e:
+                log.exception(f"Unexpected error deleting sticky {msg_id}: {e}")
+                failed = True
+
+        # Safety net for copies whose id we never had (or that pointed
+        # somewhere else). Keeps the tracked id on failure so the next attempt
+        # retries the same message instead of falling back to a stale one.
+        if contents and not await self._sweep_sticky_copies(
+            channel, channel_id, contents, skip_ids=set(candidates)
+        ):
+            failed = True
+
+        if not candidates and not contents:
+            # Nothing to identify a sticky by (embed-only with no persisted
+            # id); there is nothing we can delete, so let the repost through.
+            log.warning(f"No id and no content to identify the sticky in channel {channel_id}")
+            self.last_sticky_messages.pop(channel_id, None)
+            return True
+
+        if not failed:
+            self.last_sticky_messages.pop(channel_id, None)
+            return True
+
+        return False
 
     async def _send_sticky_message(
         self, 
         channel: discord.TextChannel, 
         content: Optional[str] = None, 
         embed: Optional[discord.Embed] = None, 
-        force_new: bool = False
+        force_new: bool = False,
+        extra_contents: Optional[List[str]] = None
     ) -> Optional[discord.Message]:
         """
         Send a sticky message with proper locking and error handling.
@@ -277,6 +355,9 @@ class StickyMessages(commands.Cog):
             content: Message content
             embed: Optional embed
             force_new: If True, always delete old and send new
+            extra_contents: Previous sticky texts to sweep for as well (used
+                when the sticky content is being changed, so the old copy is
+                found even if its tracked id was lost)
             
         Returns:
             The sent message or None if failed
@@ -291,6 +372,15 @@ class StickyMessages(commands.Cog):
             log.warning(f"Empty content for channel {channel.id}")
             return None
 
+        # Every text we must make sure is gone from the channel before posting.
+        contents: List[str] = []
+        if normalized_content:
+            contents.append(normalized_content)
+        for extra in extra_contents or []:
+            extra = self._normalize_content(extra)
+            if extra and extra not in contents:
+                contents.append(extra)
+
         # Check permissions first
         has_perms, error_msg = await self._check_permissions(channel)
         if not has_perms:
@@ -304,7 +394,7 @@ class StickyMessages(commands.Cog):
                 # Delete old sticky if needed
                 if force_new or channel.id in self.last_sticky_messages:
                     log.debug(f"Deleting old sticky for channel {channel.id} (force_new={force_new})")
-                    deleted = await self._delete_old_sticky(channel.id, channel)
+                    deleted = await self._delete_old_sticky(channel.id, channel, contents=contents)
                     if not deleted:
                         # Never send a new copy while the old one is still
                         # there - that is how duplicates pile up.
@@ -540,9 +630,11 @@ class StickyMessages(commands.Cog):
                             # Clean up memory
                             self.last_sticky_messages.pop(chan_id, None)
                             self.last_repost_time.pop(chan_id, None)
-                            if chan_id in self.channel_locks:
-                                del self.channel_locks[chan_id]
-                                
+                            # NOTE: the channel lock is deliberately kept.
+                            # Deleting it while a repost is holding it would
+                            # let a second task into the critical section and
+                            # post a sticky that nobody tracks.
+                                 
                         except Exception as e:
                             log.error(f"Failed to delete empty sticky for {chan_id}: {e}")
             
@@ -577,8 +669,7 @@ class StickyMessages(commands.Cog):
                 if chan_id not in active_channels:
                     self.last_sticky_messages.pop(chan_id, None)
                     self.last_repost_time.pop(chan_id, None)
-                    if chan_id in self.channel_locks:
-                        del self.channel_locks[chan_id]
+                    # Locks are kept on purpose - see _cleanup_loop.
                     cleaned += 1
             
             if cleaned > 0:
@@ -688,6 +779,19 @@ class StickyMessages(commands.Cog):
             
             channel_id = ctx.channel.id
             
+            # Remember the previous text: if the old copy's tracked message id
+            # was lost, content is the only way left to find and remove it.
+            old_doc = await self.stickies.find_one(
+                {"channel_id": channel_id, "text": {"$exists": False}}
+            )
+            old_content = (old_doc or {}).get("content")
+
+            # The sticky-button cog keeps its own docs in this collection; a
+            # second, independent sticky there cannot be cleaned up by us.
+            button_doc = await self.stickies.find_one(
+                {"channel_id": channel_id, "guild_id": {"$exists": True}}
+            )
+            
             # Save to database
             doc = {
                 "channel_id": channel_id,
@@ -709,11 +813,16 @@ class StickyMessages(commands.Cog):
             result = await self._send_sticky_message(
                 ctx.channel, 
                 content=content, 
-                force_new=True
+                force_new=True,
+                extra_contents=[old_content] if old_content and old_content != content else None
             )
             
             if result:
-                await confirm_msg.edit(content="✅ Sticky message is now active!")
+                text = "✅ Sticky message is now active!"
+                if button_doc:
+                    text += ("\n⚠️ This channel also has a `/sticky` (button) sticky — "
+                             "the two systems each manage their own message.")
+                await confirm_msg.edit(content=text)
             else:
                 await confirm_msg.edit(content="⚠️ Sticky saved but failed to post. Check permissions.")
             
@@ -743,33 +852,58 @@ class StickyMessages(commands.Cog):
             
             channel_id = ctx.channel.id
             
-            # Delete from database (own docs only - sticky-button docs share
-            # this collection and have a "text" field)
-            result = await self.stickies.delete_one(
+            # Read first (own docs only - sticky-button docs share this
+            # collection and have a "text" field)
+            doc = await self.stickies.find_one(
                 {"channel_id": channel_id, "text": {"$exists": False}}
             )
-            
-            if result.deleted_count == 0:
+            if not doc:
                 await ctx.send("ℹ️ No sticky message is set for this channel.")
                 return
             
-            # Delete the sticky message
-            sticky_info = self.last_sticky_messages.pop(channel_id, None)
-            if sticky_info:
-                last_msg_id = sticky_info.get("message_id") if isinstance(sticky_info, dict) else sticky_info
-                if last_msg_id:
+            content = doc.get("content") or ""
+            sticky_info = self.last_sticky_messages.get(channel_id)
+            tracked_id = sticky_info.get("message_id") if isinstance(sticky_info, dict) else sticky_info
+            if not tracked_id:
+                tracked_id = doc.get("last_message_id")
+            
+            problems = []
+            
+            # Take the channel lock: running this while a repost is in flight
+            # would leave a freshly posted copy behind a doc that no longer
+            # exists, and nothing would ever delete that copy again.
+            lock = self.channel_locks[channel_id]
+            async with lock:
+                # Drop the DB entry first so no further repost can start.
+                await self.stickies.delete_one({"_id": doc["_id"]})
+                self.last_sticky_messages.pop(channel_id, None)
+                self.last_repost_time.pop(channel_id, None)
+                
+                if tracked_id:
                     try:
-                        msg = await ctx.channel.fetch_message(last_msg_id)
+                        msg = await ctx.channel.fetch_message(tracked_id)
                         await msg.delete()
-                    except:
+                    except discord.NotFound:
                         pass
+                    except discord.Forbidden:
+                        problems.append("missing permission to delete the sticky message")
+                    except Exception as e:
+                        log.warning(f"unstick: failed to delete {tracked_id} in {channel_id}: {e}")
+                        problems.append("a Discord error while deleting the sticky message")
+                
+                # Sweep anything left over (a previously lost copy, or a repost
+                # that slipped through). Without this a failed delete became a
+                # permanent duplicate the next time .stick was used.
+                if not await self._sweep_sticky_copies(ctx.channel, channel_id, [content]):
+                    problems.append("could not verify the channel is clean")
             
-            # Clean up memory
-            self.last_repost_time.pop(channel_id, None)
-            if channel_id in self.channel_locks:
-                del self.channel_locks[channel_id]
-            
-            await ctx.send("✅ Sticky message removed.")
+            if problems:
+                await ctx.send(
+                    "ℹ️ Sticky unset, but ⚠️ " + "; ".join(problems) +
+                    ". Please check the channel and delete any remaining copy."
+                )
+            else:
+                await ctx.send("✅ Sticky message removed.")
             
         except Exception as e:
             log.exception(f"Error in unstick command: {e}")

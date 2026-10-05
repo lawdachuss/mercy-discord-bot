@@ -129,6 +129,11 @@ def normalize_emoji_key(emoji_raw: Optional[str]) -> str:
     return emoji_raw.replace(":", "").replace(" ", "_")
 
 
+# How far back the content sweep and startup recovery look for existing
+# sticky copies. Discord returns up to 100 messages per history request.
+HISTORY_SCAN_LIMIT = 100
+
+
 def make_button_custom_id(guild_id: int, channel_id: int, button_index: int) -> str:
     # Use button index instead of emoji to avoid collisions and normalization issues
     # Discord custom_id has a 100 character limit
@@ -770,18 +775,35 @@ class StickyCog(commands.Cog):
             if mongo_client_closed(self.mongo_client):
                 logging.warning("MongoDB client is closed, skipping recovery task")
                 return
-            
-            async for sticky in self.stickies.find():
-                channel = self.bot.get_channel(sticky["channel_id"])
-                if not channel:
-                    continue
+
+            # Only this cog's docs. The .stick cog shares this collection and
+            # its docs have no guild_id/text; iterating them made us match
+            # *any* bot message with empty content and record a wrong sticky id.
+            async for sticky in self.stickies.find({"guild_id": {"$exists": True}}):
                 try:
-                    async for message in channel.history(limit=50):
-                        if message.author == self.bot.user and (message.content or "") == (sticky.get("text") or ""):
+                    channel_id = sticky.get("channel_id")
+                    if not channel_id:
+                        # One malformed doc must not abort recovery for every
+                        # other sticky (the old `sticky["channel_id"]` raised
+                        # and the outer except gave up on the whole pass).
+                        continue
+                    channel = self.bot.get_channel(channel_id)
+                    if not channel:
+                        continue
+                    # Compare against what we actually send: buttons-only
+                    # stickies are posted as a zero-width space, not as "".
+                    sent_content = (sticky.get("text") or "") or "\u200b"
+                    async for message in channel.history(limit=HISTORY_SCAN_LIMIT):
+                        if message.author.id == self.bot.user.id and (message.content or "") == sent_content:
                             self.last_sticky_messages[channel.id] = message.id
                             break
                 except (discord.Forbidden, discord.HTTPException):
                     continue
+                except Exception:
+                    logging.exception(
+                        "Error recovering sticky for doc %s; continuing with the rest",
+                        sticky.get("_id"),
+                    )
         except Exception:
             logging.exception("Error in recovery_task")
 
@@ -825,7 +847,9 @@ class StickyCog(commands.Cog):
                 logging.warning("MongoDB client is closed, skipping view re-add")
                 return
             
-            async for sticky in self.stickies.find():
+            # Only this cog's docs - the .stick cog's docs have no guild_id and
+            # would otherwise log a warning for every one of them on each ready.
+            async for sticky in self.stickies.find({"guild_id": {"$exists": True}}):
                 try:
                     # Validate required fields exist
                     if "guild_id" not in sticky or "channel_id" not in sticky:
@@ -896,30 +920,39 @@ class StickyCog(commands.Cog):
         self.rate_limits[channel_id].append(datetime.now(timezone.utc))
 
     async def _delete_existing_bot_stickies(self, channel: discord.TextChannel, sticky_text: str) -> bool:
-        # Deletes any bot messages in the last N messages in the channel that match the sticky text.
+        # Deletes any bot messages in the scan window that match the sticky text.
         # Returns True when cleanup succeeded (or there was nothing to delete),
         # False when old stickies could not be removed (e.g. missing permissions).
         try:
+            # Buttons-only stickies are posted as a zero-width space, so the
+            # content fallback has to compare against what was actually sent.
+            # This fallback is the *only* defence after a restart, when the
+            # tracked message id is unknown - previously an empty text
+            # disabled it outright and every repost stacked a new copy.
+            match_content = sticky_text or "\u200b"
+            tracked_id = self.last_sticky_messages.get(channel.id)
+
             to_delete = []
-            async for m in channel.history(limit=50):
+            async for m in channel.history(limit=HISTORY_SCAN_LIMIT):
                 # Delete bot's sticky messages (match by content or by tracked message ID)
-                if m.author == self.bot.user:
-                    # Match by content or by being the tracked sticky message
-                    if (sticky_text and (m.content or "") == sticky_text) or m.id == self.last_sticky_messages.get(channel.id):
-                        to_delete.append(m)
+                if m.author.id != self.bot.user.id:
+                    continue
+                if (m.content or "") == match_content or m.id == tracked_id:
+                    to_delete.append(m)
             
             # Delete in reverse order (newest first) to avoid issues
             for m in reversed(to_delete):
+                was_tracked = (m.id == tracked_id)
                 try:
                     await m.delete()
                     # Remove from tracking if it was the tracked message
-                    if m.id == self.last_sticky_messages.get(channel.id):
-                        del self.last_sticky_messages[channel.id]
+                    if was_tracked:
+                        self.last_sticky_messages.pop(channel.id, None)
                     await asyncio.sleep(0.1)  # Small delay to avoid rate limits
                 except discord.NotFound:
                     # Message already deleted, remove from tracking if needed
-                    if m.id == self.last_sticky_messages.get(channel.id):
-                        del self.last_sticky_messages[channel.id]
+                    if was_tracked:
+                        self.last_sticky_messages.pop(channel.id, None)
                 except discord.Forbidden:
                     logging.warning("Missing permissions to delete message in channel %s", channel.id)
                     return False
@@ -1029,7 +1062,14 @@ class StickyCog(commands.Cog):
             if not isinstance(channel, discord.TextChannel):
                 logging.warning("repost_sticky called with non-TextChannel: %s", type(channel))
                 return
-                
+
+            # Ensure queue processor is running - *before* the first await, so
+            # two concurrent calls cannot both create a processor task and end
+            # up draining the queue in parallel for the same channel.
+            if not self.repost_task or self.repost_task.done():
+                logging.warning("Repost task died, restarting...")
+                self.repost_task = asyncio.create_task(self._process_repost_queue())
+
             sticky = await self.get_sticky(channel.guild.id, channel.id)
             if not sticky:
                 return
@@ -1037,11 +1077,6 @@ class StickyCog(commands.Cog):
             # Prevent duplicate queuing
             if channel.id in self.processing_channels:
                 return
-            
-            # Ensure queue processor is running
-            if not self.repost_task or self.repost_task.done():
-                logging.warning("Repost task died, restarting...")
-                self.repost_task = asyncio.create_task(self._process_repost_queue())
             
             try:
                 self.repost_queue.put_nowait((channel.id, force))
