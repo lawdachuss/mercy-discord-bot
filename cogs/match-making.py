@@ -13,6 +13,13 @@ from pymongo import ReturnDocument
 from cogs.interaction_utils import deregister_modal, safe_defer, safe_edit, safe_reply, send_modal
 
 EMBED_COLOR = 0x2F3136
+
+# custom_id of the "Get A Match" button. Defined once and used both to build
+# the button and to recognise a panel message afterwards, so the two can never
+# drift apart: a recogniser with a stale id would silently stop repairing
+# panels.
+PANEL_CUSTOM_ID = "mm:join"
+
 SKIP_BLOCK_MINUTES = 1440  # 24 hours
 MAX_DB_CANDIDATES = 2000
 # How many pages of the queue to walk when collecting live candidates. Bounds
@@ -176,12 +183,30 @@ class MemberRoleCache:
 
 # ----- UI Views -----
 
+def _carries_panel_button(message: discord.Message) -> bool:
+    """True if ``message`` carries the matchmaking panel's "Get A Match" button.
+
+    This is what stops panel repair from ever rewriting a message that is not
+    ours. Component payloads come back as ActionRow rows holding ``children``,
+    but a bare top-level button is a valid payload too, so both shapes are
+    walked rather than assuming one.
+    """
+    for row in getattr(message, "components", None) or []:
+        children = getattr(row, "children", None)
+        # None means the row IS the component (a lone button); an empty list
+        # means an empty row, which holds no button and must not fall through.
+        for child in (children if children is not None else (row,)):
+            if getattr(child, "custom_id", None) == PANEL_CUSTOM_ID:
+                return True
+    return False
+
+
 class MatchPanel(discord.ui.View):
     def __init__(self, cog: "Matchmaker"):
         super().__init__(timeout=None)
         self.cog = cog
 
-    @discord.ui.button(label="Get A Match", style=discord.ButtonStyle.secondary, custom_id="mm:join")
+    @discord.ui.button(label="Get A Match", style=discord.ButtonStyle.secondary, custom_id=PANEL_CUSTOM_ID)
     async def start_match(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             if isinstance(interaction.channel, discord.Thread):
@@ -194,11 +219,30 @@ class MatchPanel(discord.ui.View):
                 embed.description = "The bot needs permission to create private threads to function properly."
                 return await safe_reply(interaction, embed=embed, ephemeral=True)
 
-            # Claim the window before the database work. Everything below is
-            # network round trips against Mongo, and they used to run before the
-            # first response - so a slow or busy database turned into "The
-            # application didn't respond in time" instead of an error we control.
-            await safe_defer(interaction, ephemeral=True)
+            # Claim the window with a brand NEW ephemeral message, then edit
+            # that message below - deliberately not with a defer.
+            #
+            # On a button interaction a defer means deferred_message_update:
+            # "I will edit the message this button is on", and discord.py
+            # drops the ephemeral flag unless thinking is set too (see
+            # safe_defer). The follow-up edit therefore landed on the panel
+            # itself, which is exactly how the "Private Rooms" embed was
+            # replaced by "Queue Position" on every click while the button
+            # underneath survived. Replying with our own message first means
+            # every subsequent edit has a target that is not the panel, so
+            # this handler is structurally incapable of rewriting it,
+            # whatever the defer semantics do in future.
+            busy = discord.Embed(
+                title="Getting Your Match",
+                description="⏳ Checking the queue…",
+                color=EMBED_COLOR,
+            )
+            await safe_reply(interaction, embed=busy, ephemeral=True)
+
+            # Heal the panel if an older build had rewritten it (see
+            # Matchmaker.repair_panel). Fire-and-forget: it must never delay
+            # or break the reply, and the normal case is an in-memory no-op.
+            self.cog._spawn(self.cog.repair_panel(interaction.message))
 
             await self.cog.enqueue(interaction.guild.id, interaction.user.id)
             pos, total, eta = await self.cog.get_position_and_eta(interaction.guild.id, interaction.user.id)
@@ -261,7 +305,11 @@ class ThreadControls(discord.ui.View):
                 return await safe_reply(interaction, embed=discord.Embed(title="No active match found.", color=0xE74C3C))
 
             # Claim the window: a skip does several database round trips
-            # (block, record, re-queue) plus DMs before it replies.
+            # (block, record, re-queue) plus DMs before it replies. The reply
+            # is genuinely ephemeral now (see safe_defer), so the room's own
+            # control message keeps "Room N" and its buttons instead of being
+            # overwritten with a confirmation the other participant would read
+            # as if *they* had skipped.
             await safe_defer(interaction, ephemeral=True)
 
             try:
@@ -359,7 +407,8 @@ class ThreadControls(discord.ui.View):
             other_id = self.cog._get_other_id(self.thread_id, interaction.user.id)
 
             # Claim the window: leaving writes a block row, DM's the partner
-            # and records a pending deletion before it replies.
+            # and records a pending deletion before it replies. Ephemeral, like
+            # the skip above, so the room message is left alone.
             await safe_defer(interaction, ephemeral=True)
 
             try:
@@ -564,6 +613,12 @@ class Matchmaker(commands.Cog):
         self._watch: dict[int, Tuple[set[int], asyncio.Event, asyncio.Task]] = {}
         self.match_meta: dict[int, dict] = {}
         self._initialized = False
+        # cog_load (reload) and on_ready (reconnect) can both reach
+        # _initialize at the same time; this keeps a single run of it.
+        self._init_lock = asyncio.Lock()
+        # Task currently running the startup panel sweep, so a reload racing a
+        # reconnect cannot start a second sweep over the same messages.
+        self._heal_task: Optional[asyncio.Task] = None
         self._cleanup_lock = asyncio.Lock()
         self._roles_cache = MemberRoleCache(max_size=10000, ttl_seconds=300)
         self._on_ready_done = False
@@ -590,6 +645,25 @@ class Matchmaker(commands.Cog):
         self.dm_messages_col = db['matchmaker_dm_messages']
 
         notif_manager.set_collections(self.user_prefs_col, self.dm_messages_col)
+
+    async def cog_load(self) -> None:
+        """Wire up routing and startup as soon as the cog exists.
+
+        The `ready` event is dispatched only from the gateway READY payload
+        (discord/state.py), never when a cog is loaded, so ``on_ready`` does
+        NOT re-fire on ``.reload`` - and main.py tells everyone to use
+        ``.reload`` instead of restarting. The old code did everything in
+        on_ready, so after a reload the new instance was never initialised:
+        ``cog_unload`` had just cancelled the old instance's loops, no new
+        ones started, and queues filled up with nobody ever creating rooms.
+
+        Registering the panel button here means routing always points at the
+        live cog, and starting initialisation immediately covers the reload
+        case (on first boot the bot is not ready yet, so on_ready does it).
+        """
+        self.bot.add_view(MatchPanel(self))
+        if self.bot.is_ready():
+            self._spawn(self._initialize())
 
     def cog_unload(self):
         for loop in (
@@ -681,9 +755,54 @@ class Matchmaker(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        try:
+        # Only the gateway READY payload dispatches `ready`, so this runs on
+        # every (re)connect but never when the cog is (re)loaded - cog_load
+        # covers that half. Both funnel into the same idempotent initialise.
+        await self._initialize()
+
+    async def _initialize(self) -> None:
+        """One-time startup: indexes, persisted state, loops, panel sweep.
+
+        Panel routing itself is registered in ``cog_load`` - the button must
+        resolve to the live cog even if this part has not run yet. ``_init_lock``
+        serialises a reload (cog_load) against a reconnect (on_ready), and
+        ``_on_ready_done`` stops a reconnect from starting the loops twice.
+        """
+        if self._on_ready_done:
+            return
+        async with self._init_lock:
             if self._on_ready_done:
                 return
+            healthy = await self._initialize_body()
+
+            # Everything below runs whatever the DB section did. It used to sit
+            # inside that same try, so a single failed create_index aborted
+            # on_ready, left _initialized False and every loop dead: the cog
+            # looked loaded but did nothing for the life of the process.
+            self._initialized = True
+            # Repair panels a pre-fix click had rewritten, in the background:
+            # a slow sweep must never hold up startup or the loops below.
+            self._spawn(self._heal_damaged_panels())
+            if not self.match_loop.is_running():
+                self.match_loop.start()
+            if not self.cleanup_inactive_threads.is_running():
+                self.cleanup_inactive_threads.start()
+            if not self.queue_panel_loop.is_running():
+                self.queue_panel_loop.start()
+            if not self.cleanup_loop.is_running():
+                self.cleanup_loop.start()
+            if not self.dm_cleanup_loop.is_running():
+                self.dm_cleanup_loop.start()
+            # Latch only when every DB step worked, so the next (re)connect
+            # retries a failed index build instead of running forever without
+            # the unique index that keeps duplicate queue rows out.
+            self._on_ready_done = healthy
+
+    async def _initialize_body(self) -> bool:
+        """Rebuild indexes and in-memory state. Returns False if a step failed."""
+        try:
+            if self._on_ready_done:
+                return True
 
             await self.guild_config_col.create_index([("guild_id", 1)], unique=True)
             try:
@@ -703,7 +822,8 @@ class Matchmaker(commands.Cog):
             await self.pending_deletions_col.create_index([("delete_after", 1)])
             await self.dm_messages_col.create_index([("delete_after", 1)])
 
-            self.bot.add_view(MatchPanel(self))
+            # No add_view here on purpose: panel routing lives in cog_load, so
+            # it is re-registered when the cog is reloaded too.
             try:
                 # Dedupe waiting queue: if duplicates existed before adding unique index
                 try:
@@ -759,28 +879,16 @@ class Matchmaker(commands.Cog):
             except Exception:
                 pass
 
-            self._initialized = True
-            if not self.match_loop.is_running():
-                self.match_loop.start()
-            if not self.cleanup_inactive_threads.is_running():
-                self.cleanup_inactive_threads.start()
-            if not self.queue_panel_loop.is_running():
-                self.queue_panel_loop.start()
-            if not self.cleanup_loop.is_running():
-                self.cleanup_loop.start()
-            if not self.dm_cleanup_loop.is_running():
-                self.dm_cleanup_loop.start()
-            self._on_ready_done = True
+            return True
         except asyncio.CancelledError:
             raise
         except Exception:
-            # Re-raising here was the worst possible behaviour: one failed
-            # create_index (for example an IndexOptionsConflict, or a
-            # transient timeout) propagated out of on_ready and left
-            # _initialized False with every loop dead, so the cog looked
-            # loaded but did nothing for the life of the process. Startup is
-            # best-effort per step; the loops are started either way.
-            logger.exception("Matchmaking: startup step failed; continuing")
+            # Best-effort: one failed create_index (an IndexOptionsConflict, a
+            # transient timeout) must not abort startup. _initialize still
+            # starts every loop and simply does not latch, so the next
+            # (re)connect retries this section.
+            logger.exception("Matchmaking: index/state rebuild failed; continuing")
+            return False
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -940,6 +1048,120 @@ class Matchmaker(commands.Cog):
                 "Matchmaking: could not record panel message id for guild %s", guild.id, exc_info=True
             )
         return True
+
+    def _panel_embed_is_intact(self, message: discord.Message) -> bool:
+        """True if ``message`` still shows the canonical panel embed.
+
+        Compared field by field against what _build_panel_embed would post, so
+        the check cannot drift away from the thing it is checking. Pure
+        in-memory comparison of data Discord already sent us - no fetch -
+        because this runs on every single panel click.
+        """
+        embeds = message.embeds
+        if not embeds:
+            return False
+        want = self._build_panel_embed()
+        got = embeds[0]
+        got_image = got.image.url if got.image else None
+        return (
+            got.title == want.title
+            and got.description == want.description
+            and got_image == MATCHMAKER_BANNER_URL
+        )
+
+    async def repair_panel(self, message: Optional[discord.Message]) -> bool:
+        """Put a damaged matchmaking panel back to its canonical embed.
+
+        Pressing "Get A Match" used to rewrite the panel itself: discord.py
+        drops `ephemeral` on a component defer (see safe_defer), so what the
+        handler believed was a private defer was in fact a deferred update of
+        the button's own message, and its follow-up edit replaced the "Private
+        Rooms" embed with the queue position. The button underneath survived,
+        so the panel kept working while looking permanently wrong, and nothing
+        brought the embed back unless an admin re-ran /mm.
+
+        Two callers: every panel click, which only has to look at the message
+        the click arrived on, and a one-off sweep after startup, which repairs
+        panels nobody has clicked since the fix. Both are guarded the same way
+        - it must carry our own button and it must not already be canonical -
+        so an intact panel is an in-memory no-op with zero API calls, and a
+        message that is not ours can never be written to.
+
+        Returns True only when a repair actually happened.
+        """
+        if not isinstance(message, discord.Message):
+            return False
+        if not _carries_panel_button(message):
+            return False
+        if self._panel_embed_is_intact(message):
+            return False
+        guild = getattr(message, "guild", None)
+        try:
+            # A fresh view goes out with it: the buttons are still attached,
+            # but re-sending means the panel is backed by a live view instance
+            # either way, the same thing setup/configure do when refreshing it.
+            await message.edit(embed=self._build_panel_embed(), view=MatchPanel(self))
+        except Exception:
+            logger.warning(
+                "Matchmaking: could not repair panel %s in guild %s",
+                getattr(message, "id", "?"),
+                guild.id if guild else "?",
+                exc_info=True,
+            )
+            return False
+        logger.info(
+            "Matchmaking: repaired damaged panel %s in guild %s",
+            getattr(message, "id", "?"),
+            guild.id if guild else "?",
+        )
+        return True
+
+    async def _heal_damaged_panels(self) -> None:
+        """Repair every tracked panel once after startup.
+
+        Clicks repair their own panel from now on, but a server nobody clicks
+        would keep showing pre-fix damage until someone did, so sweep once at
+        startup instead. One fetch per guild, spaced out so a large bot does
+        not arrive at the rate limiter in a single burst, and only panels that
+        are actually off-canon are ever written to. Failures are logged and
+        skipped - /mm action:configure remains the manual way to refresh one.
+        """
+        me = asyncio.current_task()
+        if self._heal_task is not None and self._heal_task is not me and not self._heal_task.done():
+            logger.debug("Matchmaking: startup panel self-repair already running")
+            return
+        self._heal_task = me
+
+        try:
+            rows = await self.guild_config_col.find(
+                {"panel_message_id": {"$exists": True}},
+                {"guild_id": 1, "channel_id": 1, "parent_channel_id": 1, "panel_message_id": 1},
+            ).to_list(length=None)
+        except Exception:
+            logger.warning(
+                "Matchmaking: could not read panel records for self-repair", exc_info=True
+            )
+            return
+
+        for row in rows or []:
+            try:
+                panel_id = row.get("panel_message_id")
+                if not panel_id:
+                    continue
+                guild = self.bot.get_guild(int(row.get("guild_id") or 0))
+                if guild is None:
+                    continue
+                # parent_channel_id is what /mm writes; channel_id predates
+                # the rename and is still honoured elsewhere in this cog.
+                channel_id = row.get("parent_channel_id") or row.get("channel_id")
+                channel = guild.get_channel(int(channel_id)) if channel_id else None
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+                msg = await channel.fetch_message(int(panel_id))
+                await self.repair_panel(msg)
+            except Exception:
+                logger.debug("Matchmaking: startup panel self-repair skipped", exc_info=True)
+            await asyncio.sleep(0.5)
 
     async def _get_queue_counts(self, guild_id: int) -> Dict[str, int]:
         total = await self.waiting_queue_col.count_documents({"guild_id": guild_id})

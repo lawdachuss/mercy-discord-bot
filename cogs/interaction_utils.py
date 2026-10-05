@@ -41,11 +41,26 @@ async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True) -
     Call this before any database or network work, then finish with
     ``safe_edit``.
 
+    On a button or modal interaction ``ephemeral`` is silently ignored by
+    discord.py unless ``thinking`` is also set: those two types defer with
+    ``deferred_message_update`` - literally "I will edit the message this
+    button/modal came from" - and never attach the ephemeral flag. The
+    follow-up ``safe_edit`` would then rewrite the clicked message itself
+    instead of replying to the clicker, which is how the matchmaking panel
+    lost its embed to "Queue Position" on every "Get A Match" press. Asking
+    for the thinking state whenever a private reply was requested makes the
+    defer create a new ephemeral message, so the edit lands on that message
+    and the clicked one is never touched.
+
     Returns True if the window is now claimed by this interaction.
     """
     try:
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=ephemeral)
+            wants_thinking = ephemeral and interaction.type in (
+                discord.InteractionType.component,
+                discord.InteractionType.modal_submit,
+            )
+            await interaction.response.defer(ephemeral=ephemeral, thinking=wants_thinking)
         return interaction.response.is_done()
     except discord.HTTPException as e:
         # Almost always an expired token: the user took too long to press
@@ -66,7 +81,12 @@ async def safe_edit(
     embed: Optional[discord.Embed] = None,
     view: Optional[discord.ui.View] = None,
 ) -> bool:
-    """Finish an interaction that ``safe_defer`` already claimed."""
+    """Finish an interaction that ``safe_defer`` already claimed.
+
+    The edit goes to whatever the first response created. With
+    ``safe_defer(interaction, ephemeral=True)`` that is a private message, so
+    this can never rewrite a public message the caller only meant to read.
+    """
     kwargs: dict[str, Any] = {}
     if content is not None:
         kwargs["content"] = content
