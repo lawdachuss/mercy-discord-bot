@@ -1,53 +1,57 @@
 /**
  * workflow-watchman — Cloudflare Worker
  * ---------------------------------------
- * Monitors GitHub Actions workflows across node-1..node-18, mercy-discord-bot,
- * and supabase-actions repos. Restarts any workflow that has been inactive/dead
- * longer than its grace period.
+ * Monitors the mercy-discord-bot GitHub Actions workflow (secure-rdp.yml) and
+ * restarts it whenever it has been inactive/dead longer than its grace period.
+ * This worker watches ONLY our bot repo; every other repo is deliberately not
+ * in REPO_CONFIGS.
  *
- * Repo-specific behaviour:
- *   - node-1..node-18 + mercy-discord-bot (secure-rdp.yml):  20 min grace,  8 restarts / 24h max
- *     (checked every 5th minute — long grace, no need for fast polls)
- *   - supabase-actions (supabase-host.yml): 1 min grace — 24/7 session chaining
- *     (fast-polled EVERY minute so the handoff gap stays ~1-2 min)
+ * Behaviour (mercy-discord-bot, secure-rdp.yml, branch master):
+ *   - Grace: 2 min measured from when the last run ENDED (any conclusion), so a
+ *     finished session gets a fresh one within ~1-3 min total (detection is
+ *     ~1 min thanks to fastPoll). Extra dispatches can't fight a live session:
+ *     the workflow's `concurrency: rdp-session` (cancel-in-progress: false)
+ *     makes a second run QUEUE behind the active one instead.
+ *   - fastPoll: checked on EVERY cron tick (1 min), so a dead run is picked up
+ *     within ~1-2 min. Only one repo is watched, so the GitHub rate-limit cost
+ *     of the 1-min poll is trivial (was every 5th minute when 20 repos were
+ *     monitored).
+ *   - Budget: 8 restarts / 24h max (throttleMax).
+ *   - `failGraceMs` remains available as a per-repo override: a shorter grace
+ *     applied ONLY when the latest run failed (useful when graceMs is long).
+ *
+ * Restart budget (throttleMax / 24h): counted from the WATCHMAN_KV namespace
+ * when the binding is configured, so it only ever counts dispatches THIS worker
+ * made — manual/UI retries no longer eat the budget and lock the watchman out.
+ * Without the binding it falls back to counting completed workflow_dispatch runs
+ * from the API (cruder: manual retries count too). A throttled repo now posts a
+ * Discord alert (once per 30 min) instead of going silent.
  */
 
 const OWNER = "lawdachuss";
 
 // ===== Per-repo configuration ================================================
+// This worker intentionally monitors ONLY our bot repo — every other repo that
+// used to be here (node-1..node-18, supabase-actions) was removed so this
+// worker can't touch anything but mercy-discord-bot.
 const REPO_CONFIGS = [
-  // Node repos — standard behaviour
-  { repo: "node-1",   workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-2",   workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-3",   workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-4",   workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-5",   workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-6",   workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-7",   workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-8",   workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-9",   workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-10",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-11",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-12",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-13",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-14",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-15",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-16",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-17",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-  { repo: "node-18",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-
-  // mercy-discord-bot — Discord bot with RDP access
-  { repo: "mercy-discord-bot", workflow: "secure-rdp.yml", branch: "master", graceMs: 20 * 60 * 1000, throttleMax: 8 },
-
-  // supabase-actions — 24/7 self-hosted Supabase. Sessions run ~5h05m then stop;
-  // restart the moment one completes so the stack is up around the clock.
-  // Short grace = fast handoff. The repo's own 6-hour schedule still runs as a
-  // no-cancel fallback (it queues behind the active session instead of killing it).
-  // fastPoll: true = checked on EVERY cron tick (1 min) so the dead gap is ~1-2 min.
-  // throttleMax 12: normal 24/7 chaining needs ~4-5 sessions/day; the headroom
-  // covers a rapid-fail loop (schedule + watchman double-triggering) without the
-  // watchman going silent for 24h.
-  { repo: "supabase-actions", workflow: "supabase-host.yml", branch: "master", graceMs: 60 * 1000, throttleMax: 12, fastPoll: true },
+  // mercy-discord-bot — Discord bot with RDP access.
+  // graceMs 2 min for EVERY conclusion: the moment a session ends (success or
+  // failure) the watchman may start the next one. Overlapping dispatches are
+  // harmless because the workflow's `concurrency: rdp-session` (cancel-in-
+  // progress: false) makes a second run QUEUE behind a live session instead of
+  // fighting it — worst case you get extra back-to-back coverage.
+  // fastPoll: checked on EVERY 1-min cron tick, so a dead run is detected
+  // within ~1-2 min (cheap now that this is the only repo being watched).
+  // throttleMax: at most 8 auto-restarts per rolling 24h.
+  {
+    repo: "mercy-discord-bot",
+    workflow: "secure-rdp.yml",
+    branch: "master",
+    graceMs: 2 * 60 * 1000,
+    throttleMax: 8,
+    fastPoll: true,
+  },
 ];
 
 const THROTTLE_WINDOW = 24 * 60 * 60 * 1000; // 24 hours
@@ -56,8 +60,9 @@ const HEALTH_CHECK_INTERVAL = 30 * 1000; // 30 seconds
 
 // ===== Per-repo dispatch/notify guards =======================================
 // lastDispatchAt: prevents double-dispatch races when the schedule-queued run
-// and our dispatch land in the same cron window. lastErrorAt: caps Discord
-// error spam to once per 30 min per repo (a broken config was alerting every 5 min).
+// and our dispatch land in the same cron window. lastErrorAt / lastThrottleAt:
+// cap Discord spam to once per 30 min per repo (a broken config was alerting
+// every 5 min).
 //
 // NOTE: these live in module state, which is per-isolate in Workers. With the
 // 1-min cron, a slow health check (up to 3 min) can overlap the next scheduled
@@ -68,8 +73,16 @@ const HEALTH_CHECK_INTERVAL = 30 * 1000; // 30 seconds
 // radius. A KV/cache-backed lock would close the window entirely if ever needed.
 const DISPATCH_COOLDOWN_MS = 90 * 1000;
 const ERROR_NOTIFY_INTERVAL_MS = 30 * 60 * 1000;
+const THROTTLE_NOTIFY_INTERVAL_MS = 30 * 60 * 1000;
 const lastDispatchAt = {};
 const lastErrorAt = {};
+const lastThrottleAt = {};
+
+// Restart budget is persisted in KV (binding: WATCHMAN_KV) as a JSON array of
+// dispatch timestamps (ms). KV is eventually consistent (~60s across edges) —
+// fine here: the per-repo dispatch cooldown (90s) plus the health check already
+// serialize dispatches far more tightly than that.
+const RESTARTS_TTL_SEC = 24 * 60 * 60;
 
 // ===== Helpers ===============================================================
 
@@ -191,6 +204,40 @@ async function sendDiscordError(env, repo, message) {
   });
 }
 
+// Throttled repos used to go completely silent (restarts paused for hours with
+// no signal at all). Announce the lockout once per 30 min per repo, including
+// when the budget frees up again.
+async function maybeNotifyThrottled(env, state) {
+  const repo = state.name;
+  const now = Date.now();
+  if (now - (lastThrottleAt[repo] || 0) < THROTTLE_NOTIFY_INTERVAL_MS) return;
+  lastThrottleAt[repo] = now;
+  const url = env.DISCORD_WEBHOOK_URL;
+  if (!url) return;
+  const fields = [
+    { name: "Restarts today", value: String(state.restarts || 0), inline: true },
+    { name: "Budget", value: `${state.restarts || 0} / ${state.budget || 8} in 24h`, inline: true },
+  ];
+  if (state.resumeAt) {
+    fields.push({ name: "Budget frees up (UTC)", value: state.resumeAt.replace("T", " ").slice(0, 16), inline: true });
+  }
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      embeds: [{
+        title: `⏸️ ${repo} restart paused`,
+        color: 16776960,
+        description: `${state.reason || "Throttled"}\nAutomatic restarts are paused until the 24h budget frees up. Manual runs are unaffected.`,
+        fields,
+        footer: { text: "workflow-watchman" },
+        timestamp: new Date().toISOString(),
+      }],
+    }),
+  });
+  if (!resp.ok) console.error(`[notify] Discord webhook returned ${resp.status}`);
+}
+
 // ===== Dashboard / Metrics ===================================================
 
 // Result cache for the public dashboard (60s TTL): each page view calls the
@@ -272,7 +319,7 @@ a { color:#3b82f6; }
 </head>
 <body>
 <h1>🛡️ workflow-watchman</h1>
-<p class="subtitle">Monitoring ${repos.length} repos • cron */1 * * * * (fast-poll supabase-actions)</p>
+<p class="subtitle">Monitoring ${repos.length} repo • cron */1 * * * * (mercy-discord-bot, fast-polled)</p>
 <table>
 <thead><tr><th>Repo</th><th>Status</th><th>Last Run</th><th>Age</th><th>Restarts</th></tr></thead>
 <tbody>${rows}</tbody>
@@ -307,7 +354,56 @@ function renderMetrics(repos) {
 
 // ===== Core logic ============================================================
 
-async function evaluateRepo(config, headers) {
+// Restart budget: timestamps (ms) of WATCHMAN restarts dispatched for this repo
+// in the last 24h.
+//
+// With the WATCHMAN_KV binding this reads our own dispatch log, so only
+// restarts we made count — a user hammering "Run workflow" in the UI while
+// debugging a broken run no longer eats the budget and locks the watchman out
+// for the rest of the day (that is exactly what happened on Oct 7: 11 manual
+// retries in 40 min silenced auto-restart for ~16h).
+//
+// Without the binding we fall back to counting completed workflow_dispatch runs
+// from the already-fetched runs payload — no extra API call, but manual
+// dispatches count too (the pre-KV behaviour).
+async function loadWatchmanRestarts(env, config, runs) {
+  const kv = env.WATCHMAN_KV;
+  if (kv) {
+    const key = `restarts:${config.repo}`;
+    const stored = (await kv.get(key, "json")) || [];
+    const cutoff = Date.now() - THROTTLE_WINDOW;
+    const live = stored.filter((t) => t > cutoff);
+    if (live.length !== stored.length) {
+      await kv.put(key, JSON.stringify(live), { expirationTtl: RESTARTS_TTL_SEC });
+    }
+    return live;
+  }
+  const cutoff = Date.now() - THROTTLE_WINDOW;
+  return (runs || [])
+    .filter((r) => {
+      if (r.status !== "completed" || r.event !== "workflow_dispatch") return false;
+      if (r.conclusion === "cancelled") return false;
+      return new Date(r.created_at).getTime() > cutoff;
+    })
+    .map((r) => new Date(r.created_at).getTime());
+}
+
+// Called right after a successful dispatch. Read-modify-write on KV can race a
+// concurrent isolate, but DISPATCH_COOLDOWN_MS (90s) + the active-run check
+// keep it to one dispatch per repo per window, and worst case loses/duplicates
+// one timestamp in a counter that tolerates +/-1.
+async function recordWatchmanRestart(env, config) {
+  const kv = env.WATCHMAN_KV;
+  if (!kv) return;
+  const key = `restarts:${config.repo}`;
+  const stored = (await kv.get(key, "json")) || [];
+  const cutoff = Date.now() - THROTTLE_WINDOW;
+  const live = stored.filter((t) => t > cutoff);
+  live.push(Date.now());
+  await kv.put(key, JSON.stringify(live), { expirationTtl: RESTARTS_TTL_SEC });
+}
+
+async function evaluateRepo(config, headers, env) {
   const { repo, workflow, graceMs, throttleMax } = config;
   const resp = await ghFetch(
     `https://api.github.com/repos/${OWNER}/${repo}/actions/workflows/${workflow}/runs?per_page=30`,
@@ -324,6 +420,7 @@ async function evaluateRepo(config, headers) {
     lastConclusion: null,
     deadDuration: null,
     restarts: 0,
+    budget: throttleMax,
   };
 
   // No runs ever → needs restart
@@ -354,18 +451,23 @@ async function evaluateRepo(config, headers) {
   const endedAt = new Date(latest.updated_at || latest.created_at).getTime();
   const age = Number.isFinite(endedAt) ? Date.now() - endedAt : Infinity; // null -> treat as very old
 
-  // Grace period check
-  if (age < graceMs) return state;
+  // Restart budget first (before the grace check) so the dashboard shows an
+  // accurate restarts-today count even while the repo is inside its grace window.
+  const restarts = await loadWatchmanRestarts(env, config, runs);
+  state.restarts = restarts.length;
 
-  const recentCompletions = runs.filter((r) => {
-    if (r.status !== "completed" || r.event !== "workflow_dispatch") return false;
-    if (r.conclusion === "cancelled") return false;
-    return new Date(r.created_at).getTime() > Date.now() - THROTTLE_WINDOW;
-  });
-  state.restarts = recentCompletions.length;
-  if (recentCompletions.length >= throttleMax) {
-    state.reason = `Throttled (${recentCompletions.length} watchman restarts in 24h)`;
+  // Grace period. A failed run is retried on the short failGraceMs window
+  // (when configured) — the session never got off the ground, so there is no
+  // live session to protect with a long grace. Successful runs keep graceMs.
+  const failed = latest.status === "completed" && latest.conclusion !== "success";
+  const grace = failed && config.failGraceMs != null ? config.failGraceMs : graceMs;
+  if (age < grace) return state;
+
+  if (restarts.length >= throttleMax) {
+    const sorted = restarts.slice().sort((a, b) => a - b);
     state.throttled = true;
+    state.resumeAt = new Date(sorted[restarts.length - throttleMax] + THROTTLE_WINDOW).toISOString();
+    state.reason = `Throttled (${restarts.length} watchman restarts in 24h)`;
     return state;
   }
 
@@ -414,6 +516,7 @@ async function executeRestart(config, state, headers, env) {
 
   const dispatchedAt = Date.now();
   lastDispatchAt[repo] = dispatchedAt;
+  await recordWatchmanRestart(env, config);
   console.log(`[${repo}] dispatched`);
   await sendDiscordAlert(env, repo, {
     reason: state.reason,
@@ -462,7 +565,7 @@ async function fetchAllStatus(env) {
   const results = new Array(REPO_CONFIGS.length);
   await runWithConcurrency(REPO_CONFIGS, 4, async (config, i) => {
     try {
-      results[i] = await evaluateRepo(config, headers);
+      results[i] = await evaluateRepo(config, headers, env);
     } catch {
       results[i] = { name: config.repo, status: "error" };
     }
@@ -498,16 +601,19 @@ export default {
     }
     const headers = ghHeaders(token);
     // Fast-poll gate: the cron fires every minute, but only repos flagged
-    // fastPoll (supabase-actions) are checked on EVERY tick. The node repos
-    // (20-min grace) only need checking every 5th minute, which keeps GitHub
-    // rate-limit and free-plan CPU usage low while the 24/7 chain gets
-    // ~1-minute detection of a dead session.
-    const isNodeTick = Math.floor(Date.now() / 60000) % 5 === 0;
+    // fastPoll are checked on EVERY tick; everything else waits for the 5th
+    // minute to keep GitHub rate-limit and free-plan CPU usage low.
+    // mercy-discord-bot is fastPolled, so a dead run is spotted in ~1-2 min.
+    const isFiveMinuteTick = Math.floor(Date.now() / 60000) % 5 === 0;
     await runWithConcurrency(REPO_CONFIGS, 4, async (config) => {
-      if (!config.fastPoll && !isNodeTick) return;
+      if (!config.fastPoll && !isFiveMinuteTick) return;
       try {
-        const state = await evaluateRepo(config, headers);
-        if (state.needsRestart) {
+        const state = await evaluateRepo(config, headers, env);
+        if (state.throttled) {
+          // Budget exhausted: don't dispatch, but don't go silent either.
+          console.log(`[${config.repo}] throttled until ${state.resumeAt || "budget frees"}`);
+          await maybeNotifyThrottled(env, state);
+        } else if (state.needsRestart) {
           await executeRestart(config, state, headers, env);
         }
       } catch (err) {

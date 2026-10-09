@@ -1,4 +1,6 @@
-name = "workflow-watchman"
+# Worker name — deployed as its own worker, separate from the multi-repo
+# `workflow-watchman`, and it only monitors mercy-discord-bot.
+name = "mercy-watchman"
 main = "src/index.js"
 compatibility_date = "2025-04-01"
 
@@ -16,3 +18,12 @@ crons = ["*/1 * * * *"]
 # Optional token guarding the public dashboard/metrics pages (sent as
 # 'x-watchman-token' header or ?token= query param). Leave unset for open access.
 # Set via: wrangler secret put DASHBOARD_TOKEN
+
+# Optional (recommended): KV namespace holding each repo's restart budget, so the
+# 24h throttle counts ONLY restarts dispatched by this worker. Without it the
+# worker falls back to counting workflow_dispatch runs from the GitHub API (manual
+# retries count against the budget too).
+#   wrangler kv namespace create WATCHMAN_KV
+[[kv_namespaces]]
+binding = "WATCHMAN_KV"
+id = "c92f79db43f8432bb0eb9bf338df8fff"

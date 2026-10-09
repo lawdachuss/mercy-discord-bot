@@ -124,20 +124,49 @@ jobs:
         run: |
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
           $hostname  = "mercy-bot-${{ github.run_id }}"
+          $authkey   = "${{ secrets.TAILSCALE_KEY }}".Trim()
+          "TAILSCALE_OK=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          Start-Service Tailscale
-          Start-Sleep -Seconds 5
-
-          & $tailscale up --authkey="${{ secrets.TAILSCALE_KEY }}" --hostname="$hostname" --accept-routes --reset
-          if ($LASTEXITCODE -ne 0) { Write-Error "Tailscale failed"; exit 1 }
+          # Fail-soft on purpose: an invalid/expired TAILSCALE_KEY used to crash
+          # the whole job here, which killed the bot session along with it.
+          # RDP is access convenience — the bot must keep running either way.
+          if (-not $authkey) {
+            Write-Host "::warning::TAILSCALE_KEY secret is empty - starting WITHOUT RDP access."
+            "TAILSCALE_OK=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            return
+          }
+          if ($authkey -notlike "tskey-*") {
+            Write-Host "::warning::TAILSCALE_KEY does not look like a Tailscale auth key (expected tskey-auth-...). If 'invalid key' appears below, regenerate it at https://login.tailscale.com/admin/settings/keys"
+          }
 
           $ip = $null
-          for ($i = 0; $i -lt 20; $i++) {
-            try { $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim() } catch {}
-            if ($ip) { break }
-            Start-Sleep -Seconds 3
+          try {
+            Start-Service Tailscale
+            Start-Sleep -Seconds 5
+
+            foreach ($attempt in 1..2) {
+              & $tailscale up --authkey="$authkey" --hostname="$hostname" --accept-routes --reset
+              if ($LASTEXITCODE -eq 0) { break }
+              if ($attempt -eq 1) { Write-Host "tailscale up failed (attempt 1), retrying in 15s..."; Start-Sleep -Seconds 15 }
+            }
+
+            if ($LASTEXITCODE -eq 0) {
+              for ($i = 0; $i -lt 20; $i++) {
+                try { $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim() } catch {}
+                if ($ip) { break }
+                Start-Sleep -Seconds 3
+              }
+            }
+          } catch {
+            Write-Host "::warning::Tailscale setup threw: $($_.Exception.Message)"
+            $ip = $null
           }
-          if (-not $ip) { Write-Error "No Tailscale IP assigned"; exit 1 }
+
+          if (-not $ip) {
+            Write-Host "::warning::Tailscale tunnel is down (invalid or expired TAILSCALE_KEY?) - the bot is starting WITHOUT RDP access. Fix: create a new auth key at https://login.tailscale.com/admin/settings/keys and update the TAILSCALE_KEY Actions secret, then start a new session."
+            "TAILSCALE_OK=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            return
+          }
 
           "TAILSCALE_IP=$ip"      | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TS_HOSTNAME=$hostname" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -193,11 +222,20 @@ jobs:
 
           # Show connection details once
           $runCount = [int]$env:CACHED_RUN_COUNT + 1
+          $tsDown = ($env:TAILSCALE_OK -eq "false")
           Write-Host ""
           Write-Host "======================================="
-          Write-Host "        MERCY BOT + RDP READY"
+          if ($tsDown) {
+            Write-Host "  MERCY BOT READY (RDP/TAILSCALE DOWN)"
+          } else {
+            Write-Host "        MERCY BOT + RDP READY"
+          }
           Write-Host "======================================="
-          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          if ($tsDown) {
+            Write-Host "Tailscale    : DOWN - no RDP access this session (renew TAILSCALE_KEY)"
+          } else {
+            Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          }
           Write-Host "Username     : RDP"
           Write-Host "Password     : $env:RDP_PASSWORD"
           Write-Host "Session #    : $runCount"
