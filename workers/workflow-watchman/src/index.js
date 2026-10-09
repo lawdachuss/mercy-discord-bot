@@ -7,11 +7,11 @@
  * in REPO_CONFIGS.
  *
  * Behaviour (mercy-discord-bot, secure-rdp.yml, branch master):
- *   - Grace: 2 min measured from when the last run ENDED (any conclusion), so a
- *     finished session gets a fresh one within ~1-3 min total (detection is
- *     ~1 min thanks to fastPoll). Extra dispatches can't fight a live session:
- *     the workflow's `concurrency: rdp-session` (cancel-in-progress: false)
- *     makes a second run QUEUE behind the active one instead.
+ *   - Grace: 0 — a session that goes offline (bot crash, failed run, or normal
+ *     end of the keep-alive) is restarted on the very next cron tick, i.e. within
+ *     ~60 s + runner boot. Extra dispatches can't fight a live session: the
+ *     workflow's `concurrency: rdp-session` (cancel-in-progress: false) queues a
+ *     second run behind the active one instead of overlapping it.
  *   - fastPoll: checked on EVERY cron tick (1 min), so a dead run is picked up
  *     within ~1-2 min. Only one repo is watched, so the GitHub rate-limit cost
  *     of the 1-min poll is trivial (was every 5th minute when 20 repos were
@@ -36,19 +36,18 @@ const OWNER = "lawdachuss";
 // worker can't touch anything but mercy-discord-bot.
 const REPO_CONFIGS = [
   // mercy-discord-bot — Discord bot with RDP access.
-  // graceMs 2 min for EVERY conclusion: the moment a session ends (success or
-  // failure) the watchman may start the next one. Overlapping dispatches are
-  // harmless because the workflow's `concurrency: rdp-session` (cancel-in-
-  // progress: false) makes a second run QUEUE behind a live session instead of
-  // fighting it — worst case you get extra back-to-back coverage.
-  // fastPoll: checked on EVERY 1-min cron tick, so a dead run is detected
-  // within ~1-2 min (cheap now that this is the only repo being watched).
-  // throttleMax: at most 8 auto-restarts per rolling 24h.
+  // graceMs 0: restart the INSTANT a session goes offline — the moment GitHub
+  // reports no active run, the next cron tick (<= 60s away) dispatches a new
+  // session. Overlapping dispatches can't fight a live session: the workflow's
+  // `concurrency: rdp-session` (cancel-in-progress: false) makes a second run
+  // QUEUE behind the active one instead. A rapid-fail loop is still bounded by
+  // throttleMax (8/24h) + the 90s per-repo dispatch cooldown.
+  // fastPoll: checked on EVERY 1-min cron tick (cheap: only repo watched).
   {
     repo: "mercy-discord-bot",
     workflow: "secure-rdp.yml",
     branch: "master",
-    graceMs: 2 * 60 * 1000,
+    graceMs: 0,
     throttleMax: 8,
     fastPoll: true,
   },
@@ -285,7 +284,7 @@ function renderDashboard(repos) {
       }
       return `<tr>
         <td><strong>${r.name}</strong></td>
-        <td>${icon} ${r.status || "no runs"}</td>
+        <td>${r.throttled ? "⏸ throttled" : `${icon} ${r.status || "no runs"}`}</td>
         <td>${r.lastRun ? new Date(r.lastRun).toISOString().replace("T", " ").slice(0, 16) + " UTC" : "—"}</td>
         <td>${age}</td>
         <td>${r.restarts ?? 0}</td>
@@ -346,6 +345,8 @@ function renderMetrics(repos) {
           lastRun: r.lastRun,
           lastConclusion: r.lastConclusion,
           restarts: r.restarts ?? 0,
+          throttled: !!r.throttled,
+          resumeAt: r.resumeAt || null,
         },
       ])
     ),

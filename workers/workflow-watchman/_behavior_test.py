@@ -58,17 +58,17 @@ globalThis.__result = null;
   let s = await evaluateRepo(mercy, headers, { WATCHMAN_KV: kvMock([]) });
   r.A_failed3min = { needsRestart: s.needsRestart, throttled: !!s.throttled };
 
-  // A2: failed run 1 min ago -> still inside failGrace
+  // A2: failed run 1 min ago -> grace 0, restart right away
   __runs = [mkRun({ conclusion: "failure", updated_at: iso(Date.now() - 1 * M) })];
   s = await evaluateRepo(mercy, headers, { WATCHMAN_KV: kvMock([]) });
   r.A2_failed1min = { needsRestart: s.needsRestart };
 
-  // B: successful run ended 1 min ago -> inside the 2 min grace, still waiting
+  // B: successful run ended 1 min ago -> grace 0, restart right away
   __runs = [mkRun({ conclusion: "success", updated_at: iso(Date.now() - 1 * M) })];
   s = await evaluateRepo(mercy, headers, { WATCHMAN_KV: kvMock([]) });
   r.B_success1min = { needsRestart: s.needsRestart, restarts: s.restarts };
 
-  // B2: successful run ended 3 min ago -> past the 2 min grace -> restart
+  // B2: successful run ended 3 min ago -> still restart (grace 0)
   __runs = [mkRun({ conclusion: "success", updated_at: iso(Date.now() - 3 * M) })];
   s = await evaluateRepo(mercy, headers, { WATCHMAN_KV: kvMock([]) });
   r.B2_success3min = { needsRestart: s.needsRestart };
@@ -177,9 +177,9 @@ def chk(name, cond):
     checks.append((name, cond))
 
 chk("A: failed 3min -> restart", result["A_failed3min"] == {"needsRestart": True, "throttled": False})
-chk("A2: failed 1min -> wait (2m grace)", result["A2_failed1min"]["needsRestart"] is False)
-chk("B: success 1min -> wait (2m grace)", result["B_success1min"]["needsRestart"] is False)
-chk("B2: success 3min -> restart (2m grace)", result["B2_success3min"]["needsRestart"] is True)
+chk("A2: failed 1min -> restart (grace 0)", result["A2_failed1min"]["needsRestart"] is True)
+chk("B: success 1min -> restart (grace 0)", result["B_success1min"]["needsRestart"] is True)
+chk("B2: success 3min -> restart (grace 0)", result["B2_success3min"]["needsRestart"] is True)
 chk("C: 12 manual dispatches + KV(1) -> NOT throttled, restart",
     result["C_manualDispatchesKV"] == {"needsRestart": True, "throttled": False, "restarts": 1})
 chk("D: no KV fallback -> throttled at 12", result["D_fallbackNoKV"]["throttled"] is True and result["D_fallbackNoKV"]["restarts"] == 12)
