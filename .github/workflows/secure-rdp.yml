@@ -1,14 +1,21 @@
 name: Secure RDP + Mercy Bot
 
+# Never scheduled: no `schedule:`/cron trigger on this workflow, now or later.
+#
+# workflow_dispatch is the only trigger. Each run queues its own successor, which
+# waits in the rdp-session group and starts the moment this run ends, so the bot
+# stays up 24/7 by chaining rather than by a timer. The successor always runs the
+# default branch, so an experiment on another branch cannot hijack the loop. A
+# session that runs its full keep-alive resets the retry counter; a bot that
+# keeps failing is retried for 5 links, then the chain stops and alerts instead
+# of looping forever (fix whatever broke, then start one run by hand).
 on:
   workflow_dispatch:
     inputs:
       triggered_by:
-        description: 'Source of the trigger (workflow-watchman auto-restart)'
+        description: 'session-chain:<n> (automatic) | workflow-watchman | blank if manual'
         required: false
         default: ''
-  schedule:
-    - cron: "30 */6 * * *"
 
 concurrency:
   group: rdp-session
@@ -16,6 +23,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write    # a run queues its own successor
 
 jobs:
   rdp:
@@ -25,6 +33,49 @@ jobs:
     steps:
       - name: Checkout bot code
         uses: actions/checkout@v4
+
+      - name: Queue the next session (early insurance)
+        # Runs before the bot, so a session lost later in the run (dead runner,
+        # cancelled job, timeout) still has a successor waiting. It queues
+        # pessimistically as a retry; the end-of-run step replaces it with a
+        # reset counter when the bot comes up, and `queue: single` keeps exactly
+        # one waiting, never two sessions.
+        if: always()
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIGGERED_BY: ${{ inputs.triggered_by }}
+          CHAIN_REF: ${{ github.event.repository.default_branch || github.ref_name }}
+        run: |
+          # Retry state travels in the dispatch input: session-chain:<n> counts
+          # consecutive runs whose bot never came up (blank = manual = 0). The
+          # input is a string, so it is parsed here, never injected into code.
+          # The digit count is capped so an absurd hand-typed value cannot
+          # overflow the [int] cast and hard-fail the step before it dispatches.
+          $n = 0
+          if ($env:TRIGGERED_BY -match '^session-chain:(\d{1,9})$') { $n = [int]$Matches[1] }
+          $maxRetries = 5
+
+          if ($n + 1 -gt $maxRetries) {
+            Write-Host "Retry budget spent ($n/$maxRetries) - not queueing; the end-of-run step reports a stopped chain."
+            return
+          }
+
+          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/workflows/secure-rdp.yml/dispatches"
+          $body = @{ ref = $env:CHAIN_REF; inputs = @{ triggered_by = "session-chain:$($n + 1)" } } | ConvertTo-Json
+
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Invoke-RestMethod -Method Post -Uri $uri -Body $body -ContentType "application/json" `
+                -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              Write-Host "Successor queued for $env:CHAIN_REF (retry $($n + 1)/$maxRetries)."
+              return
+            } catch {
+              Write-Host "::warning::Dispatch attempt $attempt failed: $($_.Exception.Message) $($_.ErrorDetails.Message)"
+              if ($attempt -lt 3) { Start-Sleep -Seconds 15 }
+            }
+          }
+          Write-Host "::error::Could not queue the next session from the insurance step."
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -98,14 +149,13 @@ jobs:
         shell: powershell
         run: |
 
-          Write-Host "=== Loading session metadata ==="
-          $cacheFile = "C:\rdp-session\session.json"
-          if (Test-Path $cacheFile) {
-            $s = Get-Content $cacheFile | ConvertFrom-Json
-            $runCount = $s.run_count; $createdAt = $s.created_at
-          } else {
-            $runCount = 0; $createdAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-          }
+          # Every session gets a fresh VM, so the previous session's
+          # C:\rdp-session\session.json cannot exist here and the old "cached"
+          # counter could only ever read 1. The run number is monotonic and one
+          # run is exactly one session, so it is the honest number.
+          Write-Host "=== Session metadata ==="
+          $runCount = ${{ github.run_number }}
+          $createdAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
           "CACHED_RUN_COUNT=$runCount"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CACHED_CREATED_AT=$createdAt" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Session: #$runCount | Created: $createdAt"
@@ -221,7 +271,7 @@ jobs:
           }
 
           # Show connection details once
-          $runCount = [int]$env:CACHED_RUN_COUNT + 1
+          $runCount = [int]$env:CACHED_RUN_COUNT
           $tsDown = ($env:TAILSCALE_OK -eq "false")
           Write-Host ""
           Write-Host "======================================="
@@ -242,8 +292,12 @@ jobs:
           Write-Host "Bot PID      : (see job output above)"
           Write-Host "======================================="
 
-          # Keep Alive: stream bot output + keep runner alive
-          $endTime = (Get-Date).AddMinutes(345)
+          # Keep Alive: stream bot output + keep runner alive.
+          # 330, not the job's 360-minute cap: setup can take minutes on a cold
+          # cache, and a session that is killed by the cap never reaches the
+          # SESSION_COMPLETE write below, which would make a healthy session
+          # count as a failure link and eventually stop the chain.
+          $endTime = (Get-Date).AddMinutes(330)
           while ((Get-Date) -lt $endTime) {
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             $output = Receive-Job $job -ErrorAction SilentlyContinue
@@ -264,11 +318,74 @@ jobs:
             Start-Sleep -Seconds 30
           }
 
+          # Only a keep-alive that runs its full 330 minutes gets here. That is
+          # the healthy-session signal: the end-of-run chain step resets its
+          # retry counter on it and counts up when it is missing (bot never
+          # started, crashed, or exited early).
+          "SESSION_COMPLETE=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Queue the next session (session end)
+        # The chain link: starts the next session when this one ends, even if the
+        # bot crashed (`if: always()`). A session that ran its full keep-alive
+        # resets the retry counter; anything else (never started, crashed, exited
+        # early) counts up, and once the budget is spent the chain stops with a
+        # Discord alert rather than restarting a broken bot forever. This is the
+        # bound the old watchman's 8/24h throttle used to provide.
+        if: always()
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIGGERED_BY: ${{ inputs.triggered_by }}
+          CHAIN_REF: ${{ github.event.repository.default_branch || github.ref_name }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          # Digit count capped like the insurance step, so the cast below can
+          # never throw on an out-of-range hand-typed counter.
+          $n = 0
+          if ($env:TRIGGERED_BY -match '^session-chain:(\d{1,9})$') { $n = [int]$Matches[1] }
+          $maxRetries = 5
+
+          $next = $n + 1
+          if ($env:SESSION_COMPLETE -eq "true") { $next = 0 }
+
+          if ($next -gt $maxRetries) {
+            $stopReason = "$n sessions in a row ended early or never started"
+          } else {
+            $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/workflows/secure-rdp.yml/dispatches"
+            $body = @{ ref = $env:CHAIN_REF; inputs = @{ triggered_by = "session-chain:$next" } } | ConvertTo-Json
+
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                Invoke-RestMethod -Method Post -Uri $uri -Body $body -ContentType "application/json" `
+                  -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+                Write-Host "Successor queued for $env:CHAIN_REF (retry $next/$maxRetries)."
+                return
+              } catch {
+                Write-Host "::warning::Dispatch attempt $attempt failed: $($_.Exception.Message) $($_.ErrorDetails.Message)"
+                if ($attempt -lt 3) { Start-Sleep -Seconds 15 }
+              }
+            }
+            $stopReason = "GitHub refused the dispatch (see the warnings above)"
+          }
+
+          Write-Host "::error::Session chain stopped: $stopReason. The bot is down until a run is started."
+          if ($env:DISCORD_WEBHOOK_URL) {
+            try {
+              $alert = @{ content = ":warning: **mercy-discord-bot** session chain stopped: $stopReason. Start a run: https://github.com/$env:GITHUB_REPOSITORY/actions/workflows/secure-rdp.yml" } | ConvertTo-Json
+              Invoke-RestMethod -Method Post -Uri $env:DISCORD_WEBHOOK_URL -Body $alert -ContentType "application/json" | Out-Null
+              Write-Host "Discord alert sent."
+            } catch {
+              Write-Host "::warning::Discord alert failed: $($_.Exception.Message)"
+            }
+          } else {
+            Write-Host "::warning::WEBHOOK_URL is not set - no Discord alert sent."
+          }
+
       - name: Save Session Metadata
         if: always()
         shell: powershell
         run: |
-          $runCount = [int]$env:CACHED_RUN_COUNT + 1
+          $runCount = [int]$env:CACHED_RUN_COUNT
           New-Item -ItemType Directory -Force -Path "C:\rdp-session" | Out-Null
           $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
           $createdAt = $env:CACHED_CREATED_AT

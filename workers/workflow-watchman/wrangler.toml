@@ -12,8 +12,10 @@ compatibility_date = "2025-04-01"
 # Optional Discord webhook for restart/error notifications.
 # Set via: wrangler secret put DISCORD_WEBHOOK_URL
 
-[triggers]
-crons = ["*/1 * * * *"]
+# No cron trigger on purpose: the session workflow queues its own successor run
+# at both ends of every session (see .github/workflows/secure-rdp.yml), so this
+# worker does not restart anything on a timer. Adding a [triggers] crons entry
+# back here would re-introduce a schedule — don't, unless that is the intent.
 
 # Optional token guarding the public dashboard/metrics pages (sent as
 # 'x-watchman-token' header or ?token= query param). Leave unset for open access.

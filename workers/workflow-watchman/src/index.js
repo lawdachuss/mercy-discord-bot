@@ -1,31 +1,25 @@
 /**
  * workflow-watchman — Cloudflare Worker
  * ---------------------------------------
- * Monitors the mercy-discord-bot GitHub Actions workflow (secure-rdp.yml) and
- * restarts it whenever it has been inactive/dead longer than its grace period.
- * This worker watches ONLY our bot repo; every other repo is deliberately not
- * in REPO_CONFIGS.
+ * Status + dashboard surface for the mercy-discord-bot session workflow
+ * (secure-rdp.yml). It watches ONLY our bot repo; every other repo is
+ * deliberately not in REPO_CONFIGS.
  *
- * Behaviour (mercy-discord-bot, secure-rdp.yml, branch master):
- *   - Grace: 0 — a session that goes offline (bot crash, failed run, or normal
- *     end of the keep-alive) is restarted on the very next cron tick, i.e. within
- *     ~60 s + runner boot. Extra dispatches can't fight a live session: the
- *     workflow's `concurrency: rdp-session` (cancel-in-progress: false) queues a
- *     second run behind the active one instead of overlapping it.
- *   - fastPoll: checked on EVERY cron tick (1 min), so a dead run is picked up
- *     within ~1-2 min. Only one repo is watched, so the GitHub rate-limit cost
- *     of the 1-min poll is trivial (was every 5th minute when 20 repos were
- *     monitored).
- *   - Budget: 8 restarts / 24h max (throttleMax).
- *   - `failGraceMs` remains available as a per-repo override: a shorter grace
- *     applied ONLY when the latest run failed (useful when graceMs is long).
+ * No timer: this worker has NO cron trigger (see wrangler.toml). The workflow
+ * keeps itself alive by queuing its own successor run at the start and at the
+ * end of every session, so nothing here restarts anything automatically. The
+ * restart machinery below (grace, throttleMax, budget, healthCheck) is dormant
+ * and only runs if a [triggers] crons entry is ever added back.
+ *
+ * The dashboard is the detection surface for a broken chain: / and /__metrics
+ * show the newest run's status, so a status that has been 'completed' for longer
+ * than a session means no successor was queued and a run must be started by hand.
  *
  * Restart budget (throttleMax / 24h): counted from the WATCHMAN_KV namespace
  * when the binding is configured, so it only ever counts dispatches THIS worker
- * made — manual/UI retries no longer eat the budget and lock the watchman out.
- * Without the binding it falls back to counting completed workflow_dispatch runs
- * from the API (cruder: manual retries count too). A throttled repo now posts a
- * Discord alert (once per 30 min) instead of going silent.
+ * made. Without the binding it falls back to counting completed workflow_dispatch
+ * runs from the API — which now includes the self-chained session runs, so the
+ * KV binding is required for that count to mean anything.
  */
 
 const OWNER = "lawdachuss";
@@ -46,6 +40,8 @@ const REPO_CONFIGS = [
   {
     repo: "mercy-discord-bot",
     workflow: "secure-rdp.yml",
+    // Seed ref for a manual / cold-start dispatch; a chained session re-dispatches
+    // on its own ref instead of this one.
     branch: "master",
     graceMs: 0,
     throttleMax: 8,
@@ -58,10 +54,11 @@ const HEALTH_CHECK_RETRIES = 6;
 const HEALTH_CHECK_INTERVAL = 30 * 1000; // 30 seconds
 
 // ===== Per-repo dispatch/notify guards =======================================
-// lastDispatchAt: prevents double-dispatch races when the schedule-queued run
-// and our dispatch land in the same cron window. lastErrorAt / lastThrottleAt:
-// cap Discord spam to once per 30 min per repo (a broken config was alerting
-// every 5 min).
+// lastDispatchAt: prevents double-dispatch races when two overlapping cron
+// ticks (or isolates) both decide a repo needs restarting. The workflow itself
+// is no longer scheduled at all, so a dispatch can only ever collide with our
+// own previous dispatch. lastErrorAt / lastThrottleAt: cap Discord spam to once
+// per 30 min per repo (a broken config was alerting every 5 min).
 //
 // NOTE: these live in module state, which is per-isolate in Workers. With the
 // 1-min cron, a slow health check (up to 3 min) can overlap the next scheduled
@@ -318,7 +315,7 @@ a { color:#3b82f6; }
 </head>
 <body>
 <h1>🛡️ workflow-watchman</h1>
-<p class="subtitle">Monitoring ${repos.length} repo • cron */1 * * * * (mercy-discord-bot, fast-polled)</p>
+<p class="subtitle">Monitoring ${repos.length} repo • no cron: the session chain queues its own successor. A newest run stuck at <code>completed</code> longer than a session means the chain stopped — start one run by hand.</p>
 <table>
 <thead><tr><th>Repo</th><th>Status</th><th>Last Run</th><th>Age</th><th>Restarts</th></tr></thead>
 <tbody>${rows}</tbody>
