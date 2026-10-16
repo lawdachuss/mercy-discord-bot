@@ -1106,6 +1106,8 @@ class DiscordBot(commands.Bot):
             'safe_data.py',  # Safe data retrieval utility, not a cog
             'safe_formatter.py',  # Safe formatting utility, not a cog
             'interaction_utils.py',  # Shared interaction helpers, not a cog
+            'store.py',  # Persistence/schedule helpers (cogs.reminders), not a cog
+            'views.py',  # UI components (cogs.reminders), not a cog
             'README.md',
             'INTEGRATION_GUIDE.md',
             'IMPROVEMENTS_SUMMARY.md'

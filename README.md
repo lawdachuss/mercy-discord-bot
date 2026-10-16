@@ -8,6 +8,7 @@ A feature-rich Discord bot built with discord.py, featuring multiple cogs for se
 - **Giveaways**: Advanced giveaway system with role requirements
 - **Moderation**: Ban, purge, quarantine, and other moderation tools
 - **Utility**: AFK status, snipe, sticky messages, thread management
+- **Reminders**: interactive admin dashboard for one-off and recurring scheduled reminders with timezone support and role pings
 - **Fun**: Media commands, autoresponder, confession system
 - **Voice**: Voice channel management and matchmaking
 - **Counting & Skullboard**: Community engagement features
@@ -49,6 +50,21 @@ python main.py
 
 ## Bot Commands
 
+### Slash Commands
+
+#### Reminders (`/reminder` · Manage Server required)
+
+- `/reminder dashboard` - Interactive dashboard: create, manage, pause and resume reminders
+- `/reminder create` - Six-step wizard (details, frequency, timing, timezone, channel, role)
+- `/reminder manage` - Pick a reminder to edit, reschedule, preview, test, pause or delete
+- `/reminder list` - Paginated listing of every reminder in the server
+- `/reminder preview <reminder>` - Show the exact message without posting it
+- `/reminder pause|resume|delete <reminder>` - Per-reminder actions with confirmation
+
+Reminders are stored in MongoDB, survive restarts, support one-off and recurring
+schedules (interval, daily, weekly, monthly) with IANA timezones, and ping an
+optional role. See [cogs/reminders/README.md](cogs/reminders/README.md).
+
 ### Prefix Commands (`.`)
 
 - `.ping` - Check bot latency and database status
@@ -71,9 +87,16 @@ mercy/
 │   ├── purge/           # Message purging
 │   ├── counting/        # Counting game
 │   ├── skullboard/      # Message highlighting
+│   ├── reminders/       # Scheduled reminders + interactive dashboard
 │   └── ...              # Other features
 ├── logs/                # Bot logs
 └── database/            # Local database files
+```
+
+## Tests
+
+```bash
+python -m pytest tests -q
 ```
 
 ## Contributing
