@@ -1,6 +1,6 @@
 name: Secure RDP + Mercy Bot
 
-# No schedule or automatic dispatch here. Cloudflare mercy-watchman owns recovery.
+# One workflow owns both the session and its recovery. No cron/schedule.
 on:
   workflow_dispatch:
 
@@ -9,6 +9,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: write
   contents: read
 
 jobs:
@@ -280,3 +281,40 @@ jobs:
             last_run_id  = "${{ github.run_id }}"
           } | ConvertTo-Json | Set-Content "C:\rdp-session\session.json" -Encoding utf8
           Write-Host "Session saved. Total: $runCount"
+
+
+  # Runs after the RDP/bot job exits. Dispatches the next session on success,
+  # failure, or timeout. A manually cancelled RDP job is deliberately ignored.
+  recover:
+    needs: rdp
+    if: always() && needs.rdp.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Avoid duplicate sessions
+        id: active
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          runs="$(gh api "repos/${GH_REPOSITORY}/actions/workflows/secure-rdp.yml/runs?per_page=30")"
+          active="$(jq --arg current "${CURRENT_RUN_ID}" '[.workflow_runs[] | select((.id | tostring) != $current) | select(.status == "queued" or .status == "in_progress" or .status == "pending")] | length' <<< "$runs")"
+          if [ "$active" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Another session is already queued or running; skipping duplicate dispatch."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start the next session
+        if: steps.active.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          gh api --method POST \
+            "repos/${GH_REPOSITORY}/actions/workflows/secure-rdp.yml/dispatches" \
+            -f ref=master
+          echo "Next Mercy session dispatched."
