@@ -5,18 +5,13 @@
  * (secure-rdp.yml). It watches ONLY our bot repo; every other repo is
  * deliberately not in REPO_CONFIGS.
  *
- * Cloudflare Cron is the sole automatic restart controller (one-minute cadence,
- * configured in wrangler.toml). GitHub Actions is manual-dispatch only: it never
- * schedules itself or queues a successor. This Worker detects an idle/completed
- * session and dispatches a new run when the bot is offline.
+ * Session recovery is event-driven by .github/workflows/session-recovery.yml.
+ * That workflow starts a replacement as soon as secure-rdp.yml completes, fails,
+ * or times out, while deliberately ignoring cancelled runs. This Worker is kept
+ * for its dashboard/metrics endpoints; its legacy scheduled restart handler has
+ * no Cron Trigger configured and therefore does not dispatch sessions.
  *
- * The dashboard shows the newest run's status and the restart budget.
- *
- * Restart budget (throttleMax / 24h): counted from the WATCHMAN_KV namespace
- * when the binding is configured, so it only ever counts dispatches THIS worker
- * made. Without the binding it falls back to counting completed workflow_dispatch
- * runs from the API — which now includes the self-chained session runs, so the
- * KV binding is required for that count to mean anything.
+ * The dashboard shows the newest run's status and legacy restart-budget metrics.
  */
 
 const OWNER = "lawdachuss";
@@ -26,10 +21,9 @@ const OWNER = "lawdachuss";
 // used to be here (node-1..node-18, supabase-actions) was removed so this
 // worker can't touch anything but mercy-discord-bot.
 const REPO_CONFIGS = [
-  // mercy-discord-bot — Discord bot with RDP access.
-  // Cloudflare dispatches a replacement only after no active run is present.
-  // Workflow concurrency prevents overlapping sessions; the restart budget and
-  // cooldown bound repeated failures. This is checked on every one-minute tick.
+  // Legacy restart configuration retained for compatibility. No Cron Trigger
+  // is configured for this Worker; session recovery is handled by the separate
+  // workflow_run event workflow instead.
   {
     repo: "mercy-discord-bot",
     workflow: "secure-rdp.yml",
