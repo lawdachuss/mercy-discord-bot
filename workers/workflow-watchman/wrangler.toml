@@ -12,11 +12,8 @@ compatibility_date = "2025-04-01"
 # Optional Discord webhook for restart/error notifications.
 # Set via: wrangler secret put DISCORD_WEBHOOK_URL
 
-# Cloudflare is the sole automatic restart controller. Poll once per minute;
-# GitHub Actions workflow_dispatch is manual-only and never schedules itself.
-[triggers]
-crons = ["* * * * *"]
-
+# Session recovery is event-driven by .github/workflows/session-recovery.yml.
+# Keep this Worker unscheduled; it remains available for its dashboard endpoints.
 
 # Optional token guarding the public dashboard/metrics pages (sent as
 # 'x-watchman-token' header or ?token= query param). Leave unset for open access.
