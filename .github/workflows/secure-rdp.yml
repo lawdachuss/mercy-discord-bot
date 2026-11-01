@@ -237,9 +237,9 @@ jobs:
 
           # Keep Alive: stream bot output + keep runner alive.
           # 330, not the job's 360-minute cap: setup can take minutes on a cold
-          # cache, and a session that is killed by the cap never reaches the
-          # SESSION_COMPLETE write below, which would make a healthy session
-          # count as a failure link and eventually stop the chain.
+          # cache, leaving time for the job to finish cleanly before GitHub's cap.
+          # Cloudflare Watchman detects the completed run and dispatches a fresh
+          # manual-only workflow run when needed.
           $endTime = (Get-Date).AddMinutes(330)
           while ((Get-Date) -lt $endTime) {
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -261,11 +261,6 @@ jobs:
             Start-Sleep -Seconds 30
           }
 
-          # Only a keep-alive that runs its full 330 minutes gets here. That is
-          # the healthy-session signal: the end-of-run chain step resets its
-          # retry counter on it and counts up when it is missing (bot never
-          # started, crashed, or exited early).
-          "SESSION_COMPLETE=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Save Session Metadata
         if: always()
