@@ -5,15 +5,12 @@
  * (secure-rdp.yml). It watches ONLY our bot repo; every other repo is
  * deliberately not in REPO_CONFIGS.
  *
- * No timer: this worker has NO cron trigger (see wrangler.toml). The workflow
- * keeps itself alive by queuing its own successor run at the start and at the
- * end of every session, so nothing here restarts anything automatically. The
- * restart machinery below (grace, throttleMax, budget, healthCheck) is dormant
- * and only runs if a [triggers] crons entry is ever added back.
+ * Cloudflare Cron is the sole automatic restart controller (one-minute cadence,
+ * configured in wrangler.toml). GitHub Actions is manual-dispatch only: it never
+ * schedules itself or queues a successor. This Worker detects an idle/completed
+ * session and dispatches a new run when the bot is offline.
  *
- * The dashboard is the detection surface for a broken chain: / and /__metrics
- * show the newest run's status, so a status that has been 'completed' for longer
- * than a session means no successor was queued and a run must be started by hand.
+ * The dashboard shows the newest run's status and the restart budget.
  *
  * Restart budget (throttleMax / 24h): counted from the WATCHMAN_KV namespace
  * when the binding is configured, so it only ever counts dispatches THIS worker
@@ -30,13 +27,9 @@ const OWNER = "lawdachuss";
 // worker can't touch anything but mercy-discord-bot.
 const REPO_CONFIGS = [
   // mercy-discord-bot — Discord bot with RDP access.
-  // graceMs 0: restart the INSTANT a session goes offline — the moment GitHub
-  // reports no active run, the next cron tick (<= 60s away) dispatches a new
-  // session. Overlapping dispatches can't fight a live session: the workflow's
-  // `concurrency: rdp-session` (cancel-in-progress: false) makes a second run
-  // QUEUE behind the active one instead. A rapid-fail loop is still bounded by
-  // throttleMax (8/24h) + the 90s per-repo dispatch cooldown.
-  // fastPoll: checked on EVERY 1-min cron tick (cheap: only repo watched).
+  // Cloudflare dispatches a replacement only after no active run is present.
+  // Workflow concurrency prevents overlapping sessions; the restart budget and
+  // cooldown bound repeated failures. This is checked on every one-minute tick.
   {
     repo: "mercy-discord-bot",
     workflow: "secure-rdp.yml",
@@ -488,13 +481,10 @@ async function dispatchWorkflow(config, headers) {
       body: JSON.stringify(payload),
     });
 
-  let resp = await send({ ref: branch, inputs: { triggered_by: "workflow-watchman" } });
-  let detail = resp.ok ? "" : await githubErrorDetail(resp);
-  if (resp.status === 422 && /input|workflow_dispatch/i.test(detail)) {
-    console.log(`[${repo}] retrying dispatch without inputs — ${detail}`);
-    resp = await send({ ref: branch });
-    detail = resp.ok ? "" : await githubErrorDetail(resp);
-  }
+  // secure-rdp.yml intentionally declares no workflow inputs. Dispatch only
+  // the ref so GitHub cannot reject an obsolete triggered_by input.
+  const resp = await send({ ref: branch });
+  const detail = resp.ok ? "" : await githubErrorDetail(resp);
   return { ok: resp.ok, status: resp.status, detail };
 }
 
